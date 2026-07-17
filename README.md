@@ -1,9 +1,10 @@
 # mlqueue
 
-`mlqueue` is a machine-wide queue for coordinating local ML jobs across
-repositories. One durable daemon (`mlqueued`) admits arbitrary commands
-through a single per-job `maxParallelRuns` declaration, so independently
-acting agents cannot start an unsafe number of runs at once.
+mlqueue is a machine-wide queue for coordinating local ML jobs across
+repositories: one durable daemon (`mlqd`) plus a CLI (`mlq`). The daemon
+admits arbitrary commands through a single per-job `maxParallelRuns`
+declaration, so independently acting agents cannot start an unsafe number of
+runs at once.
 
 The design rationale, invariants, and full model live in [PLAN.md](PLAN.md).
 
@@ -30,13 +31,15 @@ process group (no daemonizing/`setsid`).
 ## Quick start
 
 ```bash
-cargo install --path .           # installs mlqueue + mlqueued
-mlqueued &                       # or: contrib/systemd/mlqueued.service
+cargo install --path .    # installs mlq + mlqd
+mlq daemon install        # systemd user service (enable + start)
+# or, without systemd:
+mlq daemon run            # foreground daemon
 
-mlqueue submit --name smoke --max-parallel-runs 1 -- python train.py --smoke
-mlqueue status                   # limits, protected job, admission reasons
-mlqueue logs 1 --follow
-mlqueue cancel 1 [--force]
+mlq submit --name smoke --max-parallel-runs 1 -- python train.py --smoke
+mlq status                # limits, protected job, admission reasons
+mlq logs 1 --follow
+mlq cancel 1 [--force]
 ```
 
 Workflow commands: `hold`, `release`, `retry`, `set-max-parallel-runs`,

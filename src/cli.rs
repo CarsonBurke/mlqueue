@@ -1,4 +1,4 @@
-//! The `mlqueue` CLI: argument parsing, environment capture, idempotency-key
+//! The `mlq` CLI: argument parsing, environment capture, idempotency-key
 //! generation, and human/JSON rendering of daemon replies.
 
 use std::collections::BTreeMap;
@@ -25,9 +25,9 @@ const SENSITIVE_MARKERS: &[&str] =
 
 #[derive(Parser)]
 #[command(
-    name = "mlqueue",
+    name = "mlq",
     version,
-    about = "Machine-wide queue for local ML commands (talks to mlqueued)"
+    about = "Machine-wide queue for local ML commands (talks to mlqd)"
 )]
 struct Cli {
     /// Durable idempotency key; pass the same key to safely rerun a whole
@@ -120,9 +120,9 @@ enum DaemonCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Run mlqueued in the foreground (this process becomes the daemon).
+    /// Run mlqd in the foreground (this process becomes the daemon).
     Run,
-    /// Install mlqueued as a systemd user service and start it.
+    /// Install mlqd as a systemd user service and start it.
     Install {
         /// Write the unit file only; do not enable or start the service.
         #[arg(long)]
@@ -240,7 +240,7 @@ pub fn main() -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&view)?);
             } else {
-                println!("mlqueued {} (pid {})", view.version, view.pid);
+                println!("mlqd {} (pid {})", view.version, view.pid);
                 println!("  socket:         {}", view.socket_path);
                 println!("  database:       {}", view.db_path);
                 println!("  active leases:  {}", view.active_leases);
@@ -537,8 +537,8 @@ fn logs(paths: &Paths, job: JobId, attempt: Option<i64>, stderr: bool, follow: b
         if matches!(state.as_str(), "orphaned" | "quarantined") && !recovery_notice_shown {
             recovery_notice_shown = true;
             eprintln!(
-                "[mlqueue] attempt is {state}: the command may still be running; \
-                 following until it drains (Ctrl-C to stop, see `mlqueue recover list`)"
+                "[mlq] attempt is {state}: the command may still be running; \
+                 following until it drains (Ctrl-C to stop, see `mlq recover list`)"
             );
         }
         let terminal = matches!(state.as_str(), "succeeded" | "failed" | "cancelled" | "lost");
@@ -558,15 +558,15 @@ fn logs(paths: &Paths, job: JobId, attempt: Option<i64>, stderr: bool, follow: b
 // Daemon lifecycle: foreground run and systemd user-service management
 // ---------------------------------------------------------------------------
 
-const SERVICE_NAME: &str = "mlqueued.service";
+const SERVICE_NAME: &str = "mlqd.service";
 
-/// Locate the `mlqueued` binary: preferring the one installed alongside this
-/// `mlqueue` binary (they are built and versioned together), then PATH.
-fn mlqueued_path() -> Result<PathBuf> {
+/// Locate the `mlqd` binary: preferring the one installed alongside this
+/// `mlq` binary (they are built and versioned together), then PATH.
+fn mlqd_path() -> Result<PathBuf> {
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
-        let sibling = dir.join("mlqueued");
+        let sibling = dir.join("mlqd");
         if sibling.is_file() {
             return Ok(sibling.canonicalize()?);
         }
@@ -576,17 +576,17 @@ fn mlqueued_path() -> Result<PathBuf> {
         if dir.as_os_str().is_empty() {
             continue;
         }
-        let candidate = dir.join("mlqueued");
+        let candidate = dir.join("mlqd");
         if candidate.is_file() {
             return Ok(candidate.canonicalize()?);
         }
     }
-    bail!("mlqueued not found next to mlqueue or on PATH; install with `cargo install --path .`")
+    bail!("mlqd not found next to mlq or on PATH; install with `cargo install --path .`")
 }
 
 fn daemon_run() -> Result<()> {
     use std::os::unix::process::CommandExt;
-    let path = mlqueued_path()?;
+    let path = mlqd_path()?;
     // exec only returns on failure.
     let err = std::process::Command::new(&path).exec();
     Err(err).with_context(|| format!("executing {}", path.display()))
@@ -618,9 +618,9 @@ fn systemctl_user(args: &[&str]) -> Result<()> {
 }
 
 fn daemon_install(no_enable: bool) -> Result<()> {
-    let mlqueued = mlqueued_path()?;
+    let mlqd = mlqd_path()?;
     let unit_path = systemd_user_unit_path()?;
-    // Mirrors contrib/systemd/mlqueued.service, with the resolved binary.
+    // Mirrors contrib/systemd/mlqd.service, with the resolved binary.
     let unit = format!(
         "[Unit]\n\
          Description=mlqueue machine-wide ML job queue daemon\n\
@@ -635,7 +635,7 @@ fn daemon_install(no_enable: bool) -> Result<()> {
          \n\
          [Install]\n\
          WantedBy=default.target\n",
-        mlqueued.display()
+        mlqd.display()
     );
     let dir = unit_path.parent().expect("unit path has a parent");
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -647,7 +647,7 @@ fn daemon_install(no_enable: bool) -> Result<()> {
     }
     systemctl_user(&["daemon-reload"])?;
     systemctl_user(&["enable", "--now", SERVICE_NAME])?;
-    println!("mlqueued enabled and started (systemctl --user status {SERVICE_NAME})");
+    println!("mlqd enabled and started (systemctl --user status {SERVICE_NAME})");
     Ok(())
 }
 
@@ -657,8 +657,11 @@ fn daemon_uninstall() -> Result<()> {
         bail!("{} is not installed (expected {})", SERVICE_NAME, unit_path.display());
     }
     // Stopping the daemon never kills workers (KillMode=process); a later
-    // daemon start adopts anything still running.
-    systemctl_user(&["disable", "--now", SERVICE_NAME])?;
+    // daemon start adopts anything still running. A unit that was installed
+    // with --no-enable was never loaded, so disable failing is not fatal.
+    if let Err(err) = systemctl_user(&["disable", "--now", SERVICE_NAME]) {
+        eprintln!("warning: {err:#} (removing the unit file anyway)");
+    }
     std::fs::remove_file(&unit_path)
         .with_context(|| format!("removing {}", unit_path.display()))?;
     systemctl_user(&["daemon-reload"])?;

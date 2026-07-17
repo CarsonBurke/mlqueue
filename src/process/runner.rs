@@ -22,7 +22,7 @@ use crate::process::artifacts::{
 };
 use crate::process::identity;
 
-/// Entry point for `mlqueued __runner --attempt-dir DIR`. Returns the process
+/// Entry point for `mlqd __runner --attempt-dir DIR`. Returns the process
 /// exit code; failures before `command.json` is readable cannot publish a
 /// result and surface only through runner death.
 pub fn runner_main(attempt_dir: &Path) -> i32 {

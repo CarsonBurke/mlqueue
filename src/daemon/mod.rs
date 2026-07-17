@@ -44,7 +44,7 @@ pub fn run(paths: Paths) -> Result<()> {
     let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
         bail!(
-            "another mlqueued instance holds {} — only one daemon may run",
+            "another mlqd instance holds {} — only one daemon may run",
             paths.daemon_lock().display()
         );
     }
@@ -53,7 +53,7 @@ pub fn run(paths: Paths) -> Result<()> {
 
     let conn = db::open(&paths.db())?;
     tracing::info!(
-        "mlqueued {} starting (db {}, socket {})",
+        "mlqd {} starting (db {}, socket {})",
         env!("CARGO_PKG_VERSION"),
         paths.db().display(),
         paths.socket().display()

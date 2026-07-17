@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "mlqueued", version, about = "mlqueue daemon (machine-wide ML job queue)")]
+#[command(name = "mlqd", version, about = "mlqueue daemon (machine-wide ML job queue)")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,

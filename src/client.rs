@@ -16,7 +16,7 @@ const CLIENT_RETRIES: u32 = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
-    #[error("cannot reach mlqueued at {socket}: {source} — start it with `mlqueued`")]
+    #[error("cannot reach mlqd at {socket}: {source} — start it with `mlqd`")]
     Unavailable { socket: String, source: io::Error },
     #[error("{}: {}", .0.code, .0.message)]
     Daemon(ErrorBody),

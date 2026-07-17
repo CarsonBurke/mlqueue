@@ -56,7 +56,7 @@ impl Paths {
     }
 
     pub fn socket(&self) -> PathBuf {
-        self.runtime_dir.join("mlqueued.sock")
+        self.runtime_dir.join("mlqd.sock")
     }
 
     pub fn db(&self) -> PathBuf {

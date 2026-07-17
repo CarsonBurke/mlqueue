@@ -232,15 +232,15 @@ special scheduler mode; it falls naturally out of the same formula.
 
 Use one Rust package with two public binaries and an internal execution role:
 
-- `mlqueue`: CLI and Unix-socket client.
-- `mlqueued`: long-running user daemon.
-- Internal `mlqueued` attempt-runner mode for durable process supervision.
+- `mlq`: CLI and Unix-socket client.
+- `mlqd`: long-running user daemon.
+- Internal `mlqd` attempt-runner mode for durable process supervision.
 
 Suggested modules:
 
 ```text
-src/bin/mlqueue.rs        CLI entry point
-src/bin/mlqueued.rs       daemon and internal runner entry point
+src/bin/mlq.rs        CLI entry point
+src/bin/mlqd.rs       daemon and internal runner entry point
 src/lib.rs
 src/config.rs
 src/paths.rs
@@ -271,7 +271,7 @@ filesystem waits, or process spawning.
 Follow XDG base-directory conventions with test overrides:
 
 ```text
-$XDG_RUNTIME_DIR/mlqueue/mlqueued.sock       Unix socket
+$XDG_RUNTIME_DIR/mlqueue/mlqd.sock       Unix socket
 $XDG_STATE_HOME/mlqueue/mlqueue.db           SQLite database
 $XDG_STATE_HOME/mlqueue/daemon.lock          stable singleton lock
 $XDG_STATE_HOME/mlqueue/attempts/<id>/
@@ -539,25 +539,25 @@ terminal result is `cancelled`, even if a signal handler returns zero.
 Initial commands:
 
 ```text
-mlqueue [--idempotency-key KEY] submit --max-parallel-runs N --name NAME
+mlq [--idempotency-key KEY] submit --max-parallel-runs N --name NAME
         --cwd PATH [--after-success JOB]... [--after-completion JOB]...
         [--max-attempts N] [--retry-delay DURATION] -- COMMAND [ARGS...]
-mlqueue status [--watch] [--json]
-mlqueue show JOB [--json]
-mlqueue logs JOB [--attempt N] [--stderr] [--follow]
-mlqueue [--idempotency-key KEY] cancel JOB [--force]
-mlqueue daemon status [--json]
+mlq status [--watch] [--json]
+mlq show JOB [--json]
+mlq logs JOB [--attempt N] [--stderr] [--follow]
+mlq [--idempotency-key KEY] cancel JOB [--force]
+mlq daemon status [--json]
 ```
 
 Workflow commands:
 
 ```text
-mlqueue [--idempotency-key KEY] hold JOB
-mlqueue [--idempotency-key KEY] release JOB
-mlqueue [--idempotency-key KEY] retry JOB
-mlqueue [--idempotency-key KEY] set-max-parallel-runs JOB N
-mlqueue recover list
-mlqueue [--idempotency-key KEY] recover resolve JOB --attempt N
+mlq [--idempotency-key KEY] hold JOB
+mlq [--idempotency-key KEY] release JOB
+mlq [--idempotency-key KEY] retry JOB
+mlq [--idempotency-key KEY] set-max-parallel-runs JOB N
+mlq recover list
+mlq [--idempotency-key KEY] recover resolve JOB --attempt N
         --as lost|cancelled
 ```
 
@@ -588,7 +588,7 @@ Trigger the skill whenever an agent intends to start any cooperating local ML
 command, including short smokes and CPU preprocessing as well as GPU workloads,
 benchmarks, experiment batches, and dependent chains. It requires the agent to:
 
-1. Use `mlqueue`; never launch managed work directly, with `nohup`, in a
+1. Use `mlq`; never launch managed work directly, with `nohup`, in a
    detached terminal, or through a repository-local scheduler that bypasses
    the daemon.
 2. Identify the exact command, working directory, environment, dependencies,
@@ -605,8 +605,8 @@ benchmarks, experiment batches, and dependent chains. It requires the agent to:
    of the same script.
 8. Never increase the value merely because the machine looks idle at the
    moment; it is a compatibility declaration, not a utilization target.
-9. Submit with an explicit idempotency key, report the job ID and declared
-   limit, and use queue status/log/cancel commands afterward.
+9. Report the job ID and declared limit, and use queue status/log/cancel
+   commands afterward (the CLI generates idempotency keys automatically).
 10. Lower future declarations if observed concurrency harms correctness,
    stability, throughput, or benchmark validity.
 
@@ -624,14 +624,14 @@ Forward-test the skill on:
 - A request to run work directly despite an active queue.
 
 Tests must inspect proposed commands and limits, not merely whether the agent
-mentions `mlqueue`.
+mentions `mlq`.
 
 ## Repository integrations
 
 ### CleanRL
 
 Keep experiment-specific configuration, completion detection, and result
-tools. Replace direct launch with `mlqueue submit --max-parallel-runs 3` for the
+tools. Replace direct launch with `mlq submit --max-parallel-runs 3` for the
 small characterized configurations that are known to share safely. Use `1`
 for larger or uncharacterized configurations. The number is an explicit
 integration choice, not framework detection inside the daemon.
@@ -848,7 +848,7 @@ Decisions resolved during implementation:
 - A dead runner after a *published* authorization but before the exec
   handshake quarantines the attempt (command existence unknowable); a dead
   runner whose authorization was never published fails the attempt safely.
-- systemd integration ships as `contrib/systemd/mlqueued.service` with
+- systemd integration ships as `contrib/systemd/mlqd.service` with
   `KillMode=process` so daemon restarts never signal workers. Per-attempt
   transient scopes remain a Phase 3 extension.
 - The runner's group-emptiness proof is PID-reuse safe: the leader's exit is

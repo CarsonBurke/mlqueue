@@ -51,7 +51,7 @@ impl TestQueue {
     }
 
     fn spawn_daemon(&self) -> Child {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_mlqueued"));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_mlqd"));
         self.apply_env(&mut cmd);
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
         cmd.spawn().unwrap()
@@ -73,7 +73,7 @@ impl TestQueue {
     }
 
     fn try_cli(&self, args: &[&str]) -> Output {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_mlqueue"));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_mlq"));
         self.apply_env(&mut cmd);
         cmd.args(args);
         cmd.output().unwrap()
@@ -83,7 +83,7 @@ impl TestQueue {
         let output = self.try_cli(args);
         assert!(
             output.status.success(),
-            "mlqueue {args:?} failed:\nstdout: {}\nstderr: {}",
+            "mlq {args:?} failed:\nstdout: {}\nstderr: {}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );

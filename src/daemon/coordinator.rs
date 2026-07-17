@@ -1019,7 +1019,7 @@ impl Coordinator {
             .append(true)
             .open(dir.join(RUNNER_LOG_FILE))?;
         let runner_log_err = runner_log.try_clone()?;
-        let exe = std::env::current_exe().context("resolving mlqueued executable")?;
+        let exe = std::env::current_exe().context("resolving mlqd executable")?;
         let mut cmd = std::process::Command::new(exe);
         cmd.arg("__runner")
             .arg("--attempt-dir")
@@ -1331,7 +1331,7 @@ fn cancel_job(tx: &Transaction<'_>, job: JobId, force: bool, now: i64) -> ApiRes
                     error_codes::UNSAFE_RESOLUTION,
                     format!(
                         "attempt {} is quarantined with unknown process containment; \
-                         inspect and use `mlqueue recover resolve`",
+                         inspect and use `mlq recover resolve`",
                         attempt.id
                     ),
                 )),

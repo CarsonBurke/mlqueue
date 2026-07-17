@@ -6,12 +6,12 @@ description = "Machine-wide queue coordinating local ML jobs through per-job max
 license = "MIT"
 
 [[bin]]
-name = "mlqueue"
-path = "src/bin/mlqueue.rs"
+name = "mlq"
+path = "src/bin/mlq.rs"
 
 [[bin]]
-name = "mlqueued"
-path = "src/bin/mlqueued.rs"
+name = "mlqd"
+path = "src/bin/mlqd.rs"
 
 [dependencies]
 anyhow = "1"

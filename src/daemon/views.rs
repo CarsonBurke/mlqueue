@@ -55,7 +55,7 @@ fn eligibility_reason(
         JobState::Held => Some("held".to_string()),
         JobState::Starting => Some("launching".to_string()),
         JobState::NeedsAttention => {
-            Some("attempt needs recovery; see mlqueue recover list".to_string())
+            Some("attempt needs recovery; see mlq recover list".to_string())
         }
         JobState::Queued => {
             let deps = dependency_views(conn, job)?;
