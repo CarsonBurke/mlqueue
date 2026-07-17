@@ -584,6 +584,7 @@ mlq [--idempotency-key KEY] submit --max-parallel-runs N --name NAME
         --cwd PATH [--after-success JOB]... [--after-completion JOB]...
         [--max-attempts N] [--retry-delay DURATION] -- COMMAND [ARGS...]
 mlq status [--watch] [--json]
+mlq follow-tts
 mlq show JOB [--json]
 mlq logs JOB [--attempt N] [--stderr] [--follow]
 mlq wait JOB [--timeout DUR] [--json]

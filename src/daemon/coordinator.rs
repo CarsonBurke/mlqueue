@@ -178,6 +178,22 @@ impl Coordinator {
                 &self.paths,
                 self.admission_blocked.is_some(),
             )?)),
+            Op::FollowTtsSnapshot => Ok(Reply::FollowTtsSnapshot(
+                views::follow_tts_snapshot(&self.conn)?,
+            )),
+            Op::Events { after, limit } => {
+                if *after < 0 || !(1..=1_000).contains(limit) {
+                    return Err(ApiError::new(
+                        error_codes::INVALID_ARGUMENT,
+                        "events requires after >= 0 and limit between 1 and 1000",
+                    ));
+                }
+                let events = db::events_after(&self.conn, *after, *limit)?
+                    .iter()
+                    .map(views::event_view)
+                    .collect();
+                Ok(Reply::Events { events })
+            }
             Op::Show { job } => {
                 let row = db::job_row(&self.conn, *job)?
                     .ok_or_else(|| ApiError::new(error_codes::NOT_FOUND, format!("job {job} not found")))?;
@@ -1311,6 +1327,18 @@ fn apply_mutation(
                 "recover_resolved",
                 "client",
                 Some(&json!({ "as": attempt_state.as_str() }).to_string()),
+            )?;
+            db::append_event(
+                tx,
+                Some(*job),
+                None,
+                match job_state {
+                    JobState::Lost => "job_lost",
+                    JobState::Cancelled => "job_cancelled",
+                    _ => unreachable!("recovery resolves only to a terminal outcome"),
+                },
+                "client",
+                None,
             )?;
             Ok((job_reply(tx, paths, *job)?, Vec::new()))
         }

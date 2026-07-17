@@ -5,12 +5,35 @@
 use anyhow::Result;
 use rusqlite::Connection;
 
-use crate::db::{self, AttemptRow, JobRow, ReservationRow};
+use crate::db::{self, AttemptRow, EventRow, JobRow, ReservationRow};
 use crate::domain::{JobState, now_ms};
 use crate::paths::Paths;
 use crate::protocol::{
-    AttemptView, DependencyView, JobView, ReservationView, StatusView,
+    AttemptView, DependencyView, EventView, FollowTtsJobView, FollowTtsSnapshotView, JobView,
+    ReservationView, StatusView,
 };
+
+const TTS_NAME_LIMIT: usize = 80;
+
+fn tts_name(name: &str) -> String {
+    if name.chars().count() <= TTS_NAME_LIMIT {
+        name.to_string()
+    } else {
+        format!("{}…", name.chars().take(TTS_NAME_LIMIT - 1).collect::<String>())
+    }
+}
+
+pub fn event_view(event: &EventRow) -> EventView {
+    EventView {
+        id: event.id,
+        timestamp: event.timestamp,
+        job: event.job_id,
+        job_name: event.job_name.as_deref().map(tts_name),
+        attempt: event.attempt_id,
+        attempt_number: event.attempt_number,
+        event_type: event.event_type.clone(),
+    }
+}
 
 pub fn attempt_view(paths: &Paths, attempt: &AttemptRow) -> AttemptView {
     AttemptView {
@@ -182,3 +205,23 @@ pub fn status_view(conn: &Connection, paths: &Paths, admission_blocked: bool) ->
     })
 }
 
+pub fn follow_tts_snapshot(conn: &Connection) -> Result<FollowTtsSnapshotView> {
+    const MAX_INITIAL_RUNNING: usize = 5;
+
+    let running_count = db::count_jobs_in_state(conn, JobState::Running)?;
+    let additional_running_jobs = running_count.saturating_sub(MAX_INITIAL_RUNNING as u32);
+    let running_jobs = db::bounded_job_names_in_state(
+        conn,
+        JobState::Running,
+        TTS_NAME_LIMIT as u32,
+        MAX_INITIAL_RUNNING as u32,
+    )?
+        .into_iter()
+        .map(|(id, name)| FollowTtsJobView { id, name: tts_name(&name) })
+        .collect();
+    Ok(FollowTtsSnapshotView {
+        running_jobs,
+        additional_running_jobs,
+        latest_event_id: db::latest_event_id(conn)?,
+    })
+}

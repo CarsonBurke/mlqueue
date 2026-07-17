@@ -227,6 +227,17 @@ pub struct ReservationRow {
     pub consumed: BTreeSet<JobId>,
 }
 
+#[derive(Debug, Clone)]
+pub struct EventRow {
+    pub id: i64,
+    pub timestamp: i64,
+    pub job_id: Option<JobId>,
+    pub job_name: Option<String>,
+    pub attempt_id: Option<AttemptId>,
+    pub attempt_number: Option<i64>,
+    pub event_type: String,
+}
+
 const JOB_COLUMNS: &str = "id, name, state, cwd, args, env, max_parallel_runs, max_attempts, \
      retry_delay_ms, retry_not_before, attempt_count, state_reason, created_at, updated_at, \
      finished_at";
@@ -415,6 +426,20 @@ pub fn count_jobs_in_state(conn: &Connection, state: JobState) -> Result<u32> {
     )?)
 }
 
+pub fn bounded_job_names_in_state(
+    conn: &Connection,
+    state: JobState,
+    name_chars: u32,
+    limit: u32,
+) -> Result<Vec<(JobId, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, substr(name, 1, ?2) FROM jobs WHERE state = ?1 ORDER BY id LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(params![state.as_str(), name_chars, limit], |row| {
+        Ok((row.get(0)?, row.get(1)?))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
 
 // ---------------------------------------------------------------------------
 // Dependencies
@@ -874,6 +899,32 @@ pub fn insert_operation(
 // Events
 // ---------------------------------------------------------------------------
 
+pub fn latest_event_id(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| row.get(0))?)
+}
+
+pub fn events_after(conn: &Connection, after: i64, limit: u32) -> Result<Vec<EventRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.id, e.ts, e.job_id, substr(j.name, 1, 80), e.attempt_id, a.number, e.type \
+         FROM events e \
+         LEFT JOIN jobs j ON j.id = e.job_id \
+         LEFT JOIN attempts a ON a.id = e.attempt_id \
+         WHERE e.id > ?1 ORDER BY e.id LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![after, limit], |row| {
+        Ok(EventRow {
+            id: row.get(0)?,
+            timestamp: row.get(1)?,
+            job_id: row.get(2)?,
+            job_name: row.get(3)?,
+            attempt_id: row.get(4)?,
+            attempt_number: row.get(5)?,
+            event_type: row.get(6)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 pub fn append_event(
     conn: &Connection,
     job: Option<JobId>,
@@ -1133,4 +1184,35 @@ mod tests {
         assert!(lookup_operation(&conn, "missing").unwrap().is_none());
     }
 
+    #[test]
+    fn events_are_read_from_a_durable_monotonic_cursor() {
+        let conn = open_in_memory().unwrap();
+        let job = insert_job(&conn, &submit_params("event-job", 1), 1000).unwrap();
+        append_event(&conn, Some(job), None, "job_submitted", "client", None).unwrap();
+        append_event(&conn, Some(job), None, "job_succeeded", "daemon", None).unwrap();
+
+        assert_eq!(latest_event_id(&conn).unwrap(), 2);
+        let events = events_after(&conn, 0, 1).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, 1);
+        assert_eq!(events[0].job_name.as_deref(), Some("event-job"));
+        let events = events_after(&conn, events[0].id, 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, 2);
+        assert_eq!(events[0].event_type, "job_succeeded");
+    }
+
+    #[test]
+    fn notification_queries_bound_job_names() {
+        let conn = open_in_memory().unwrap();
+        let long_name = "x".repeat(2_000);
+        let job = insert_job(&conn, &submit_params(&long_name, 1), 1000).unwrap();
+        update_job_state(&conn, job, JobState::Running, None, 1001).unwrap();
+        append_event(&conn, Some(job), None, "attempt_running", "runner", None).unwrap();
+
+        let names = bounded_job_names_in_state(&conn, JobState::Running, 80, 5).unwrap();
+        assert_eq!(names[0].1.chars().count(), 80);
+        let events = events_after(&conn, 0, 256).unwrap();
+        assert_eq!(events[0].job_name.as_ref().unwrap().chars().count(), 80);
+    }
 }

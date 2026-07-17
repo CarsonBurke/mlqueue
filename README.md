@@ -39,6 +39,7 @@ mlq daemon run            # foreground daemon
 
 mlq submit --name smoke --max-parallel-runs 1 -- python train.py --smoke
 mlq status                # limits, protected job, admission reasons
+mlq follow-tts            # announce completions and newly running work
 mlq logs 1 --follow       # exits with the attempt's outcome
 mlq wait 1 [--timeout 2h] # block until terminal; exit 0 / exit-code / 128+sig
 mlq cancel 1 [--force]
@@ -49,6 +50,10 @@ Workflow commands: `hold`, `release`, `retry`, `set-max-parallel-runs`,
 dependency chains, `--max-attempts`/`--retry-delay` retry policy, and
 `--json` everywhere. Every mutation takes an idempotency key
 (`--idempotency-key`) and is safely retryable.
+
+`mlq follow-tts` uses the backend and voice configured by the local `tts`
+command. Use `--tts-backend BACKEND` to override that selection for this
+follower.
 
 ## Durability
 

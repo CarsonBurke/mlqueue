@@ -11,7 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::domain::{AttemptId, JobId};
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const DEFAULT_MAX_FRAME_BYTES: u32 = 1 << 20;
 
 // Stable error codes.
@@ -43,6 +43,8 @@ pub struct Request {
 pub enum Op {
     Submit(SubmitParams),
     Status,
+    FollowTtsSnapshot,
+    Events { after: i64, limit: u32 },
     Show { job: JobId },
     Logs { job: JobId, attempt: Option<i64> },
     Cancel { job: JobId, force: bool },
@@ -73,6 +75,8 @@ impl Op {
         match self {
             Op::Submit(_) => "submit",
             Op::Status => "status",
+            Op::FollowTtsSnapshot => "follow_tts_snapshot",
+            Op::Events { .. } => "events",
             Op::Show { .. } => "show",
             Op::Logs { .. } => "logs",
             Op::Cancel { .. } => "cancel",
@@ -141,6 +145,8 @@ pub enum Reply {
     Submitted { job: JobView },
     Job { job: JobView },
     Status(StatusView),
+    FollowTtsSnapshot(FollowTtsSnapshotView),
+    Events { events: Vec<EventView> },
     LogPaths(LogPathsView),
     DaemonStatus(DaemonStatusView),
     RecoverList { attempts: Vec<AttemptView> },
@@ -232,6 +238,39 @@ pub struct StatusView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reservation: Option<ReservationView>,
     pub admission_blocked: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FollowTtsSnapshotView {
+    pub running_jobs: Vec<FollowTtsJobView>,
+    pub additional_running_jobs: u32,
+    pub latest_event_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FollowTtsJobView {
+    pub id: JobId,
+    /// Bounded display name suitable for a framed notification response.
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventView {
+    pub id: i64,
+    pub timestamp: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job: Option<JobId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Bounded display name; event details and command data are never exposed.
+    pub job_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<AttemptId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt_number: Option<i64>,
+    pub event_type: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

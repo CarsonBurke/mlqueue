@@ -13,7 +13,7 @@ use crate::client::{self, ClientError};
 use crate::domain::{AttemptState, JobId, JobState};
 use crate::paths::Paths;
 use crate::protocol::{
-    JobView, LogPathsView, Op, Reply, ResolveAs, StatusView, SubmitParams,
+    EventView, JobView, LogPathsView, Op, Reply, ResolveAs, StatusView, SubmitParams,
 };
 
 /// Environment variables captured by default at submission. Everything else
@@ -48,6 +48,12 @@ enum Command {
         watch: bool,
         #[arg(long)]
         json: bool,
+    },
+    /// Announce queue transitions through the local `tts` command.
+    FollowTts {
+        /// Override the backend selected by the local `tts` configuration.
+        #[arg(long)]
+        tts_backend: Option<String>,
     },
     /// Show one job in detail, including its attempts.
     Show {
@@ -223,6 +229,7 @@ pub fn main() -> Result<()> {
     match cli.command {
         Command::Submit(args) => submit(&paths, args, key),
         Command::Status { watch, json } => status(&paths, watch, json),
+        Command::FollowTts { tts_backend } => follow_tts(&paths, tts_backend.as_deref()),
         Command::Show { job, json } => {
             let reply = send(&paths, Op::Show { job }, None)?;
             let Reply::Job { job } = reply else { bail!(client::unexpected("job")) };
@@ -421,6 +428,274 @@ fn status(paths: &Paths, watch: bool, json: bool) -> Result<()> {
     }
 }
 
+fn follow_tts(paths: &Paths, tts_backend: Option<&str>) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    paths.ensure_dirs()?;
+    let mut follower_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(paths.follow_tts_lock())
+        .with_context(|| format!("opening {}", paths.follow_tts_lock().display()))?;
+    let lock_result = unsafe {
+        libc::flock(follower_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
+    };
+    if lock_result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            bail!("another mlq follow-tts process is already running");
+        }
+        return Err(error).context("locking the follow-tts singleton");
+    }
+    follower_lock.set_len(0)?;
+    writeln!(follower_lock, "{}", std::process::id())?;
+
+    let reply = send(paths, Op::FollowTtsSnapshot, None)?;
+    let Reply::FollowTtsSnapshot(snapshot) = reply else {
+        bail!(client::unexpected("follow TTS snapshot"))
+    };
+    let mut cursor = snapshot.latest_event_id;
+
+    println!("following queue with TTS announcements (Ctrl-C to stop)");
+    let mut running = snapshot
+        .running_jobs
+        .iter()
+        .map(|job| spoken_job_name(job.id, &job.name))
+        .collect::<Vec<_>>();
+    if snapshot.additional_running_jobs > 0 {
+        running.push(format!("{} more", snapshot.additional_running_jobs));
+    }
+    let body = if running.is_empty() {
+        "Queue monitor started. No runs are currently active.".to_string()
+    } else {
+        format!("Queue monitor started. Currently running: {}.", running.join(", "))
+    };
+    speak_tts(tts_backend, "ML queue monitor", &body);
+
+    let mut daemon_unavailable = false;
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+        let mut events = match follow_tts_events(paths, &mut cursor) {
+            Ok(events) => {
+                if daemon_unavailable {
+                    eprintln!("mlqd is reachable again; resumed TTS monitoring");
+                    daemon_unavailable = false;
+                }
+                events
+            }
+            Err(error) => {
+                if !daemon_unavailable {
+                    eprintln!("warning: lost contact with mlqd: {error:#}; retrying");
+                    daemon_unavailable = true;
+                }
+                continue;
+            }
+        };
+        if events.is_empty() {
+            continue;
+        }
+        // Give the scheduler one tick to pair a completion with the work it
+        // admits next, producing one useful utterance instead of two.
+        std::thread::sleep(Duration::from_millis(350));
+        match follow_tts_events(paths, &mut cursor) {
+            Ok(more) => events.extend(more),
+            Err(error) => {
+                eprintln!("warning: lost contact with mlqd: {error:#}; retrying");
+                daemon_unavailable = true;
+            }
+        }
+        if let Some(body) = follow_tts_announcement(&events) {
+            println!("{body}");
+            speak_tts(tts_backend, "ML queue update", &body);
+        }
+    }
+}
+
+fn follow_tts_events(paths: &Paths, cursor: &mut i64) -> Result<Vec<EventView>> {
+    const PAGE_SIZE: u32 = 256;
+
+    let mut all = Vec::new();
+    let mut next_cursor = *cursor;
+    loop {
+        let reply = send(paths, Op::Events { after: next_cursor, limit: PAGE_SIZE }, None)?;
+        let Reply::Events { events } = reply else { bail!(client::unexpected("events")) };
+        let full_page = events.len() == PAGE_SIZE as usize;
+        if let Some(last) = events.last() {
+            next_cursor = last.id;
+        }
+        all.extend(events);
+        if !full_page {
+            *cursor = next_cursor;
+            return Ok(all);
+        }
+    }
+}
+
+fn follow_tts_announcement(events: &[EventView]) -> Option<String> {
+    let mut outcomes = Vec::new();
+    let mut started = BTreeMap::new();
+    for event in events {
+        let name = || spoken_event_job(event);
+        match event.event_type.as_str() {
+            "job_succeeded" => {
+                outcomes.push(format!("{} finished successfully", name()));
+                started.remove(&event.job);
+            }
+            "job_failed" => {
+                outcomes.push(format!("{} failed", name()));
+                started.remove(&event.job);
+            }
+            "job_cancelled" => {
+                outcomes.push(format!("{} was cancelled", name()));
+                started.remove(&event.job);
+            }
+            "job_lost" => {
+                outcomes.push(format!("{} was lost", name()));
+                started.remove(&event.job);
+            }
+            "job_skipped" => {
+                outcomes.push(format!("{} was skipped", name()));
+                started.remove(&event.job);
+            }
+            "retry_scheduled" => {
+                outcomes.push(match event.attempt_number {
+                    Some(attempt) => {
+                        format!("Attempt {attempt} for {} failed and a retry is queued", name())
+                    }
+                    None => format!("An attempt for {} failed and a retry is queued", name()),
+                });
+                started.remove(&event.job);
+            }
+            "attempt_orphaned" | "attempt_quarantined" => {
+                outcomes.push(format!("{} needs operator attention", name()));
+                started.remove(&event.job);
+            }
+            "attempt_running" => {
+                started.insert(event.job, name());
+            }
+            _ => {}
+        }
+    }
+    if outcomes.is_empty() && started.is_empty() {
+        return None;
+    }
+
+    const MAX_SPOKEN_OUTCOMES: usize = 8;
+    const MAX_SPOKEN_STARTS: usize = 5;
+
+    let omitted_outcomes = outcomes.len().saturating_sub(MAX_SPOKEN_OUTCOMES);
+    let mut sentences = outcomes.into_iter().take(MAX_SPOKEN_OUTCOMES).collect::<Vec<_>>();
+    if omitted_outcomes > 0 {
+        sentences.push(format!("{omitted_outcomes} more queue updates"));
+    }
+    if !started.is_empty() {
+        let omitted_starts = started.len().saturating_sub(MAX_SPOKEN_STARTS);
+        let mut running = started.into_values().take(MAX_SPOKEN_STARTS).collect::<Vec<_>>();
+        if omitted_starts > 0 {
+            running.push(format!("{omitted_starts} more"));
+        }
+        sentences.push(format!(
+            "Now running: {}",
+            running.join(", ")
+        ));
+    }
+    Some(format!("{}.", sentences.join(". ")))
+}
+
+fn spoken_event_job(event: &EventView) -> String {
+    match (event.job, event.job_name.as_deref()) {
+        (Some(id), Some(name)) => spoken_job_name(id, name),
+        (Some(id), None) => format!("job {id}"),
+        (None, Some(name)) => {
+            let name = normalized_spoken_name(name);
+            if name.is_empty() { "an unnamed job".to_string() } else { name }
+        }
+        (None, None) => "an unknown job".to_string(),
+    }
+}
+
+fn spoken_job_name(id: JobId, name: &str) -> String {
+    let normalized = normalized_spoken_name(name);
+    if normalized.is_empty() {
+        format!("job {id}")
+    } else {
+        format!("job {id}, {normalized}")
+    }
+}
+
+fn normalized_spoken_name(name: &str) -> String {
+    let normalized = name
+        .chars()
+        .map(|character| match character {
+            '_' | '-' => ' ',
+            character if character.is_control() => ' ',
+            character => character,
+        })
+        .collect::<String>();
+    let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate(&normalized, 60)
+}
+
+fn speak_tts(backend: Option<&str>, title: &str, body: &str) {
+    const TTS_TIMEOUT: Duration = Duration::from_secs(60);
+
+    let result = tts_command(backend)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn();
+    let mut child = match result {
+        Ok(child) => child,
+        Err(error) => {
+            eprintln!("warning: could not run tts: {error}; continuing to follow the queue");
+            return;
+        }
+    };
+    let text = format!("{title}. {body}");
+    if let Some(mut stdin) = child.stdin.take()
+        && let Err(error) = stdin.write_all(text.as_bytes())
+    {
+        eprintln!("warning: could not send text to tts: {error}; continuing to follow the queue");
+        let _ = child.kill();
+    }
+    let deadline = Instant::now() + TTS_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return,
+            Ok(Some(status)) => {
+                eprintln!("warning: tts exited with {status}; continuing to follow the queue");
+                return;
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Ok(None) => {
+                eprintln!("warning: tts timed out after 60 seconds; continuing to follow the queue");
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
+            Err(error) => {
+                eprintln!("warning: could not wait for tts: {error}; continuing to follow the queue");
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
+        }
+    }
+}
+
+fn tts_command(backend: Option<&str>) -> std::process::Command {
+    let mut command = std::process::Command::new("tts");
+    command.args(["speak", "--daemon"]);
+    if let Some(backend) = backend {
+        command.args(["--backend", backend]);
+    }
+    command.args(["--level", "status", "--text-stdin"]);
+    command
+}
+
 fn print_status(view: &StatusView) {
     match view.effective_limit {
         Some(limit) => println!(
@@ -468,7 +743,6 @@ fn print_status(view: &StatusView) {
         );
     }
 }
-
 fn print_job_detail(job: &JobView) {
     println!("job {} [{}]", job.id, job.name);
     println!("  state:            {}{}", job.state, match &job.state_reason {
@@ -799,4 +1073,84 @@ fn shell_join(args: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(id: i64, job: JobId, name: &str, event_type: &str) -> EventView {
+        EventView {
+            id,
+            timestamp: id,
+            job: Some(job),
+            job_name: Some(name.into()),
+            attempt: None,
+            attempt_number: None,
+            event_type: event_type.into(),
+        }
+    }
+
+
+    #[test]
+    fn follow_tts_batches_outcomes_retries_and_started_work() {
+        let mut retry = event(2, 2, "retry_job", "retry_scheduled");
+        retry.attempt = Some(20);
+        retry.attempt_number = Some(1);
+        let events = vec![
+            event(1, 1, "finished-job", "job_succeeded"),
+            retry,
+            event(3, 3, "next-job", "attempt_running"),
+        ];
+
+        assert_eq!(
+            follow_tts_announcement(&events).as_deref(),
+            Some(
+                "job 1, finished job finished successfully. Attempt 1 for job 2, retry job failed and a retry is queued. Now running: job 3, next job."
+            )
+        );
+    }
+
+    #[test]
+    fn follow_tts_ignores_irrelevant_events_and_sanitizes_names() {
+        assert!(follow_tts_announcement(&[event(1, 1, "secret", "job_submitted")]).is_none());
+        assert_eq!(spoken_job_name(7, "  odd\nname_with-control\t"), "job 7, odd name with control");
+    }
+
+    #[test]
+    fn follow_tts_bounds_large_announcement_batches() {
+        let events = (1..=10)
+            .map(|id| event(id, id, &format!("failed-{id}"), "job_failed"))
+            .collect::<Vec<_>>();
+        let announcement = follow_tts_announcement(&events).unwrap();
+        assert!(announcement.contains("job 8, failed 8 failed"));
+        assert!(announcement.contains("2 more queue updates"));
+        assert!(!announcement.contains("job 9, failed 9 failed"));
+    }
+
+    #[test]
+    fn follow_tts_inherits_the_default_backend_unless_overridden() {
+        let args = |backend| {
+            tts_command(backend)
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            args(None),
+            ["speak", "--daemon", "--level", "status", "--text-stdin"]
+        );
+        assert_eq!(
+            args(Some("system")),
+            [
+                "speak",
+                "--daemon",
+                "--backend",
+                "system",
+                "--level",
+                "status",
+                "--text-stdin",
+            ]
+        );
+    }
 }

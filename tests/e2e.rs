@@ -2,6 +2,7 @@
 //! isolated in a per-test state directory.
 
 use std::path::PathBuf;
+use std::os::unix::fs::PermissionsExt;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -19,6 +20,23 @@ fn wait_for(what: &str, timeout: Duration, mut check: impl FnMut() -> bool) {
 struct TestQueue {
     dir: tempfile::TempDir,
     daemon: Option<Child>,
+}
+
+struct KillOnDrop(Option<Child>);
+
+impl KillOnDrop {
+    fn stop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 impl TestQueue {
@@ -152,6 +170,81 @@ fn submit_runs_captures_logs_and_reports() {
 }
 
 
+#[test]
+fn follow_tts_announces_completion_and_the_next_running_job() {
+    let mut q = TestQueue::new();
+    let fake_bin = q.dir.path().join("fake-bin");
+    std::fs::create_dir(&fake_bin).unwrap();
+    let fake_tts = fake_bin.join("tts");
+    std::fs::write(
+        &fake_tts,
+        "#!/bin/sh\nprintf 'ARGS: %s\\n' \"$*\" >> \"$MLQ_TTS_LOG\"\ncat >> \"$MLQ_TTS_LOG\"\nprintf '\\n' >> \"$MLQ_TTS_LOG\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_tts, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let tts_log = q.dir.path().join("tts.log");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mlq"));
+    q.apply_env(&mut command);
+    command
+        .arg("follow-tts")
+        .env("MLQ_TTS_LOG", &tts_log)
+        .env(
+            "PATH",
+            format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap_or_default()),
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut follower = KillOnDrop(Some(command.spawn().unwrap()));
+    wait_for("initial TTS announcement", Duration::from_secs(5), || {
+        std::fs::read_to_string(&tts_log)
+            .is_ok_and(|text| text.contains("Queue monitor started"))
+    });
+    let duplicate = q.try_cli(&["follow-tts"]);
+    assert!(!duplicate.status.success());
+    assert!(
+        String::from_utf8_lossy(&duplicate.stderr).contains("already running"),
+        "{}",
+        String::from_utf8_lossy(&duplicate.stderr)
+    );
+
+    let first = q.submit(&["--name", "tts-first"], &["sleep", "0.4"]);
+    let next = q.submit(
+        &["--name", "tts-next", "--after-success", &first.to_string()],
+        &["sleep", "2"],
+    );
+    q.wait_state(next, "running", Duration::from_secs(10));
+    let expected_finished = format!("job {first}, tts first finished successfully");
+    let expected_running = format!("Now running: job {next}, tts next");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let spoken = loop {
+        let spoken = std::fs::read_to_string(&tts_log).unwrap_or_default();
+        if spoken.contains(&expected_finished) && spoken.contains(&expected_running) {
+            break spoken;
+        }
+        if Instant::now() >= deadline {
+            break spoken;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    // The durable event cursor survives a daemon restart while the follower
+    // and managed command remain alive.
+    q.kill_daemon();
+    q.start_daemon();
+    q.wait_state(next, "succeeded", Duration::from_secs(10));
+    let expected_next_finished = format!("job {next}, tts next finished successfully");
+    wait_for("post-restart TTS announcement", Duration::from_secs(10), || {
+        std::fs::read_to_string(&tts_log)
+            .is_ok_and(|text| text.contains(&expected_next_finished))
+    });
+
+    follower.stop();
+    assert!(spoken.contains(&expected_finished), "missing finish announcement:\n{spoken}");
+    assert!(spoken.contains(&expected_running), "missing running announcement:\n{spoken}");
+    assert!(spoken.contains("ARGS: speak --daemon --level status --text-stdin"), "{spoken}");
+    assert!(!spoken.contains("--backend"), "default TTS backend was overridden: {spoken}");
+}
 
 #[test]
 fn default_limit_serializes_jobs() {
