@@ -1,0 +1,22 @@
+# User-level unit for the mlqueue daemon.
+#
+#   install -Dm644 contrib/systemd/mlqueued.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now mlqueued
+#
+# Runners are spawned into their own sessions, so restarting or upgrading the
+# daemon does not kill workers; the restarted daemon adopts them.
+
+[Unit]
+Description=mlqueue machine-wide ML job queue daemon
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/mlqueued
+Restart=on-failure
+RestartSec=2
+# Workers must survive daemon restarts: kill only the daemon process itself.
+KillMode=process
+
+[Install]
+WantedBy=default.target
