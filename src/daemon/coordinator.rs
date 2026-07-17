@@ -786,36 +786,76 @@ impl Coordinator {
 
     fn schedule(&mut self) -> Result<()> {
         if self.admission_blocked.is_some() {
-            return Ok(());
+            // Blocked admission heals once the offending reservation is gone
+            // or interpretable again (the operator cancelled or held the
+            // protected job — an explicit, audited resolution); requiring a
+            // daemon restart on top of that would strand the queue.
+            let still_blocked = match db::active_reservation(&self.conn)? {
+                Some(res) => matches!(
+                    db::backfill_frontier(&self.conn, &res)?,
+                    db::BackfillFrontier::Unsupported(_)
+                ),
+                None => false,
+            };
+            if still_blocked {
+                return Ok(());
+            }
+            tracing::info!("admission unblocked: the unsupported reservation was resolved");
+            self.admission_blocked = None;
         }
         let now = now_ms();
         let leases = db::active_leases(&self.conn)?;
         let reservation = db::active_reservation(&self.conn)?;
-        if let Some(res) = &reservation
-            && res.semantics_version != SCHEDULER_SEMANTICS_VERSION
-        {
-            let reason = format!(
-                "active reservation {} uses scheduler semantics version {} (daemon implements {}); \
-                 admission blocked until an operator migrates or resolves it",
-                res.id, res.semantics_version, SCHEDULER_SEMANTICS_VERSION
-            );
-            tracing::error!("{reason}");
-            self.admission_blocked = Some(reason);
-            return Ok(());
-        }
+
+        // Interpret the persisted reservation under its recorded semantics
+        // version. `pending_freeze` carries the cutoff to pin if the backfill
+        // window closed this pass and the reservation survives it.
+        let mut pending_freeze: Option<i64> = None;
+        let snapshot = match &reservation {
+            None => None,
+            Some(res) => {
+                let cutoff_seq = match db::backfill_frontier(&self.conn, res)? {
+                    db::BackfillFrontier::OpenWindow => None,
+                    db::BackfillFrontier::Frozen(cutoff) => Some(cutoff),
+                    // The window just closed: this pass already plans against
+                    // the frontier it is about to pin.
+                    db::BackfillFrontier::FreezePending(cutoff) => {
+                        pending_freeze = Some(cutoff);
+                        Some(cutoff)
+                    }
+                    db::BackfillFrontier::Unsupported(version) => {
+                        let reason = format!(
+                            "active reservation {} uses scheduler semantics version {version} \
+                             (daemon implements {}); admission blocked until an operator \
+                             migrates or resolves it",
+                            res.id, SCHEDULER_SEMANTICS_VERSION
+                        );
+                        tracing::error!("{reason}");
+                        self.admission_blocked = Some(reason);
+                        return Ok(());
+                    }
+                };
+                Some(ReservationSnapshot {
+                    job_id: res.job_id,
+                    cutoff_seq,
+                    consumed: res.consumed.clone(),
+                })
+            }
+        };
+
         let eligible = db::eligible_candidates(&self.conn, now)?;
-        let max_seq = db::max_job_seq(&self.conn)?;
         let active: Vec<_> = leases.iter().map(|(_, lease)| lease.clone()).collect();
-        let snapshot = reservation.as_ref().map(|res| ReservationSnapshot {
-            job_id: res.job_id,
-            cutoff_seq: res.cutoff_seq,
-            consumed: res.consumed.clone(),
-        });
-        let outcome = scheduler::plan_pass(&active, &eligible, snapshot.as_ref(), max_seq);
+        let outcome = scheduler::plan_pass(&active, &eligible, snapshot.as_ref());
+        // A freeze is only persisted when the reservation outlives the pass;
+        // a satisfied or invalidated reservation is resolved instead.
+        let commit_freeze = pending_freeze.is_some()
+            && !outcome.satisfy_reservation
+            && outcome.invalidate_reservation.is_none();
         if outcome.starts.is_empty()
             && !outcome.satisfy_reservation
             && outcome.invalidate_reservation.is_none()
             && outcome.create_reservation.is_none()
+            && !commit_freeze
         {
             return Ok(());
         }
@@ -857,6 +897,23 @@ impl Coordinator {
                 launched.push(attempt.id);
             }
 
+            if commit_freeze {
+                let (id, job, cutoff) = reservation
+                    .as_ref()
+                    .zip(pending_freeze)
+                    .map(|(res, cutoff)| (res.id, res.job_id, cutoff))
+                    .context("freeze without reservation")?;
+                db::freeze_reservation_cutoff(&tx, id, cutoff)?;
+                db::append_event(
+                    &tx,
+                    Some(job),
+                    None,
+                    "backfill_cutoff_frozen",
+                    "daemon",
+                    Some(&json!({ "backfillCutoff": cutoff }).to_string()),
+                )?;
+            }
+
             let mut current_reservation = reservation.as_ref().map(|res| (res.id, res.job_id));
             if outcome.satisfy_reservation {
                 let (id, job) = current_reservation.take().context("satisfy without reservation")?;
@@ -891,7 +948,6 @@ impl Coordinator {
                 let rid = db::create_reservation(
                     &tx,
                     new_res.job_id,
-                    new_res.cutoff_seq,
                     SCHEDULER_SEMANTICS_VERSION,
                     &blockers,
                     now,
@@ -909,7 +965,7 @@ impl Coordinator {
                     "daemon",
                     Some(
                         &json!({
-                            "backfillCutoff": new_res.cutoff_seq,
+                            "initialBlockers": blockers,
                             "initialConsumed": new_res.initial_consumed,
                         })
                         .to_string(),

@@ -13,7 +13,14 @@ pub type AttemptId = i64;
 /// Version stamped on persisted scheduler reservations. If a future upgrade
 /// cannot interpret an active reservation's version exactly, it must block
 /// ordinary admission instead of silently clearing the reservation.
-pub const SCHEDULER_SEMANTICS_VERSION: i64 = 1;
+///
+/// Version history:
+/// - 1: backfill cutoff frozen at reservation creation. An active v1
+///   reservation is still interpreted exactly, as a permanently frozen
+///   frontier at its stored cutoff.
+/// - 2: blocker-scoped backfill window. The cutoff starts as the unfrozen
+///   sentinel and is pinned once, when the initial blockers stop advancing.
+pub const SCHEDULER_SEMANTICS_VERSION: i64 = 2;
 
 pub fn now_ms() -> i64 {
     SystemTime::now()

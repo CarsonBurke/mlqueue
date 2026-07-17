@@ -9,7 +9,9 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::domain::{AttemptId, AttemptState, DepRequirement, JobId, JobState, now_ms};
+use crate::domain::{
+    AttemptId, AttemptState, DepRequirement, JobId, JobState, SCHEDULER_SEMANTICS_VERSION, now_ms,
+};
 use crate::protocol::SubmitParams;
 use crate::scheduler::{ActiveLease, Candidate};
 
@@ -413,6 +415,7 @@ pub fn count_jobs_in_state(conn: &Connection, state: JobState) -> Result<u32> {
     )?)
 }
 
+
 // ---------------------------------------------------------------------------
 // Dependencies
 // ---------------------------------------------------------------------------
@@ -673,6 +676,12 @@ pub fn set_attempt_cancel_requested(
 // Reservation
 // ---------------------------------------------------------------------------
 
+/// Sentinel `cutoff_seq` for a reservation whose backfill window is still
+/// open. Job sequences start at 1, so 0 is unambiguous, and it keeps the
+/// column NOT NULL: the freeze can then be made idempotent (pin the real
+/// cutoff exactly once, when the window closes) without a schema change.
+pub const RESERVATION_CUTOFF_UNFROZEN: i64 = 0;
+
 pub fn active_reservation(conn: &Connection) -> Result<Option<ReservationRow>> {
     let row = conn
         .query_row(
@@ -703,10 +712,12 @@ pub fn active_reservation(conn: &Connection) -> Result<Option<ReservationRow>> {
     Ok(Some(reservation))
 }
 
+/// Create an active reservation with an open backfill window
+/// ([`RESERVATION_CUTOFF_UNFROZEN`]); the cutoff is pinned later by
+/// [`freeze_reservation_cutoff`] when the initial blockers stop advancing.
 pub fn create_reservation(
     conn: &Connection,
     job: JobId,
-    cutoff_seq: i64,
     semantics_version: i64,
     initial_blockers: &[AttemptId],
     now: i64,
@@ -715,9 +726,84 @@ pub fn create_reservation(
         "INSERT INTO scheduler_reservation \
          (job_id, cutoff_seq, semantics_version, status, initial_blockers, created_at) \
          VALUES (?1, ?2, ?3, 'active', ?4, ?5)",
-        params![job, cutoff_seq, semantics_version, serde_json::to_string(initial_blockers)?, now],
+        params![
+            job,
+            RESERVATION_CUTOFF_UNFROZEN,
+            semantics_version,
+            serde_json::to_string(initial_blockers)?,
+            now
+        ],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// Pin the frozen backfill cutoff. Guarded on the sentinel so a repeated
+/// call (crash between commit and observation, or a racing recomputation)
+/// can never advance an already-frozen frontier.
+pub fn freeze_reservation_cutoff(conn: &Connection, id: i64, cutoff_seq: i64) -> Result<()> {
+    debug_assert!(cutoff_seq != RESERVATION_CUTOFF_UNFROZEN);
+    conn.execute(
+        "UPDATE scheduler_reservation SET cutoff_seq = ?2 \
+         WHERE id = ?1 AND cutoff_seq = ?3",
+        params![id, cutoff_seq, RESERVATION_CUTOFF_UNFROZEN],
+    )?;
+    Ok(())
+}
+
+/// The backfill frontier of an active reservation, as scheduling interprets
+/// it right now. Single source of truth for the coordinator and the views.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackfillFrontier {
+    /// An initial blocker is still advancing: any eligible job whose bypass
+    /// is unconsumed may pass the protected job once.
+    OpenWindow,
+    /// The window closed but the sentinel is still stored; the next pass
+    /// plans against this cutoff and pins it.
+    FreezePending(i64),
+    /// Pinned: jobs submitted after the cutoff may not pass.
+    Frozen(i64),
+    /// Unknown semantics version; ordinary admission must stay blocked.
+    Unsupported(i64),
+}
+
+pub fn backfill_frontier(conn: &Connection, res: &ReservationRow) -> Result<BackfillFrontier> {
+    match res.semantics_version {
+        // v1 froze the cutoff at creation; a permanently frozen frontier at
+        // the stored cutoff remains its exact meaning.
+        1 => Ok(BackfillFrontier::Frozen(res.cutoff_seq)),
+        SCHEDULER_SEMANTICS_VERSION => {
+            if res.cutoff_seq != RESERVATION_CUTOFF_UNFROZEN {
+                Ok(BackfillFrontier::Frozen(res.cutoff_seq))
+            } else if any_blockers_advancing(conn, &res.initial_blockers)? {
+                Ok(BackfillFrontier::OpenWindow)
+            } else {
+                Ok(BackfillFrontier::FreezePending(max_job_seq(conn)?))
+            }
+        }
+        version => Ok(BackfillFrontier::Unsupported(version)),
+    }
+}
+
+/// True while any of the given attempts still holds an unreleased run lease
+/// in a live-advancing state. Orphaned and quarantined attempts retain their
+/// leases until resolved, but no longer advance: counting them would hold a
+/// protected job's backfill window open indefinitely, admitting an unbounded
+/// stream of later arrivals past it.
+pub fn any_blockers_advancing(conn: &Connection, attempts: &[AttemptId]) -> Result<bool> {
+    if attempts.is_empty() {
+        return Ok(false);
+    }
+    let placeholders = vec!["?"; attempts.len()].join(",");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT EXISTS (
+             SELECT 1 FROM run_leases l
+             JOIN attempts a ON a.id = l.attempt_id
+             WHERE l.released_at IS NULL
+               AND a.state IN ('prepared','authorized','running')
+               AND l.attempt_id IN ({placeholders})
+         )"
+    ))?;
+    Ok(stmt.query_row(rusqlite::params_from_iter(attempts.iter()), |row| row.get(0))?)
 }
 
 pub fn resolve_reservation(
@@ -910,8 +996,8 @@ mod tests {
         let conn = open_in_memory().unwrap();
         let a = insert_job(&conn, &submit_params("a", 1), 1000).unwrap();
         let b = insert_job(&conn, &submit_params("b", 1), 1001).unwrap();
-        let res = create_reservation(&conn, a, 10, 1, &[7], 1002).unwrap();
-        assert!(create_reservation(&conn, b, 11, 1, &[], 1003).is_err());
+        let res = create_reservation(&conn, a, SCHEDULER_SEMANTICS_VERSION, &[7], 1002).unwrap();
+        assert!(create_reservation(&conn, b, SCHEDULER_SEMANTICS_VERSION, &[], 1003).is_err());
 
         record_backfill(&conn, res, b, "admitted", None, 1004).unwrap();
         // Second consumption attempt is ignored, not duplicated.
@@ -919,12 +1005,91 @@ mod tests {
 
         let restored = active_reservation(&conn).unwrap().unwrap();
         assert_eq!(restored.job_id, a);
-        assert_eq!(restored.cutoff_seq, 10);
+        assert_eq!(restored.cutoff_seq, RESERVATION_CUTOFF_UNFROZEN);
         assert_eq!(restored.initial_blockers, vec![7]);
         assert_eq!(restored.consumed, BTreeSet::from([b]));
 
         resolve_reservation(&conn, res, "satisfied", "protected job started", 2000).unwrap();
         assert!(active_reservation(&conn).unwrap().is_none());
+    }
+
+    #[test]
+    fn freezing_the_cutoff_is_idempotent() {
+        let conn = open_in_memory().unwrap();
+        let a = insert_job(&conn, &submit_params("a", 1), 1000).unwrap();
+        let res = create_reservation(&conn, a, SCHEDULER_SEMANTICS_VERSION, &[7], 1001).unwrap();
+
+        freeze_reservation_cutoff(&conn, res, 9).unwrap();
+        assert_eq!(active_reservation(&conn).unwrap().unwrap().cutoff_seq, 9);
+        // A later attempt (crash replay, racing recomputation) must never
+        // advance an already-frozen frontier.
+        freeze_reservation_cutoff(&conn, res, 42).unwrap();
+        assert_eq!(active_reservation(&conn).unwrap().unwrap().cutoff_seq, 9);
+    }
+
+    #[test]
+    fn backfill_frontier_interprets_versions_and_window_state() {
+        let conn = open_in_memory().unwrap();
+        let blocker_job = insert_job(&conn, &submit_params("blocker", 2), 1000).unwrap();
+        let row = job_row(&conn, blocker_job).unwrap().unwrap();
+        let attempt = create_attempt_with_lease(&conn, &row, "token", 1001).unwrap();
+        let protected = insert_job(&conn, &submit_params("protected", 1), 1002).unwrap();
+
+        // Native version with a live blocker: the window is open.
+        let rid =
+            create_reservation(&conn, protected, SCHEDULER_SEMANTICS_VERSION, &[attempt.id], 1003)
+                .unwrap();
+        let res = active_reservation(&conn).unwrap().unwrap();
+        assert_eq!(backfill_frontier(&conn, &res).unwrap(), BackfillFrontier::OpenWindow);
+
+        // Blocker drained: a freeze at the current maximum sequence is
+        // pending, then pinning makes it durable.
+        release_lease(&conn, attempt.id, 1004).unwrap();
+        assert_eq!(
+            backfill_frontier(&conn, &res).unwrap(),
+            BackfillFrontier::FreezePending(protected)
+        );
+        freeze_reservation_cutoff(&conn, rid, protected).unwrap();
+        let res = active_reservation(&conn).unwrap().unwrap();
+        assert_eq!(backfill_frontier(&conn, &res).unwrap(), BackfillFrontier::Frozen(protected));
+        resolve_reservation(&conn, rid, "invalidated", "test", 1005).unwrap();
+
+        // A v1 reservation stays frozen at its stored cutoff even while a
+        // blocker still runs: it never gains an open window retroactively.
+        let row = job_row(&conn, blocker_job).unwrap().unwrap();
+        let live = create_attempt_with_lease(&conn, &row, "token-2", 1006).unwrap();
+        let rid = create_reservation(&conn, protected, 1, &[live.id], 1007).unwrap();
+        freeze_reservation_cutoff(&conn, rid, 1).unwrap();
+        let res = active_reservation(&conn).unwrap().unwrap();
+        assert!(any_blockers_advancing(&conn, &res.initial_blockers).unwrap());
+        assert_eq!(backfill_frontier(&conn, &res).unwrap(), BackfillFrontier::Frozen(1));
+        resolve_reservation(&conn, rid, "invalidated", "test", 1008).unwrap();
+
+        // Unknown versions must surface as unsupported, never as a guess.
+        create_reservation(&conn, protected, 99, &[], 1009).unwrap();
+        let res = active_reservation(&conn).unwrap().unwrap();
+        assert_eq!(backfill_frontier(&conn, &res).unwrap(), BackfillFrontier::Unsupported(99));
+    }
+
+    #[test]
+    fn blockers_advance_only_while_leased_in_a_live_state() {
+        let conn = open_in_memory().unwrap();
+        let job = insert_job(&conn, &submit_params("blocker", 2), 1000).unwrap();
+        let row = job_row(&conn, job).unwrap().unwrap();
+        let attempt = create_attempt_with_lease(&conn, &row, "token", 1001).unwrap();
+
+        assert!(!any_blockers_advancing(&conn, &[]).unwrap());
+        assert!(any_blockers_advancing(&conn, &[attempt.id]).unwrap());
+
+        // Orphaned/quarantined attempts keep their lease but stop advancing:
+        // the backfill window must not stay open on their account.
+        set_attempt_state(&conn, attempt.id, AttemptState::Orphaned, None).unwrap();
+        assert!(!any_blockers_advancing(&conn, &[attempt.id]).unwrap());
+
+        set_attempt_state(&conn, attempt.id, AttemptState::Running, None).unwrap();
+        assert!(any_blockers_advancing(&conn, &[attempt.id]).unwrap());
+        release_lease(&conn, attempt.id, 2000).unwrap();
+        assert!(!any_blockers_advancing(&conn, &[attempt.id]).unwrap());
     }
 
     #[test]
@@ -967,4 +1132,5 @@ mod tests {
         assert!(insert_operation(&conn, "k1", "submit", "hash-b", "{}", 1001).is_err());
         assert!(lookup_operation(&conn, "missing").unwrap().is_none());
     }
+
 }

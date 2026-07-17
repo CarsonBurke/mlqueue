@@ -66,21 +66,38 @@ fn eligibility_reason(
             } else if let Some(res) = reservation {
                 if res.job_id == job.id {
                     Some("protected_drain: waiting for active jobs to drain".to_string())
-                } else if job.id > res.cutoff_seq {
-                    Some(format!(
-                        "behind_backfill_cutoff: submitted after job {} was protected",
-                        res.job_id
-                    ))
                 } else if res.consumed.contains(&job.id) {
                     Some(format!(
                         "backfill_bypass_consumed: already bypassed protected job {} once",
                         res.job_id
                     ))
                 } else {
-                    Some(format!(
-                        "backfill_eligible: may bypass protected job {} once when a slot opens",
-                        res.job_id
-                    ))
+                    match db::backfill_frontier(conn, res)? {
+                        db::BackfillFrontier::OpenWindow => Some(format!(
+                            "backfill_window_open: may bypass protected job {} once while \
+                             its original blockers run",
+                            res.job_id
+                        )),
+                        db::BackfillFrontier::Frozen(cutoff)
+                        | db::BackfillFrontier::FreezePending(cutoff) => {
+                            if job.id > cutoff {
+                                Some(format!(
+                                    "behind_backfill_cutoff: submitted after job {}'s backfill \
+                                     frontier froze",
+                                    res.job_id
+                                ))
+                            } else {
+                                Some(format!(
+                                    "backfill_eligible: may bypass protected job {} once when \
+                                     a slot opens",
+                                    res.job_id
+                                ))
+                            }
+                        }
+                        db::BackfillFrontier::Unsupported(_) => Some(
+                            "admission_blocked: reservation needs operator attention".to_string(),
+                        ),
+                    }
                 }
             } else {
                 Some("waiting_for_slot".to_string())
@@ -142,13 +159,26 @@ pub fn status_view(conn: &Connection, paths: &Paths, admission_blocked: bool) ->
         jobs,
         active_leases: leases.len() as u32,
         effective_limit: leases.iter().map(|(_, lease)| lease.limit).min(),
-        reservation: reservation.map(|res| ReservationView {
-            protected_job: res.job_id,
-            backfill_cutoff: res.cutoff_seq,
-            created_at: res.created_at,
-            blocking_attempts: leases.iter().map(|(attempt, _)| *attempt).collect(),
-            consumed_bypasses: res.consumed.iter().copied().collect(),
-        }),
+        reservation: match reservation {
+            Some(res) => {
+                let (window_open, cutoff) = match db::backfill_frontier(conn, &res)? {
+                    db::BackfillFrontier::OpenWindow => (true, None),
+                    db::BackfillFrontier::Frozen(cutoff)
+                    | db::BackfillFrontier::FreezePending(cutoff) => (false, Some(cutoff)),
+                    db::BackfillFrontier::Unsupported(_) => (false, None),
+                };
+                Some(ReservationView {
+                    protected_job: res.job_id,
+                    backfill_window_open: window_open,
+                    backfill_cutoff: cutoff,
+                    created_at: res.created_at,
+                    blocking_attempts: leases.iter().map(|(attempt, _)| *attempt).collect(),
+                    consumed_bypasses: res.consumed.iter().copied().collect(),
+                })
+            }
+            None => None,
+        },
         admission_blocked,
     })
 }
+

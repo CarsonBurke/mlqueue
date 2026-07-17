@@ -114,8 +114,9 @@ On each scheduling pass:
 1. Reconcile active run leases and terminal attempts.
 2. Start an existing protected job immediately if it is now compatible.
 3. If a reservation exists and its owner is still blocked, restrict candidates
-   to eligible pre-cutoff jobs whose one bypass is not consumed. Post-cutoff
-   jobs are not part of this scheduling pass.
+   to eligible jobs whose one bypass is not consumed: every such job while the
+   backfill window is open, only those at or before the frozen cutoff once the
+   window has closed. Later jobs are not part of that scheduling pass.
 4. Without a reservation, consider every eligible job in FIFO order. When the
    first job is incompatible with the cumulative shadow set, protect it before
    considering lower jobs. Seed the consumed set with attempts already active
@@ -138,44 +139,75 @@ running. Stopping all admissions immediately wastes concurrency those running
 jobs explicitly allow; letting every later permissive arrival pass can starve
 the restrictive job.
 
-Use a frozen backfill frontier:
+Use a backfill window scoped to the protected job's original blockers, then a
+frozen frontier:
 
 1. When the highest-ranked job cannot start only because of the active
-   concurrency limits, persist it as the protected job.
-2. Record the current maximum submission sequence as its backfill cutoff.
-3. On every pass, derive the backfill set as all currently eligible, unconsumed
-   jobs submitted at or before that cutoff, excluding the protected job. This
-   includes a previously held or dependency-delayed job that later becomes
-   eligible; membership is not snapshotted separately.
-4. Admit compatible jobs from that finite set in FIFO order.
-5. Record each job that starts as a backfill; the same job cannot bypass this
-   reservation again through a retry or another attempt.
-6. Jobs submitted after the cutoff may not pass the protected job.
+   concurrency limits, persist it as the protected job together with its
+   initial blockers: the attempts holding (shadow) leases at that moment.
+2. While any initial blocker still holds its lease in a live-advancing state
+   (prepared, authorized, or running), the backfill window is open: every
+   eligible job whose bypass is unconsumed may pass the protected job,
+   regardless of submission order. The machine was already busy with work
+   that predates the protection; open slots are not idled on its account.
+3. On the first pass after the last initial blocker stops advancing, freeze
+   the frontier: pin the current maximum submission sequence as the backfill
+   cutoff, exactly once. The stored cutoff is an explicit unfrozen sentinel
+   until then, so a crash between drain and pinning merely re-freezes at a
+   slightly later, still finite, sequence — and a pinned cutoff can never be
+   advanced again.
+4. After the freeze, derive the backfill set as all currently eligible,
+   unconsumed jobs submitted at or before the cutoff, excluding the protected
+   job. This includes a previously held or dependency-delayed job that later
+   becomes eligible; membership is not snapshotted separately.
+5. Admit compatible candidates in FIFO order. Record each job that starts as
+   a backfill; the same job cannot bypass this reservation again through a
+   retry or another attempt, in the open window or after the freeze.
+6. Jobs submitted after the frozen cutoff may not pass the protected job.
 7. When nothing fits, launch nothing. Re-run the same checks after an active
    attempt finishes; do not mistake “currently full” for an exhausted frontier.
 8. Start the protected job as soon as the compatibility formula permits,
    before reconsidering any backfill.
 
-The cutoff plus one-bypass-per-job rule bounds scheduler-created starvation
-without requiring duration estimates or assuming retries are finite. Seed the
-consumed set with the jobs already active when protection is created so their
-retries cannot become fresh backfills. Existing queued jobs can still delay the
-protected job once each; that is the explicit utilization/fairness tradeoff.
+The window plus one-bypass-per-job rule bounds scheduler-created starvation
+without requiring duration estimates or assuming retries are finite: the
+window closes when the finite initial blocker set terminates, and the frozen
+frontier is finite thereafter. Orphaned or quarantined blockers retain their
+leases (the protected job still waits for containment) but count as drained
+for the window, so an attempt that stopped advancing can never hold the
+window open for an unbounded stream of newcomers. Seed the consumed set with
+the jobs already active when protection is created so their retries cannot
+become fresh backfills.
+
+This deliberately inverts the tradeoff of the earlier freeze-at-creation
+design. There, a reservation was created on the restrictive job's own
+submission tick with an empty frontier behind it, so in incremental use no
+later submission could ever backfill: slots idled, and the protected job
+started at the earliest drain. Now slots stay busy through the window and the
+protected job may wait longer — for the window's backfills and the frozen
+frontier to drain too. A job declared `maxParallelRuns 1` asked to run alone,
+not to run soon; jobs present before its original blockers cleared may delay
+it once each. The simpler alternative — closing the window with no frozen
+frontier at all, letting the machine drain immediately — was rejected because
+it re-idles slots for every job that arrived during a possibly hours-long
+window without ever getting a slot, which is the same waste this design
+removes, one step later.
 
 Consume a job's bypass when its prepared attempt and run lease are acquired,
 even if launch later fails or is cancelled. Reservation creation and seeding,
-a backfill lease and consumption row, protected-job lease and reservation
-satisfaction, or an invalidating hold/cancel/limit mutation are each atomic
-transactions. Recovery therefore never reconstructs fairness from partial
-events.
+a backfill lease and consumption row, a cutoff freeze, protected-job lease
+and reservation satisfaction, or an invalidating hold/cancel/limit mutation
+are each atomic transactions. Recovery therefore never reconstructs fairness
+from partial events; the window itself is re-derived from durable leases and
+attempt states, never from history.
 
-In the motivating example, suppose two CleanRL runs with limit `3` are active,
-an LLM job with limit `1` is first in line, and five CleanRL jobs are already
-behind it. The LLM becomes protected. A queued CleanRL job may take the empty
-third position because the resulting set is valid at three-wide. Other
-pre-cutoff CleanRL jobs may continue to backfill as positions open. CleanRL
-jobs submitted after protection cannot pass. When the frozen set is exhausted,
-the active runs drain and the LLM starts alone.
+In the motivating example, suppose two CleanRL runs with limit `3` are active
+and an LLM job with limit `1` is submitted. The LLM becomes protected with
+the two CleanRL attempts as its initial blockers. CleanRL jobs submitted
+afterwards keep taking the empty third position, once each, because the
+resulting set is valid at three-wide. When both original CleanRL runs finish,
+the frontier freezes: jobs submitted from then on wait behind the LLM, the
+already-admitted backfills drain, and the LLM starts alone.
 
 ### Reservation lifecycle
 
@@ -183,8 +215,10 @@ Persist one global protected-job reservation in the MVP because there is one
 global concurrency domain. It contains:
 
 - Protected job ID.
-- Backfill cutoff submission sequence.
-- Creation time and the running attempt IDs that initially blocked it.
+- Backfill cutoff submission sequence: an unfrozen sentinel while the window
+  is open, pinned exactly once when the initial blockers stop advancing.
+- Creation time and the attempt IDs that initially blocked it, which also
+  scope the backfill window.
 - Initially active and subsequently admitted job IDs whose one bypass has been
   consumed.
 - Scheduler-semantics version.
@@ -198,8 +232,14 @@ If a software upgrade cannot interpret an active reservation's scheduler-
 semantics version exactly, restore no ordinary admission. Surface an operator-
 attention state until an explicit audited migration preserves or invalidates
 the reservation; never silently clear it and let post-cutoff jobs pass.
+Cancelling or holding the protected job remains possible while blocked and is
+itself an audited resolution: once the offending reservation is resolved,
+ordinary admission resumes without a daemon restart. An active version-1
+reservation is interpretable exactly: its cutoff was frozen at creation, so
+it schedules as a permanently frozen frontier and never gains an open window
+retroactively.
 
-If a pre-cutoff backfill never terminates, the non-preemptive queue cannot
+If an admitted backfill never terminates, the non-preemptive queue cannot
 guarantee that the protected job starts. It stops admitting further work and
 reports the blocker; it does not pretend the concurrency parameter is a time
 limit.
@@ -220,7 +260,8 @@ special scheduler mode; it falls naturally out of the same formula.
   `maxParallelRuns` declaration.
 - Run leases are not released until the attempt's process group is empty.
 - A protected job is considered before ordinary admissions on every pass.
-- Jobs after a protected job's frozen cutoff cannot bypass it.
+- Jobs submitted after a protected job's frontier froze cannot bypass it, and
+  no job bypasses it more than once.
 - Submission and state transitions are durable under concurrent agents.
 - Commands are argument vectors with explicit working directories and
   environments; no shell string is reconstructed.
@@ -369,8 +410,8 @@ serialized coordinator prevent double starts.
 ### `scheduler_reservation`
 
 - Protected job ID.
-- Frozen backfill cutoff sequence.
-- Initial blocker attempt IDs.
+- Backfill cutoff sequence (unfrozen sentinel until the window closes).
+- Initial blocker attempt IDs, which also scope the backfill window.
 - Creation, invalidation, and satisfaction records.
 - Scheduler-semantics version.
 
@@ -437,8 +478,8 @@ retain their leases until the process group is proven empty or an operator
 resolves them safely.
 
 Eligibility reasons such as `waiting_for_dependency`, `waiting_for_slot`,
-`protected_drain`, and `behind_backfill_cutoff` are derived status fields, not
-persisted job states.
+`protected_drain`, `backfill_window_open`, and `behind_backfill_cutoff` are
+derived status fields, not persisted job states.
 
 Attempts never return from a terminal state. An idempotent retry moves an
 eligible failed/lost job to `queued`; the scheduler later creates the next
@@ -571,7 +612,7 @@ and inserted atomically with the job. Human and JSON status explain:
 - The declared limit for every job and active attempt.
 - Current run-lease count and effective minimum running limit.
 - Why a candidate is incompatible.
-- The protected job and frozen cutoff.
+- The protected job, and its open window or frozen cutoff.
 - Whether a queued job is eligible to backfill or arrived too late.
 - The attempts that currently prevent the protected job from starting.
 
@@ -673,7 +714,7 @@ ordinary configuration does not alter the concurrency formula or cutoff rules.
 - Define job/attempt states, positive concurrency limits, leases, reservation,
   decisions, protocol envelopes, and stable error types.
 - Implement the compatibility formula as a pure function.
-- Implement frozen-frontier scheduling with a fake clock and deterministic job
+- Implement windowed-then-frozen backfill scheduling with deterministic job
   fixtures.
 - Implement XDG paths, config validation, and embedded migrations.
 
@@ -681,7 +722,7 @@ Exit criteria:
 
 - Empty and mixed-limit examples match the documented formula.
 - Sequential shadow admission never creates an invalid active set.
-- A protected job starts before post-cutoff arrivals.
+- A protected job starts before arrivals its frontier froze out.
 - A temporary database migrates from empty to current.
 
 ### Phase 1: durable CPU-only vertical slice
@@ -755,11 +796,14 @@ they require a demonstrated need that `maxParallelRuns` cannot solve.
 - Batch decisions are evaluated cumulatively.
 - A restrictive candidate never starts beside an incompatible permissive job.
 - A permissive candidate never starts beside a restrictive running job.
-- Pre-cutoff backfills may pass; post-cutoff arrivals never pass.
+- Any eligible job may pass once while the window is open; post-cutoff
+  arrivals never pass a frozen frontier.
 - Cancelling, holding, or changing the limit of the protected job invalidates its
   reservation deterministically.
-- Reservations restore identically after daemon restart.
-- Continuous new arrivals cannot extend a frozen frontier.
+- Reservations restore identically after daemon restart; the window is
+  re-derived from durable leases and attempt states.
+- Continuous new arrivals cannot extend a frozen frontier, and a pinned
+  cutoff never advances.
 - Randomized job streams never violate the formula or reservation precedence.
 
 ### Database, protocol, and concurrency tests
@@ -792,8 +836,8 @@ they require a demonstrated need that `maxParallelRuns` cannot solve.
   work.
 - Three `maxParallelRuns=3` jobs may run together; a fourth may not.
 - A `maxParallelRuns=1` job starts only with no other active lease.
-- Existing compatible jobs may backfill a protected restrictive job, but later
-  submissions cannot extend its frozen frontier.
+- Compatible jobs may backfill a protected restrictive job once each while
+  its original blockers run; submissions after the frontier froze cannot pass.
 - Concurrent clients cannot corrupt state, duplicate work, or over-admit.
 - Every mutation is safely retryable through its idempotency key.
 - Daemon restart does not kill workers, lose completed runner results, or forget
@@ -810,7 +854,7 @@ they require a demonstrated need that `maxParallelRuns` cannot solve.
 
 ## Decisions deferred until implementation evidence
 
-- Whether the frozen frontier should also have a configurable maximum number
+- Whether the backfill window should also have a configurable maximum number
   of backfill starts.
 - Whether real workloads require cgroups rather than process groups.
 - Retention periods for logs, operations, and completed jobs.
@@ -828,7 +872,7 @@ coordinator, detached attempt runners, recovery, dependencies with skip
 propagation, retry policy, hold/release/retry/queued-limit mutations, the
 full CLI, and the `queue-ml-jobs` agent skill. `tests/e2e.rs` exercises real
 daemon/runner/CLI binaries against the acceptance criteria (formula limits,
-frozen-frontier backfill, cancellation, idempotency replay/conflict,
+windowed-then-frozen backfill, cancellation, idempotency replay/conflict,
 dependency skips, retries, daemon-crash adoption, singleton locking).
 
 Decisions resolved during implementation:
@@ -887,3 +931,11 @@ Decisions resolved during implementation:
   reads `sqlite_sequence` so future retention deletes can never lower it, and
   declaring the same dependency parent under both flags keeps the stricter
   `success` requirement.
+- Scheduler semantics version 2 replaced freeze-at-creation with the
+  blocker-scoped backfill window. Version 1 froze the cutoff on the protected
+  job's own submission tick, so in incremental use the frontier behind it was
+  always empty and every later submission idled open slots until full drain.
+  The window reuses the stored cutoff column (`0` as the unfrozen sentinel,
+  pinned exactly once), so no schema migration was needed; active version-1
+  reservations are still interpreted exactly, as permanently frozen
+  frontiers.

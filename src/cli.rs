@@ -430,10 +430,14 @@ fn print_status(view: &StatusView) {
         None => println!("active leases: 0"),
     }
     if let Some(res) = &view.reservation {
+        let frontier = match res.backfill_cutoff {
+            _ if res.backfill_window_open => "backfill window open".to_string(),
+            Some(cutoff) => format!("backfill cutoff at job {cutoff}"),
+            None => "backfill frontier unavailable".to_string(),
+        };
         println!(
-            "protected job: {} (backfill cutoff at job {}; blocked by attempts {:?}; \
-             consumed bypasses {:?})",
-            res.protected_job, res.backfill_cutoff, res.blocking_attempts, res.consumed_bypasses
+            "protected job: {} ({frontier}; blocked by attempts {:?}; consumed bypasses {:?})",
+            res.protected_job, res.blocking_attempts, res.consumed_bypasses
         );
     }
     if view.admission_blocked {

@@ -11,7 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::domain::{AttemptId, JobId};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const DEFAULT_MAX_FRAME_BYTES: u32 = 1 << 20;
 
 // Stable error codes.
@@ -238,7 +238,12 @@ pub struct StatusView {
 #[serde(rename_all = "camelCase")]
 pub struct ReservationView {
     pub protected_job: JobId,
-    pub backfill_cutoff: i64,
+    /// While true, an initial blocker of the protected job is still running
+    /// and any eligible job may bypass it once.
+    pub backfill_window_open: bool,
+    /// The frozen frontier; absent while the backfill window is open.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backfill_cutoff: Option<i64>,
     pub created_at: i64,
     /// Attempts currently preventing the protected job from starting.
     pub blocking_attempts: Vec<AttemptId>,

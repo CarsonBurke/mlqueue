@@ -151,6 +151,8 @@ fn submit_runs_captures_logs_and_reports() {
     assert!(stderr.contains("err-marker"), "stderr log: {stderr:?}");
 }
 
+
+
 #[test]
 fn default_limit_serializes_jobs() {
     let q = TestQueue::new();
@@ -204,18 +206,18 @@ fn three_wide_jobs_share_and_a_fourth_waits() {
 }
 
 #[test]
-fn restrictive_job_is_protected_and_frontier_is_frozen() {
+fn restrictive_job_is_protected_and_the_backfill_window_stays_open() {
     let q = TestQueue::new();
     // Three permissive jobs fill the 3-wide set; `gate` finishes first.
-    let a = q.submit(&["--max-parallel-runs", "3", "--name", "a"], &["sleep", "3"]);
-    let b = q.submit(&["--max-parallel-runs", "3", "--name", "b"], &["sleep", "3"]);
+    let a = q.submit(&["--max-parallel-runs", "3", "--name", "a"], &["sleep", "4"]);
+    let b = q.submit(&["--max-parallel-runs", "3", "--name", "b"], &["sleep", "4"]);
     let gate = q.submit(&["--max-parallel-runs", "3", "--name", "gate"], &["sleep", "1"]);
     for job in [a, b, gate] {
         q.wait_state(job, "running", Duration::from_secs(10));
     }
 
-    // Dependency-delayed permissive job: ineligible now, but submitted before
-    // protection, so it belongs to the frozen frontier once eligible.
+    // Dependency-delayed permissive job: ineligible now, but first in FIFO
+    // order among the backfill candidates once `gate` completes.
     let backfill = q.submit(
         &["--max-parallel-runs", "3", "--name", "backfill", "--after-completion", &gate.to_string()],
         &["sleep", "1"],
@@ -229,49 +231,105 @@ fn restrictive_job_is_protected_and_frontier_is_frozen() {
         q.status()["reservation"]["protectedJob"].as_i64() == Some(exclusive)
     });
 
-    // Submitted after protection: frozen out until the protected job runs.
-    let late = q.submit(&["--max-parallel-runs", "3", "--name", "late"], &["sh", "-c", "true"]);
+    // Submitted after protection, but the original blockers (a, b, gate) are
+    // still running: the backfill window is open and the late job may take a
+    // slot rather than idling it.
+    let late = q.submit(&["--max-parallel-runs", "3", "--name", "late"], &["sleep", "1"]);
+    let status = q.status();
+    assert_eq!(status["reservation"]["backfillWindowOpen"], true, "window must be open: {status}");
+    assert!(status["reservation"]["backfillCutoff"].is_null(), "no cutoff while open: {status}");
     let late_view = q.job(late);
     assert!(
-        late_view["eligibility"].as_str().unwrap().starts_with("behind_backfill_cutoff"),
-        "late job must be frozen out: {late_view}"
+        late_view["eligibility"].as_str().unwrap().starts_with("backfill_window_open"),
+        "late job must be bypass-eligible in the open window: {late_view}"
     );
 
-    // When `gate` drains, the pre-cutoff job becomes eligible and takes the
-    // open slot as a backfill while the protected job keeps waiting and the
-    // post-cutoff job stays frozen.
+    // When `gate` drains, the dependency-delayed job is the lowest-sequence
+    // candidate and takes the open slot first; the late job follows when that
+    // backfill finishes, all while the protected job keeps waiting.
     q.wait_state(backfill, "running", Duration::from_secs(10));
     assert_eq!(q.job_state(exclusive), "queued");
-    assert_eq!(q.job_state(late), "queued");
+    q.wait_state(late, "running", Duration::from_secs(10));
+    assert_eq!(q.job_state(exclusive), "queued");
     let status = q.status();
-    assert!(
-        status["reservation"]["consumedBypasses"]
-            .as_array()
-            .unwrap()
-            .contains(&serde_json::json!(backfill)),
-        "backfill bypass must be recorded: {status}"
-    );
+    for consumed in [backfill, late] {
+        assert!(
+            status["reservation"]["consumedBypasses"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(consumed)),
+            "bypass of job {consumed} must be recorded: {status}"
+        );
+    }
 
-    // Full drain: the protected job starts (alone), then the late job.
+    // Full drain: the protected job starts alone and succeeds.
     q.wait_state(exclusive, "succeeded", Duration::from_secs(20));
-    q.wait_state(late, "succeeded", Duration::from_secs(20));
-    assert!(q.job(late)["finishedAt"].as_i64() >= q.job(exclusive)["finishedAt"].as_i64());
+    assert!(q.job(exclusive)["finishedAt"].as_i64() >= q.job(late)["finishedAt"].as_i64());
+}
+
+#[test]
+fn frontier_freezes_once_the_original_blockers_drain() {
+    let q = TestQueue::new();
+    // Long enough that both blockers are still running through the submits
+    // below even on a loaded machine; the freeze is then deterministic.
+    let a = q.submit(&["--max-parallel-runs", "3", "--name", "a"], &["sleep", "4"]);
+    let b = q.submit(&["--max-parallel-runs", "3", "--name", "b"], &["sleep", "4"]);
+    for job in [a, b] {
+        q.wait_state(job, "running", Duration::from_secs(10));
+    }
+    let exclusive =
+        q.submit(&["--max-parallel-runs", "1", "--name", "exclusive"], &["sh", "-c", "true"]);
+    wait_for("reservation to exist", Duration::from_secs(5), || {
+        q.status()["reservation"]["protectedJob"].as_i64() == Some(exclusive)
+    });
+
+    // Open window: the post-protection job takes the third slot immediately.
+    let occupant = q.submit(&["--max-parallel-runs", "3", "--name", "occupant"], &["sleep", "20"]);
+    q.wait_state(occupant, "running", Duration::from_secs(10));
+
+    // The original blockers drain; the occupant (a mere backfill) does not
+    // hold the window open, so the frontier freezes.
+    q.wait_state(a, "succeeded", Duration::from_secs(10));
+    q.wait_state(b, "succeeded", Duration::from_secs(10));
+    wait_for("frontier to freeze", Duration::from_secs(5), || {
+        q.status()["reservation"]["backfillWindowOpen"] == serde_json::json!(false)
+    });
+    let cutoff = q.status()["reservation"]["backfillCutoff"].as_i64().unwrap();
+    assert!(cutoff >= occupant, "cutoff must cover everything submitted before the freeze");
+
+    // Submitted after the freeze: may no longer pass the protected job, even
+    // though two slots are open beside the occupant.
+    let frozen_out =
+        q.submit(&["--max-parallel-runs", "3", "--name", "frozen-out"], &["sh", "-c", "true"]);
+    let frozen_view = q.job(frozen_out);
+    assert!(
+        frozen_view["eligibility"].as_str().unwrap().starts_with("behind_backfill_cutoff"),
+        "post-freeze submission must wait: {frozen_view}"
+    );
+    assert_eq!(q.job_state(exclusive), "queued");
+
+    // Drain the occupant: the protected job runs alone, then the frozen-out
+    // job follows.
+    q.cli(&["cancel", &occupant.to_string()]);
+    q.wait_state(exclusive, "succeeded", Duration::from_secs(20));
+    q.wait_state(frozen_out, "succeeded", Duration::from_secs(20));
+    assert!(q.job(frozen_out)["finishedAt"].as_i64() >= q.job(exclusive)["finishedAt"].as_i64());
 }
 
 #[test]
 fn reservation_and_consumed_bypasses_survive_daemon_restart() {
     let mut q = TestQueue::new();
-    // Same shape as the frozen-frontier test, but long enough to straddle a
+    // Same shape as the open-window test, but long enough to straddle a
     // daemon crash while the reservation and one consumed bypass exist.
-    let a = q.submit(&["--max-parallel-runs", "3", "--name", "a"], &["sleep", "5"]);
-    let b = q.submit(&["--max-parallel-runs", "3", "--name", "b"], &["sleep", "5"]);
+    let a = q.submit(&["--max-parallel-runs", "3", "--name", "a"], &["sleep", "8"]);
+    let b = q.submit(&["--max-parallel-runs", "3", "--name", "b"], &["sleep", "8"]);
     let gate = q.submit(&["--max-parallel-runs", "3", "--name", "gate"], &["sleep", "1"]);
     for job in [a, b, gate] {
         q.wait_state(job, "running", Duration::from_secs(10));
     }
     let backfill = q.submit(
         &["--max-parallel-runs", "3", "--name", "backfill", "--after-completion", &gate.to_string()],
-        &["sleep", "3"],
+        &["sleep", "2"],
     );
     let exclusive =
         q.submit(&["--max-parallel-runs", "1", "--name", "exclusive"], &["sh", "-c", "true"]);
@@ -285,10 +343,12 @@ fn reservation_and_consumed_bypasses_survive_daemon_restart() {
     q.kill_daemon();
     q.start_daemon();
 
-    // The restarted daemon restores the reservation, its cutoff semantics,
-    // and the consumed set from the database rather than recomputing them.
+    // The restarted daemon restores the reservation and the consumed set
+    // from the database, and re-derives the open window from the still-live
+    // initial blockers rather than recomputing fairness from events.
     let status = q.status();
     assert_eq!(status["reservation"]["protectedJob"].as_i64(), Some(exclusive));
+    assert_eq!(status["reservation"]["backfillWindowOpen"], true, "blockers still run: {status}");
     assert!(
         status["reservation"]["consumedBypasses"]
             .as_array()
@@ -298,23 +358,28 @@ fn reservation_and_consumed_bypasses_survive_daemon_restart() {
     );
     assert_eq!(q.job_state(exclusive), "queued");
     assert!(
-        q.job(late)["eligibility"].as_str().unwrap().starts_with("behind_backfill_cutoff"),
-        "post-cutoff job must stay frozen after restart"
+        q.job(late)["eligibility"].as_str().unwrap().starts_with("backfill_window_open"),
+        "the window stays open across the restart"
     );
 
-    // Ordering guarantees still hold through the drain.
-    q.wait_state(exclusive, "succeeded", Duration::from_secs(30));
+    // The late job takes a slot once the backfill finishes, while the
+    // original blockers still run and the protected job keeps waiting.
     q.wait_state(late, "succeeded", Duration::from_secs(30));
-    assert!(q.job(late)["finishedAt"].as_i64() >= q.job(exclusive)["finishedAt"].as_i64());
+    assert_eq!(q.job_state(a), "running");
+    assert_eq!(q.job_state(exclusive), "queued");
+
+    // Drain everything: the protected job still starts.
+    q.cli(&["cancel", &a.to_string()]);
+    q.cli(&["cancel", &b.to_string()]);
+    q.wait_state(exclusive, "succeeded", Duration::from_secs(30));
 }
 
 #[test]
 fn cancelling_the_protected_job_invalidates_the_reservation() {
     let q = TestQueue::new();
-    let a = q.submit(&["--max-parallel-runs", "3", "--name", "a"], &["sleep", "4"]);
-    let b = q.submit(&["--max-parallel-runs", "3", "--name", "b"], &["sleep", "4"]);
-    let gate = q.submit(&["--max-parallel-runs", "3", "--name", "gate"], &["sleep", "1"]);
-    for job in [a, b, gate] {
+    let a = q.submit(&["--max-parallel-runs", "3", "--name", "a"], &["sleep", "6"]);
+    let b = q.submit(&["--max-parallel-runs", "3", "--name", "b"], &["sleep", "6"]);
+    for job in [a, b] {
         q.wait_state(job, "running", Duration::from_secs(10));
     }
     let exclusive =
@@ -322,25 +387,70 @@ fn cancelling_the_protected_job_invalidates_the_reservation() {
     wait_for("reservation to exist", Duration::from_secs(5), || {
         q.status()["reservation"]["protectedJob"].as_i64() == Some(exclusive)
     });
-    let late = q.submit(&["--max-parallel-runs", "3", "--name", "late"], &["sleep", "1"]);
 
-    // `gate` drains, but the frozen frontier keeps the open slot away from
-    // the post-cutoff job while the protected job waits.
-    q.wait_state(gate, "succeeded", Duration::from_secs(10));
-    assert!(
-        q.job(late)["eligibility"].as_str().unwrap().starts_with("behind_backfill_cutoff"),
-        "late job must be frozen while the reservation stands"
-    );
+    // The open window admits the late job into the third slot; its bypass is
+    // consumed under the standing reservation.
+    let late = q.submit(&["--max-parallel-runs", "3", "--name", "late"], &["sleep", "6"]);
+    q.wait_state(late, "running", Duration::from_secs(10));
+    assert_eq!(q.job_state(exclusive), "queued");
 
-    // Cancelling the protected job invalidates the reservation, releasing
-    // the frontier: the late job takes the open slot beside a and b.
+    // Cancelling the protected job invalidates the reservation entirely:
+    // later submissions no longer answer to any frontier.
     q.cli(&["cancel", &exclusive.to_string()]);
     wait_for("reservation to be invalidated", Duration::from_secs(5), || {
         q.status()["reservation"].is_null()
     });
-    q.wait_state(late, "running", Duration::from_secs(10));
+    let free = q.submit(&["--max-parallel-runs", "4", "--name", "free"], &["sh", "-c", "true"]);
+    let free_view = q.job(free);
+    assert!(
+        free_view["eligibility"].as_str().is_none_or(|reason| !reason.contains("backfill")),
+        "no reservation may constrain the queue after invalidation: {free_view}"
+    );
     assert_eq!(q.job_state(a), "running");
     assert_eq!(q.job_state(b), "running");
+}
+
+#[test]
+fn unsupported_reservation_blocks_admission_until_resolved() {
+    let mut q = TestQueue::new();
+    let a = q.submit(&["--max-parallel-runs", "3", "--name", "a"], &["sleep", "10"]);
+    let b = q.submit(&["--max-parallel-runs", "3", "--name", "b"], &["sleep", "10"]);
+    for job in [a, b] {
+        q.wait_state(job, "running", Duration::from_secs(10));
+    }
+    let exclusive =
+        q.submit(&["--max-parallel-runs", "1", "--name", "exclusive"], &["sh", "-c", "true"]);
+    wait_for("reservation to exist", Duration::from_secs(5), || {
+        q.status()["reservation"]["protectedJob"].as_i64() == Some(exclusive)
+    });
+
+    // Rewrite the active reservation to a semantics version this daemon does
+    // not implement, as a bad upgrade or downgrade would leave behind.
+    q.kill_daemon();
+    {
+        let conn = mlqueue::db::open(&q.state_dir().join("mlqueue.db")).unwrap();
+        conn.execute(
+            "UPDATE scheduler_reservation SET semantics_version = 99 WHERE status = 'active'",
+            [],
+        )
+        .unwrap();
+    }
+    q.start_daemon();
+
+    // The daemon must refuse ordinary admission rather than guess: a new
+    // compatible job queues even though a slot is open beside a and b.
+    wait_for("admission to block", Duration::from_secs(5), || {
+        q.status()["admissionBlocked"] == serde_json::json!(true)
+    });
+    let stuck = q.submit(&["--max-parallel-runs", "3", "--name", "stuck"], &["sh", "-c", "true"]);
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(q.job_state(stuck), "queued");
+
+    // Cancelling the protected job resolves the uninterpretable reservation;
+    // admission must heal without a daemon restart.
+    q.cli(&["cancel", &exclusive.to_string()]);
+    q.wait_state(stuck, "succeeded", Duration::from_secs(10));
+    assert_eq!(q.status()["admissionBlocked"], serde_json::json!(false));
 }
 
 #[test]

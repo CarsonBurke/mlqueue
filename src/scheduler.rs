@@ -1,5 +1,8 @@
 //! Pure scheduling policy: the symmetric `maxParallelRuns` compatibility
-//! formula plus frozen-frontier protected-job backfill.
+//! formula plus protected-job backfill with a blocker-scoped window. While
+//! any attempt that originally blocked the protected job is still advancing,
+//! any eligible job may bypass it once; when the last original blocker
+//! drains, the frontier freezes and later submissions can no longer pass.
 //!
 //! This module is deliberately independent of Tokio, SQLite, and process
 //! code. The coordinator feeds it a snapshot and commits its decisions in one
@@ -29,7 +32,13 @@ pub struct Candidate {
 #[derive(Debug, Clone)]
 pub struct ReservationSnapshot {
     pub job_id: JobId,
-    pub cutoff_seq: i64,
+    /// `None` while the backfill window is open: an initial blocker of the
+    /// protected job is still advancing, so any eligible job may consume its
+    /// single bypass regardless of submission order. `Some` once the frontier
+    /// is frozen; jobs submitted after the cutoff may then never pass. The
+    /// coordinator derives this from blocker liveness and the persisted
+    /// cutoff.
+    pub cutoff_seq: Option<i64>,
     /// Jobs whose single backfill bypass is already consumed (seeded with the
     /// jobs active at creation plus every backfill admitted since).
     pub consumed: BTreeSet<JobId>,
@@ -54,7 +63,6 @@ impl Start {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewReservation {
     pub job_id: JobId,
-    pub cutoff_seq: i64,
     /// Jobs seeded as already-consumed: everything holding a (shadow) lease
     /// when protection was created, so their retries cannot become fresh
     /// backfills.
@@ -83,14 +91,14 @@ pub fn can_admit(active_limits: &[u32], candidate_limit: u32) -> bool {
 
 /// One greedy scheduling pass over a consistent snapshot.
 ///
-/// `eligible` must be sorted by ascending `seq`. `max_seq` is the largest
-/// submission sequence that exists at all (including ineligible jobs); it
-/// becomes the frozen backfill cutoff when protection is created.
+/// `eligible` must be sorted by ascending `seq`. A reservation created in
+/// this pass starts with an open backfill window (its blockers are the shadow
+/// set, which is active by construction); the coordinator freezes the cutoff
+/// on the pass where those blockers stop advancing.
 pub fn plan_pass(
     active: &[ActiveLease],
     eligible: &[Candidate],
     reservation: Option<&ReservationSnapshot>,
-    max_seq: i64,
 ) -> PassOutcome {
     debug_assert!(eligible.windows(2).all(|w| w[0].seq < w[1].seq));
 
@@ -104,7 +112,7 @@ pub fn plan_pass(
     // reported) or one created earlier in this same pass.
     struct Res {
         job_id: JobId,
-        cutoff_seq: i64,
+        cutoff_seq: Option<i64>,
         consumed: BTreeSet<JobId>,
         existing: bool,
     }
@@ -152,10 +160,11 @@ pub fn plan_pass(
                     continue;
                 }
 
-                // Step 3: restrict candidates to the frozen frontier —
-                // eligible pre-cutoff jobs whose single bypass is unconsumed.
+                // Step 3: restrict candidates to the backfill frontier —
+                // any eligible job while the window is open, only pre-cutoff
+                // jobs once frozen — whose single bypass is unconsumed.
                 let backfill = eligible.iter().find(|c| {
-                    c.seq <= r.cutoff_seq
+                    r.cutoff_seq.is_none_or(|cutoff| c.seq <= cutoff)
                         && c.job_id != r.job_id
                         && !r.consumed.contains(&c.job_id)
                         && !started.contains(&c.job_id)
@@ -190,16 +199,17 @@ pub fn plan_pass(
                 // Incompatible only because of active concurrency limits:
                 // protect it. Seed the consumed set with every current shadow
                 // lease holder (initially active attempts plus jobs admitted
-                // earlier in this batch).
+                // earlier in this batch). The new reservation's backfill
+                // window is open: its blockers are the shadow set, which is
+                // active right now by construction.
                 let initial_consumed = shadow_jobs.clone();
                 outcome.create_reservation = Some(NewReservation {
                     job_id: head.job_id,
-                    cutoff_seq: max_seq,
                     initial_consumed: initial_consumed.clone(),
                 });
                 res = Some(Res {
                     job_id: head.job_id,
-                    cutoff_seq: max_seq,
+                    cutoff_seq: None,
                     consumed: initial_consumed,
                     existing: false,
                 });
@@ -248,7 +258,7 @@ mod tests {
 
     #[test]
     fn empty_queue_does_nothing() {
-        let outcome = plan_pass(&leases(&[3]), &[], None, 10);
+        let outcome = plan_pass(&leases(&[3]), &[], None);
         assert_eq!(outcome, PassOutcome::default());
     }
 
@@ -257,16 +267,15 @@ mod tests {
         // Four 3-wide candidates on an idle machine: exactly three start and
         // the fourth becomes protected (not silently over-admitted).
         let eligible = vec![cand(1, 3), cand(2, 3), cand(3, 3), cand(4, 3)];
-        let outcome = plan_pass(&[], &eligible, None, 4);
+        let outcome = plan_pass(&[], &eligible, None);
         assert_eq!(start_ids(&outcome), vec![1, 2, 3]);
         let res = outcome.create_reservation.expect("fourth job is protected");
         assert_eq!(res.job_id, 4);
-        assert_eq!(res.cutoff_seq, 4);
         assert_eq!(res.initial_consumed, BTreeSet::from([1, 2, 3]));
     }
 
     #[test]
-    fn restrictive_head_is_protected_and_backfill_is_bounded() {
+    fn restrictive_head_is_protected_and_backfill_takes_the_slot() {
         // Motivating example: two CleanRL(3) active, LLM(1) first in line,
         // five CleanRL(3) behind it.
         let active = vec![
@@ -274,41 +283,70 @@ mod tests {
             ActiveLease { job_id: 101, limit: 3 },
         ];
         let eligible = vec![cand(1, 1), cand(2, 3), cand(3, 3), cand(4, 3), cand(5, 3), cand(6, 3)];
-        let outcome = plan_pass(&active, &eligible, None, 6);
+        let outcome = plan_pass(&active, &eligible, None);
 
         // LLM protected; exactly one CleanRL backfills the empty third slot.
         assert_eq!(outcome.starts, vec![Start { job_id: 2, bypasses: Some(1) }]);
         let res = outcome.create_reservation.unwrap();
         assert_eq!(res.job_id, 1);
-        assert_eq!(res.cutoff_seq, 6);
         assert_eq!(res.initial_consumed, BTreeSet::from([100, 101]));
     }
 
     #[test]
-    fn post_cutoff_jobs_never_pass_protection() {
-        // Reservation frozen at cutoff 6; job 7 arrived later. A slot is
-        // open, but job 7 must not take it and pre-cutoff job 3 may.
+    fn open_window_admits_post_protection_arrivals() {
+        // The reported head-of-line bug: LLM(1) protected while two
+        // CleanRL(3) run; CleanRL(4) was submitted after protection. While an
+        // initial blocker still runs the window is open and job 4 takes the
+        // empty third slot.
         let active = vec![
             ActiveLease { job_id: 100, limit: 3 },
             ActiveLease { job_id: 101, limit: 3 },
         ];
         let res = ReservationSnapshot {
             job_id: 1,
-            cutoff_seq: 6,
+            cutoff_seq: None,
+            consumed: BTreeSet::from([100, 101]),
+        };
+        let eligible = vec![cand(1, 1), cand(4, 3)];
+        let outcome = plan_pass(&active, &eligible, Some(&res));
+        assert_eq!(outcome.starts, vec![Start { job_id: 4, bypasses: Some(1) }]);
+
+        // A consumed bypass stays consumed in the open window: a retry of
+        // job 4 may not pass again.
+        let res2 = ReservationSnapshot {
+            job_id: 1,
+            cutoff_seq: None,
+            consumed: BTreeSet::from([100, 101, 4]),
+        };
+        let outcome2 = plan_pass(&active, &eligible, Some(&res2));
+        assert!(outcome2.starts.is_empty());
+    }
+
+    #[test]
+    fn post_cutoff_jobs_never_pass_a_frozen_frontier() {
+        // Frontier frozen at cutoff 6; job 7 arrived later. A slot is open,
+        // but job 7 must not take it and pre-cutoff job 3 may.
+        let active = vec![
+            ActiveLease { job_id: 100, limit: 3 },
+            ActiveLease { job_id: 101, limit: 3 },
+        ];
+        let res = ReservationSnapshot {
+            job_id: 1,
+            cutoff_seq: Some(6),
             consumed: BTreeSet::from([100, 101, 2]),
         };
         let eligible = vec![cand(1, 1), cand(3, 3), cand(7, 3)];
-        let outcome = plan_pass(&active, &eligible, Some(&res), 7);
+        let outcome = plan_pass(&active, &eligible, Some(&res));
         assert_eq!(outcome.starts, vec![Start { job_id: 3, bypasses: Some(1) }]);
 
         // Same but job 3's bypass is already consumed: nothing starts even
         // though a slot is open — post-cutoff job 7 still may not pass.
         let res2 = ReservationSnapshot {
             job_id: 1,
-            cutoff_seq: 6,
+            cutoff_seq: Some(6),
             consumed: BTreeSet::from([100, 101, 2, 3]),
         };
-        let outcome2 = plan_pass(&active, &eligible, Some(&res2), 7);
+        let outcome2 = plan_pass(&active, &eligible, Some(&res2));
         assert!(outcome2.starts.is_empty());
         assert!(!outcome2.satisfy_reservation);
         assert!(outcome2.create_reservation.is_none());
@@ -317,10 +355,10 @@ mod tests {
     #[test]
     fn protected_job_starts_before_backfills_when_drained() {
         // Everything drained: the protected LLM(1) starts alone; eligible
-        // pre-cutoff CleanRL jobs must not start beside it.
-        let res = ReservationSnapshot { job_id: 1, cutoff_seq: 6, consumed: BTreeSet::new() };
+        // CleanRL jobs must not start beside it.
+        let res = ReservationSnapshot { job_id: 1, cutoff_seq: Some(6), consumed: BTreeSet::new() };
         let eligible = vec![cand(1, 1), cand(3, 3), cand(4, 3)];
-        let outcome = plan_pass(&[], &eligible, Some(&res), 7);
+        let outcome = plan_pass(&[], &eligible, Some(&res));
         assert_eq!(outcome.starts, vec![Start { job_id: 1, bypasses: None }]);
         assert!(outcome.satisfy_reservation);
         // After the exclusive job is admitted, the rest wait (head job 3
@@ -332,9 +370,9 @@ mod tests {
     fn satisfying_one_reservation_can_create_the_next() {
         // Protected job (2-wide) starts; one companion fits; the next head is
         // 1-wide and becomes the new protected job.
-        let res = ReservationSnapshot { job_id: 1, cutoff_seq: 5, consumed: BTreeSet::new() };
+        let res = ReservationSnapshot { job_id: 1, cutoff_seq: Some(5), consumed: BTreeSet::new() };
         let eligible = vec![cand(1, 2), cand(2, 2), cand(3, 1)];
-        let outcome = plan_pass(&[], &eligible, Some(&res), 5);
+        let outcome = plan_pass(&[], &eligible, Some(&res));
         assert_eq!(start_ids(&outcome), vec![1, 2]);
         assert!(outcome.satisfy_reservation);
         let new_res = outcome.create_reservation.unwrap();
@@ -344,9 +382,9 @@ mod tests {
 
     #[test]
     fn ineligible_protected_job_invalidates_reservation() {
-        let res = ReservationSnapshot { job_id: 1, cutoff_seq: 5, consumed: BTreeSet::new() };
+        let res = ReservationSnapshot { job_id: 1, cutoff_seq: Some(5), consumed: BTreeSet::new() };
         let eligible = vec![cand(2, 3), cand(3, 3)];
-        let outcome = plan_pass(&[], &eligible, Some(&res), 5);
+        let outcome = plan_pass(&[], &eligible, Some(&res));
         assert!(outcome.invalidate_reservation.is_some());
         // Ordinary FIFO admission resumes.
         assert_eq!(start_ids(&outcome), vec![2, 3]);
@@ -355,10 +393,10 @@ mod tests {
     #[test]
     fn lower_limit_always_wins_in_mixed_sets() {
         // active {4}: a 2-wide candidate fits (resulting 2 <= min(4, 2)).
-        let outcome = plan_pass(&leases(&[4]), &[cand(1, 2)], None, 1);
+        let outcome = plan_pass(&leases(&[4]), &[cand(1, 2)], None);
         assert_eq!(start_ids(&outcome), vec![1]);
         // active {4, 2}: a 4-wide candidate would make 3 > 2 — protected.
-        let outcome = plan_pass(&leases(&[4, 2]), &[cand(1, 4)], None, 1);
+        let outcome = plan_pass(&leases(&[4, 2]), &[cand(1, 4)], None);
         assert!(outcome.starts.is_empty());
         assert_eq!(outcome.create_reservation.unwrap().job_id, 1);
     }
@@ -381,6 +419,9 @@ mod tests {
             let mut queued: Vec<Candidate> = Vec::new();
             let mut active: Vec<ActiveLease> = Vec::new();
             let mut reservation: Option<ReservationSnapshot> = None;
+            // The reservation's initial blockers (job IDs standing in for
+            // attempt IDs; the oracle has no retries, so they coincide).
+            let mut blockers: BTreeSet<JobId> = BTreeSet::new();
             // Sequence at which each job was protected, to check precedence.
             let mut protected_since: Option<(JobId, i64)> = None;
 
@@ -402,11 +443,22 @@ mod tests {
                     _ => {}
                 }
 
-                let outcome = plan_pass(&active, &queued, reservation.as_ref(), next_seq);
+                // The coordinator's freeze rule: the first pass after every
+                // initial blocker stopped advancing pins the cutoff exactly
+                // once, at the maximum sequence submitted so far.
+                if let Some(res) = &mut reservation
+                    && res.cutoff_seq.is_none()
+                    && !active.iter().any(|l| blockers.contains(&l.job_id))
+                {
+                    res.cutoff_seq = Some(next_seq);
+                }
+
+                let outcome = plan_pass(&active, &queued, reservation.as_ref());
 
                 // Apply decisions exactly as the coordinator would.
                 if outcome.satisfy_reservation || outcome.invalidate_reservation.is_some() {
                     reservation = None;
+                    blockers.clear();
                     protected_since = None;
                 }
                 for start in &outcome.starts {
@@ -421,16 +473,19 @@ mod tests {
                         c.limit
                     );
 
-                    // Invariant: nothing submitted after a protection event
-                    // starts while that reservation is active.
+                    // Invariant: once the frontier is frozen, nothing
+                    // submitted after the cutoff starts while that
+                    // reservation is active.
                     if let Some(r) = &reservation {
                         assert!(start.consumes_bypass() || c.job_id == r.job_id);
-                        assert!(
-                            c.seq <= r.cutoff_seq || c.job_id == r.job_id,
-                            "post-cutoff job {} bypassed protected job {}",
-                            c.job_id,
-                            r.job_id
-                        );
+                        if let Some(cutoff) = r.cutoff_seq {
+                            assert!(
+                                c.seq <= cutoff || c.job_id == r.job_id,
+                                "post-cutoff job {} bypassed protected job {}",
+                                c.job_id,
+                                r.job_id
+                            );
+                        }
                         if let Some((pjob, _)) = protected_since {
                             assert_ne!(c.job_id, pjob, "protected job started via backfill path");
                         }
@@ -450,9 +505,13 @@ mod tests {
                 if let Some(new_res) = outcome.create_reservation {
                     assert!(reservation.is_none());
                     protected_since = Some((new_res.job_id, next_seq));
+                    // As in the coordinator: the initial blockers are the
+                    // shadow set at protection creation, which is exactly the
+                    // seeded consumed set.
+                    blockers = new_res.initial_consumed.clone();
                     reservation = Some(ReservationSnapshot {
                         job_id: new_res.job_id,
-                        cutoff_seq: new_res.cutoff_seq,
+                        cutoff_seq: None,
                         consumed: new_res.initial_consumed,
                     });
                 }

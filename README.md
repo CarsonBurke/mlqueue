@@ -19,9 +19,10 @@ A candidate starts exactly when `|running| + 1 <= min(candidate limit, every
 running limit)`. The default of `1` makes unspecified work exclusive; three
 `--max-parallel-runs 3` jobs may share; a `1` job waits for the machine and
 makes everything else wait for it. When a restrictive job reaches the head of
-the queue, it is *protected*: jobs already submitted may backfill open slots
-once each, but later submissions cannot pass it (a frozen backfill frontier
-that bounds starvation without duration estimates).
+the queue, it is *protected*: while the jobs that originally blocked it are
+still running, any eligible job may backfill an open slot once each; when
+those blockers drain, the frontier freezes and later submissions can no
+longer pass it (bounding starvation without duration estimates).
 
 The daemon deliberately does **not** discover GPUs, meter VRAM/CPU, infer
 workload types, or preempt work. Cooperation is the contract: all managed
@@ -76,5 +77,5 @@ cargo clippy
 
 The end-to-end suite (`tests/e2e.rs`) runs real daemons, runners, and CLI
 binaries in isolated temp directories, covering the concurrency formula,
-frozen-frontier backfill, cancellation, retries, dependency skips,
+windowed-then-frozen backfill, cancellation, retries, dependency skips,
 idempotency replay/conflict, and daemon-crash recovery.
