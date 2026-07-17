@@ -525,3 +525,58 @@ fn set_max_parallel_runs_only_while_queued() {
 
     q.wait_state(queued, "succeeded", Duration::from_secs(10));
 }
+
+#[test]
+fn wait_blocks_until_terminal_and_exits_with_the_outcome() {
+    let q = TestQueue::new();
+
+    let ok = q.submit(&["--name", "ok"], &["sh", "-c", "sleep 0.3; true"]);
+    let output = q.try_cli(&["wait", &ok.to_string()]);
+    assert!(output.status.success(), "wait on a succeeding job must exit 0");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("succeeded"));
+
+    let bad = q.submit(&["--name", "bad"], &["sh", "-c", "exit 3"]);
+    let output = q.try_cli(&["wait", &bad.to_string()]);
+    assert_eq!(output.status.code(), Some(3), "wait must propagate the command's exit code");
+
+    let hurt = q.submit(&["--name", "hurt"], &["sh", "-c", "kill -SEGV $$"]);
+    let output = q.try_cli(&["wait", &hurt.to_string()]);
+    assert_eq!(output.status.code(), Some(128 + 11), "signal deaths map to 128+N");
+
+    let slow = q.submit(&["--name", "slow"], &["sleep", "5"]);
+    let output = q.try_cli(&["wait", &slow.to_string(), "--timeout", "300ms"]);
+    assert_eq!(output.status.code(), Some(124), "wait --timeout expiry must exit 124");
+    // Cancelling before launch would finalize without a signal; the 128+15
+    // mapping is only defined for a delivered SIGTERM.
+    q.wait_state(slow, "running", Duration::from_secs(10));
+    q.cli(&["cancel", &slow.to_string()]);
+    let output = q.try_cli(&["wait", &slow.to_string()]);
+    assert_eq!(output.status.code(), Some(128 + 15), "cancellation by SIGTERM maps to 128+15");
+}
+
+#[test]
+fn logs_follow_reports_the_terminal_outcome() {
+    let q = TestQueue::new();
+    // Tail a live job so the follow loop crosses the running→terminal edge.
+    let job = q.submit(&["--name", "tail-me"], &["sh", "-c", "echo body-marker; sleep 0.8; exit 7"]);
+    q.wait_state(job, "running", Duration::from_secs(10));
+
+    let output = q.try_cli(&["logs", &job.to_string(), "--follow"]);
+    assert_eq!(output.status.code(), Some(7), "follow must reflect the attempt outcome");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("body-marker"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("attempt 1 failed"), "missing terminal report: {stderr}");
+
+    // Without --follow the command only prints current logs; a failed job
+    // must not turn that read into a failure.
+    let output = q.try_cli(&["logs", &job.to_string()]);
+    assert!(output.status.success());
+
+    // Following a succeeding job drains, reports, and exits 0.
+    let fine = q.submit(&["--name", "tail-fine"], &["sh", "-c", "echo fine-marker; sleep 0.5"]);
+    q.wait_state(fine, "running", Duration::from_secs(10));
+    let output = q.try_cli(&["logs", &fine.to_string(), "--follow"]);
+    assert!(output.status.success(), "follow on success must exit 0");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("fine-marker"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("attempt 1 succeeded"));
+}

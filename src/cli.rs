@@ -4,13 +4,13 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
 use crate::client::{self, ClientError};
-use crate::domain::JobId;
+use crate::domain::{AttemptState, JobId, JobState};
 use crate::paths::Paths;
 use crate::protocol::{
     JobView, LogPathsView, Op, Reply, ResolveAs, StatusView, SubmitParams,
@@ -66,6 +66,17 @@ enum Command {
         stderr: bool,
         #[arg(long, short = 'f')]
         follow: bool,
+    },
+    /// Block until a job reaches a terminal state, then exit with its
+    /// outcome: 0 on success, the command's exit code (or 128+signal) on
+    /// failure, 124 on --timeout.
+    Wait {
+        job: JobId,
+        /// Give up after this long (e.g. "90s", "2h") and exit 124.
+        #[arg(long, value_parser = humantime::parse_duration)]
+        timeout: Option<Duration>,
+        #[arg(long)]
+        json: bool,
     },
     /// Cancel a job. Running work receives SIGTERM; --force escalates to
     /// SIGKILL after the configured grace period.
@@ -223,6 +234,7 @@ pub fn main() -> Result<()> {
             Ok(())
         }
         Command::Logs { job, attempt, stderr, follow } => logs(&paths, job, attempt, stderr, follow),
+        Command::Wait { job, timeout, json } => wait(&paths, job, timeout, json),
         Command::Cancel { job, force, json } => {
             mutate_job(&paths, Op::Cancel { job, force }, key, json)
         }
@@ -531,24 +543,117 @@ fn logs(paths: &Paths, job: JobId, attempt: Option<i64>, stderr: bool, follow: b
         }
         // Stop following once the attempt is terminal and everything written
         // has been drained.
-        let state = fetch(Some(view.attempt_number))?.attempt_state;
+        let latest = fetch(Some(view.attempt_number))?;
+        let state = latest.attempt_state.parse::<AttemptState>().ok();
         // Orphaned/quarantined attempts may still have a live command
         // writing logs; keep following, but say why this never ends.
-        if matches!(state.as_str(), "orphaned" | "quarantined") && !recovery_notice_shown {
+        if matches!(state, Some(AttemptState::Orphaned | AttemptState::Quarantined))
+            && !recovery_notice_shown
+        {
             recovery_notice_shown = true;
             eprintln!(
-                "[mlq] attempt is {state}: the command may still be running; \
-                 following until it drains (Ctrl-C to stop, see `mlq recover list`)"
+                "[mlq] attempt is {}: the command may still be running; \
+                 following until it drains (Ctrl-C to stop, see `mlq recover list`)",
+                latest.attempt_state
             );
         }
-        let terminal = matches!(state.as_str(), "succeeded" | "failed" | "cancelled" | "lost");
-        if terminal {
+        if state.is_some_and(AttemptState::is_terminal) {
             if let Ok(meta) = std::fs::metadata(&path)
                 && meta.len() > offset
             {
                 continue;
             }
+            // Report why the stream ended, and reflect the outcome in this
+            // process's exit code so scripted tails can branch on it.
+            eprintln!(
+                "[mlq] attempt {} {}{}",
+                latest.attempt_number,
+                latest.attempt_state,
+                latest.message.as_deref().map(|message| format!(" — {message}")).unwrap_or_default()
+            );
+            let code = outcome_exit_code(
+                state == Some(AttemptState::Succeeded),
+                latest.exit_code,
+                latest.term_signal,
+            );
+            if code != 0 {
+                std::process::exit(code);
+            }
             return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// Exit code for waiting on a job that never reached a terminal state
+/// within `--timeout`, mirroring timeout(1).
+const EXIT_TIMED_OUT: i32 = 124;
+
+/// Map a terminal outcome onto a process exit code: 0 for success, 128+N
+/// for a death by signal N, the command's own non-zero exit code where one
+/// exists, and 1 otherwise (skipped, lost, cancelled or failed pre-launch).
+fn outcome_exit_code(succeeded: bool, exit_code: Option<i32>, term_signal: Option<i32>) -> i32 {
+    if succeeded {
+        return 0;
+    }
+    match (term_signal, exit_code) {
+        (Some(signal), _) => 128 + signal,
+        (None, Some(code)) if code != 0 => code,
+        _ => 1,
+    }
+}
+
+fn wait(paths: &Paths, job: JobId, timeout: Option<Duration>, json: bool) -> Result<()> {
+    // A deadline beyond Instant's range means "wait forever", which is what
+    // an absurdly large --timeout asks for anyway.
+    let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
+    let mut recovery_notice_shown = false;
+    loop {
+        let reply = send(paths, Op::Show { job }, None)?;
+        let Reply::Job { job: view } = reply else { bail!(client::unexpected("job")) };
+        let last = view.attempts.last();
+        let state = view.state.parse::<JobState>().ok();
+        if state.is_some_and(JobState::is_terminal) {
+            // Attempt data feeds the exit code only when that attempt produced
+            // the job's outcome — a job cancelled while queued for a retry
+            // still carries its predecessor's failed attempt.
+            let outcome_attempt = last.filter(|a| a.state == view.state);
+            let code = outcome_exit_code(
+                state == Some(JobState::Succeeded),
+                outcome_attempt.and_then(|a| a.exit_code),
+                outcome_attempt.and_then(|a| a.term_signal),
+            );
+            if json {
+                println!("{}", serde_json::to_string_pretty(&view)?);
+            } else {
+                let reason = view
+                    .state_reason
+                    .as_deref()
+                    .or(outcome_attempt.and_then(|a| a.message.as_deref()));
+                println!("job {} [{}] {}{}", view.id, view.name, view.state, match reason {
+                    Some(reason) => format!(" ({reason})"),
+                    None => String::new(),
+                });
+            }
+            std::process::exit(code);
+        }
+        // Orphaned/quarantined attempts resolve through an operator, not the
+        // scheduler; say so once rather than blocking silently.
+        if !recovery_notice_shown
+            && let Some(attempt) = last
+            && matches!(attempt.state.as_str(), "orphaned" | "quarantined")
+        {
+            recovery_notice_shown = true;
+            eprintln!(
+                "[mlq] attempt is {}: waiting on operator recovery (see `mlq recover list`)",
+                attempt.state
+            );
+        }
+        if let Some(deadline) = deadline
+            && Instant::now() >= deadline
+        {
+            eprintln!("[mlq] timed out waiting for job {job} (state: {})", view.state);
+            std::process::exit(EXIT_TIMED_OUT);
         }
         std::thread::sleep(Duration::from_millis(300));
     }

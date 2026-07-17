@@ -38,7 +38,8 @@ mlq daemon run            # foreground daemon
 
 mlq submit --name smoke --max-parallel-runs 1 -- python train.py --smoke
 mlq status                # limits, protected job, admission reasons
-mlq logs 1 --follow
+mlq logs 1 --follow       # exits with the attempt's outcome
+mlq wait 1 [--timeout 2h] # block until terminal; exit 0 / exit-code / 128+sig
 mlq cancel 1 [--force]
 ```
 

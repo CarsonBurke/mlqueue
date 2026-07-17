@@ -71,7 +71,8 @@ Use the queue, not ad-hoc process inspection:
 ```bash
 mlq status            # queue, limits, protected job, admission reasons
 mlq show JOB          # one job with attempts and exit codes
-mlq logs JOB --follow # stdout (add --stderr for stderr)
+mlq logs JOB --follow # stream output; exits with the attempt's outcome
+mlq wait JOB          # block until terminal: exit 0, exit code, or 128+signal
 mlq cancel JOB        # SIGTERM; add --force to escalate to SIGKILL
 mlq retry JOB         # requeue a failed/lost job
 ```

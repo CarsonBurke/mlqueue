@@ -200,6 +200,9 @@ impl Coordinator {
                     attempt: attempt_row.id,
                     attempt_number: attempt_row.number,
                     attempt_state: attempt_row.state.as_str().to_string(),
+                    exit_code: attempt_row.exit_code,
+                    term_signal: attempt_row.term_signal,
+                    message: attempt_row.message.clone(),
                     stdout: dir.join(artifacts::STDOUT_LOG_FILE).display().to_string(),
                     stderr: dir.join(artifacts::STDERR_LOG_FILE).display().to_string(),
                 }))

@@ -211,6 +211,12 @@ pub struct LogPathsView {
     pub attempt: AttemptId,
     pub attempt_number: i64,
     pub attempt_state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub term_signal: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
     pub stdout: String,
     pub stderr: String,
 }

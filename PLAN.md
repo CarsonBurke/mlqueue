@@ -545,6 +545,7 @@ mlq [--idempotency-key KEY] submit --max-parallel-runs N --name NAME
 mlq status [--watch] [--json]
 mlq show JOB [--json]
 mlq logs JOB [--attempt N] [--stderr] [--follow]
+mlq wait JOB [--timeout DUR] [--json]
 mlq [--idempotency-key KEY] cancel JOB [--force]
 mlq daemon status [--json]
 ```
