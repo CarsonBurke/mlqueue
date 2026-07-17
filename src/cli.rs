@@ -1,6 +1,7 @@
 //! The `mlq` CLI: argument parsing, environment capture, idempotency-key
 //! generation, and human/JSON rendering of daemon replies.
 
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -22,6 +23,11 @@ const BASELINE_ENV: &[&str] = &["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LAN
 
 const SENSITIVE_MARKERS: &[&str] =
     &["TOKEN", "SECRET", "PASSWORD", "PASSWD", "APIKEY", "API_KEY", "CREDENTIAL", "PRIVATE"];
+
+const STATUS_NAME_WIDTH: usize = 32;
+const STATUS_QUEUE_LIMIT: usize = 10;
+const STATUS_FINISHED_LIMIT: usize = 10;
+const STATUS_HELD_LIMIT: usize = 10;
 
 #[derive(Parser)]
 #[command(
@@ -697,12 +703,21 @@ fn tts_command(backend: Option<&str>) -> std::process::Command {
 }
 
 fn print_status(view: &StatusView) {
+    print!("{}", render_status(view));
+}
+
+fn render_status(view: &StatusView) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::new();
     match view.effective_limit {
-        Some(limit) => println!(
+        Some(limit) => writeln!(
+            output,
             "active leases: {} (effective minimum limit {})",
             view.active_leases, limit
-        ),
-        None => println!("active leases: 0"),
+        )
+        .unwrap(),
+        None => writeln!(output, "active leases: 0").unwrap(),
     }
     if let Some(res) = &view.reservation {
         let frontier = match res.backfill_cutoff {
@@ -710,39 +725,125 @@ fn print_status(view: &StatusView) {
             Some(cutoff) => format!("backfill cutoff at job {cutoff}"),
             None => "backfill frontier unavailable".to_string(),
         };
-        println!(
+        writeln!(
+            output,
             "protected job: {} ({frontier}; blocked by attempts {:?}; consumed bypasses {:?})",
             res.protected_job, res.blocking_attempts, res.consumed_bypasses
-        );
+        )
+        .unwrap();
     }
     if view.admission_blocked {
-        println!("ADMISSION BLOCKED: operator attention required (see daemon logs)");
+        writeln!(output, "ADMISSION BLOCKED: operator attention required (see daemon logs)")
+            .unwrap();
     }
     if view.jobs.is_empty() {
-        println!("no jobs");
-        return;
+        writeln!(output, "no jobs").unwrap();
+        return output;
     }
-    println!(
-        "{:<6} {:<20} {:<15} {:<6} {:<9} REASON",
-        "JOB", "NAME", "STATE", "LIMIT", "ATTEMPTS"
-    );
-    for job in &view.jobs {
-        let reason = job
-            .eligibility
-            .as_deref()
-            .or(job.state_reason.as_deref())
-            .unwrap_or("-");
-        println!(
-            "{:<6} {:<20} {:<15} {:<6} {:<9} {}",
-            job.id,
-            truncate(&job.name, 20),
-            job.state,
-            job.max_parallel_runs,
-            format!("{}/{}", job.attempt_count, job.max_attempts),
-            reason
-        );
+
+    let (live, queued, held, finished) = status_sections(view);
+    if !live.is_empty() || !queued.is_empty() {
+        write_status_header(&mut output);
+        for job in live.into_iter().chain(queued) {
+            write_status_job(&mut output, job);
+        }
     }
+    if !finished.is_empty() {
+        writeln!(output).unwrap();
+        writeln!(output, "Finished Runs").unwrap();
+        write_status_header(&mut output);
+        for job in finished {
+            write_status_job(&mut output, job);
+        }
+    }
+    if !held.is_empty() {
+        writeln!(output).unwrap();
+        writeln!(output, "Held Jobs").unwrap();
+        write_status_header(&mut output);
+        for job in held {
+            write_status_job(&mut output, job);
+        }
+    }
+    output
 }
+
+fn status_sections(
+    view: &StatusView,
+) -> (Vec<&JobView>, Vec<&JobView>, Vec<&JobView>, Vec<&JobView>) {
+    let mut live = Vec::new();
+    let mut queued = Vec::new();
+    let mut held = Vec::new();
+    let mut finished = Vec::new();
+    for job in &view.jobs {
+        if job.finished_at.is_some() {
+            finished.push(job);
+        } else if job.state == "queued" {
+            queued.push(job);
+        } else if job.state == "held" {
+            held.push(job);
+        } else {
+            // Starting and recovery states are live operational work too;
+            // keep unknown future non-terminal states visible here as well.
+            live.push(job);
+        }
+    }
+
+    live.sort_by_key(|job| {
+        let rank = match job.state.as_str() {
+            "running" => 0,
+            "starting" => 1,
+            "needs_attention" => 2,
+            _ => 3,
+        };
+        (rank, job.id)
+    });
+    queued.sort_by_key(|job| job.id);
+    queued.truncate(STATUS_QUEUE_LIMIT);
+    held.sort_by_key(|job| job.id);
+    held.truncate(STATUS_HELD_LIMIT);
+    finished.sort_by_key(|job| Reverse((job.finished_at, job.id)));
+    finished.truncate(STATUS_FINISHED_LIMIT);
+    (live, queued, held, finished)
+}
+
+fn write_status_header(output: &mut String) {
+    use std::fmt::Write as _;
+
+    writeln!(
+        output,
+        "{:<6} {:<width$} {:<15} {:<6} {:<9} REASON",
+        "JOB",
+        "NAME",
+        "STATE",
+        "LIMIT",
+        "ATTEMPTS",
+        width = STATUS_NAME_WIDTH,
+    )
+    .unwrap();
+}
+
+fn write_status_job(output: &mut String, job: &JobView) {
+    use std::fmt::Write as _;
+
+    let reason = job
+        .eligibility
+        .as_deref()
+        .or(job.state_reason.as_deref())
+        .unwrap_or("-");
+    writeln!(
+        output,
+        "{:<6} {:<width$} {:<15} {:<6} {:<9} {}",
+        job.id,
+        truncate(&job.name, STATUS_NAME_WIDTH),
+        job.state,
+        job.max_parallel_runs,
+        format!("{}/{}", job.attempt_count, job.max_attempts),
+        reason,
+        width = STATUS_NAME_WIDTH,
+    )
+    .unwrap();
+}
+
 fn print_job_detail(job: &JobView) {
     println!("job {} [{}]", job.id, job.name);
     println!("  state:            {}{}", job.state, match &job.state_reason {
@@ -1091,6 +1192,81 @@ mod tests {
         }
     }
 
+    fn status_job(id: JobId, state: &str, finished_at: Option<i64>) -> JobView {
+        JobView {
+            id,
+            name: format!("{state}-{id}"),
+            state: state.into(),
+            eligibility: None,
+            state_reason: None,
+            max_parallel_runs: 1,
+            cwd: "/tmp".into(),
+            args: vec!["true".into()],
+            max_attempts: 1,
+            retry_delay_ms: 0,
+            retry_not_before: None,
+            attempt_count: finished_at.is_some() as i64,
+            created_at: id,
+            updated_at: finished_at.unwrap_or(id),
+            finished_at,
+            dependencies: vec![],
+            attempts: vec![],
+            cancel_requested: None,
+        }
+    }
+
+    #[test]
+    fn status_prioritizes_live_work_and_limits_queue_and_finished_sections() {
+        let mut jobs = vec![
+            status_job(2, "starting", None),
+            status_job(1, "needs_attention", None),
+            status_job(3, "running", None),
+        ];
+        jobs.extend((50..62).rev().map(|id| status_job(id, "held", None)));
+        jobs.extend((100..112).rev().map(|id| status_job(id, "queued", None)));
+        jobs.extend((0..12).map(|index| {
+            let finished_at = (index * 7) % 12;
+            status_job(200 + index, "succeeded", Some(finished_at))
+        }));
+        let view = StatusView {
+            jobs,
+            active_leases: 1,
+            effective_limit: Some(1),
+            reservation: None,
+            admission_blocked: false,
+        };
+
+        let (live, queued, held, finished) = status_sections(&view);
+        assert_eq!(live.iter().map(|job| job.id).collect::<Vec<_>>(), vec![3, 2, 1]);
+        assert_eq!(
+            queued.iter().map(|job| job.id).collect::<Vec<_>>(),
+            (100..110).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            held.iter().map(|job| job.id).collect::<Vec<_>>(),
+            (50..60).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            finished.iter().map(|job| job.id).collect::<Vec<_>>(),
+            vec![205, 210, 203, 208, 201, 206, 211, 204, 209, 202]
+        );
+
+        let output = render_status(&view);
+        assert_eq!(output.matches("JOB    NAME").count(), 3, "{output}");
+        let finished_header = output.find("Finished Runs").unwrap();
+        let held_header = output.find("Held Jobs").unwrap();
+        assert!(output.find("running-3").unwrap() < output.find("queued-100").unwrap());
+        assert!(output.find("queued-109").unwrap() < finished_header);
+        assert!(finished_header < output.find("succeeded-205").unwrap());
+        assert!(output.find("succeeded-202").unwrap() < held_header);
+        assert!(held_header < output.find("held-50").unwrap());
+        assert!(!output.contains("queued-110"));
+        assert!(!output.contains("queued-111"));
+        assert!(!output.contains("held-60"));
+        assert!(!output.contains("held-61"));
+        assert!(!output.contains("succeeded-200"));
+        assert!(!output.contains("succeeded-207"));
+    }
 
     #[test]
     fn follow_tts_batches_outcomes_retries_and_started_work() {

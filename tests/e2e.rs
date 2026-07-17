@@ -169,6 +169,17 @@ fn submit_runs_captures_logs_and_reports() {
     assert!(stderr.contains("err-marker"), "stderr log: {stderr:?}");
 }
 
+#[test]
+fn status_displays_long_job_names() {
+    let q = TestQueue::new();
+    let name = "long-job-name-now-fits-in-status";
+    q.submit(&["--name", name], &["sleep", "1"]);
+
+    let status = q.cli(&["status"]);
+    assert!(status.contains(name), "long job name was truncated: {status}");
+    let header = status.lines().find(|line| line.starts_with("JOB ")).unwrap();
+    assert!(header.chars().count() <= 80, "status header is wider than 80 columns: {header}");
+}
 
 #[test]
 fn follow_tts_announces_completion_and_the_next_running_job() {

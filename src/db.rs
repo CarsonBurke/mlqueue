@@ -366,7 +366,7 @@ pub fn status_jobs(conn: &Connection, recent_terminal: u32) -> Result<Vec<JobRow
              UNION
              SELECT id FROM (
                  SELECT id FROM jobs WHERE finished_at IS NOT NULL
-                 ORDER BY finished_at DESC LIMIT ?1
+                 ORDER BY finished_at DESC, id DESC LIMIT ?1
              )
          ) ORDER BY id"
     ))?;
