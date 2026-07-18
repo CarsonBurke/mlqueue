@@ -325,19 +325,38 @@ fn send(paths: &Paths, op: Op, key: Option<String>) -> Result<Reply> {
 }
 
 fn mutate_job(paths: &Paths, op: Op, key: String, json: bool) -> Result<()> {
-    let reply = send(paths, op, Some(key))?;
+    let reply = send(paths, op.clone(), Some(key))?;
     let Reply::Job { job } = reply else { bail!(client::unexpected("job")) };
     if json {
         println!("{}", serde_json::to_string_pretty(&job)?);
     } else {
-        let extra = match (&job.eligibility, &job.state_reason) {
-            (_, Some(reason)) => format!(" ({reason})"),
-            (Some(reason), _) => format!(" ({reason})"),
-            _ => String::new(),
-        };
-        println!("job {} [{}] is now {}{}", job.id, job.name, job.state, extra);
+        println!("{}", format_mutation_message(&op, &job));
     }
     Ok(())
+}
+
+/// Human-readable result of a mutating op. Cancel of live work is asynchronous:
+/// the job stays `running`/`starting` until the process group drains, so a bare
+/// "is now running" would look like a no-op or a bug.
+fn format_mutation_message(op: &Op, job: &JobView) -> String {
+    if let Op::Cancel { force, .. } = op {
+        // Live cancel never flips job state in the same reply; gate on state so a
+        // missing cancel_requested flag cannot reintroduce "is now running".
+        if matches!(job.state.as_str(), "starting" | "running" | "needs_attention") {
+            let force = if *force { " (force)" } else { "" };
+            return format!(
+                "job {} [{}] cancel requested{}; still {} — waiting for cancel to complete",
+                job.id, job.name, force, job.state
+            );
+        }
+    }
+
+    let extra = match (&job.eligibility, &job.state_reason) {
+        (_, Some(reason)) => format!(" ({reason})"),
+        (Some(reason), _) => format!(" ({reason})"),
+        _ => String::new(),
+    };
+    format!("job {} [{}] is now {}{}", job.id, job.name, job.state, extra)
 }
 
 fn submit(paths: &Paths, args: SubmitArgs, key: String) -> Result<()> {
@@ -825,11 +844,17 @@ fn write_status_header(output: &mut String) {
 fn write_status_job(output: &mut String, job: &JobView) {
     use std::fmt::Write as _;
 
-    let reason = job
+    let prior = job
         .eligibility
         .as_deref()
         .or(job.state_reason.as_deref())
-        .unwrap_or("-");
+        .filter(|reason| !reason.is_empty() && *reason != "-");
+    let reason = match (job.cancel_requested == Some(true), prior) {
+        (true, Some(prior)) => format!("cancel_requested; {prior}"),
+        (true, None) => "cancel_requested".to_string(),
+        (false, Some(prior)) => prior.to_string(),
+        (false, None) => "-".to_string(),
+    };
     writeln!(
         output,
         "{:<6} {:<width$} {:<15} {:<6} {:<9} {}",
@@ -1213,6 +1238,48 @@ mod tests {
             attempts: vec![],
             cancel_requested: None,
         }
+    }
+
+    #[test]
+    fn cancel_of_running_job_does_not_claim_it_is_now_running() {
+        let mut job = status_job(106, "running", None);
+        job.name = "normuon_2k".into();
+        job.cancel_requested = Some(true);
+
+        let msg = format_mutation_message(&Op::Cancel { job: 106, force: false }, &job);
+        assert_eq!(
+            msg,
+            "job 106 [normuon_2k] cancel requested; still running — waiting for cancel to complete"
+        );
+
+        let force = format_mutation_message(&Op::Cancel { job: 106, force: true }, &job);
+        assert!(force.contains("cancel requested (force)"));
+        assert!(!force.contains("is now running"));
+    }
+
+    #[test]
+    fn cancel_of_queued_job_reports_terminal_state() {
+        let mut job = status_job(7, "cancelled", Some(1));
+        job.name = "queued-cancel".into();
+        job.state_reason = Some("cancelled before start".into());
+
+        let msg = format_mutation_message(&Op::Cancel { job: 7, force: false }, &job);
+        assert_eq!(
+            msg,
+            "job 7 [queued-cancel] is now cancelled (cancelled before start)"
+        );
+    }
+
+    #[test]
+    fn status_marks_cancel_requested_on_live_jobs() {
+        let mut job = status_job(42, "running", None);
+        job.cancel_requested = Some(true);
+        let mut out = String::new();
+        write_status_job(&mut out, &job);
+        assert!(
+            out.contains("cancel_requested") && !out.trim_end().ends_with('-'),
+            "got: {out}"
+        );
     }
 
     #[test]

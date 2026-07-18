@@ -563,7 +563,19 @@ fn cancel_terminates_and_frees_the_lease() {
     let job = q.submit(&["--name", "long"], &["sleep", "60"]);
     q.wait_state(job, "running", Duration::from_secs(10));
 
-    q.cli(&["cancel", &job.to_string()]);
+    // Cancel of live work is async: state stays running until the process
+    // exits. The human message must not claim the job "is now running".
+    let out = q.cli(&["cancel", &job.to_string()]);
+    assert!(
+        out.contains("cancel requested")
+            && out.contains("still running")
+            && out.contains("waiting for cancel to complete"),
+        "cancel of a live job should report async cancel intent, got: {out:?}"
+    );
+    assert!(
+        !out.contains("is now running"),
+        "cancel must not look like a no-op, got: {out:?}"
+    );
     q.wait_state(job, "cancelled", Duration::from_secs(10));
 
     // The lease is gone: an exclusive job starts immediately.
