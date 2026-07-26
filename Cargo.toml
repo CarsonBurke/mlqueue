@@ -1,6 +1,6 @@
 [package]
 name = "mlqueue"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Machine-wide queue coordinating local ML jobs through per-job maxParallelRuns admission"
 license = "MIT"
