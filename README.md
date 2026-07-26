@@ -1,105 +1,192 @@
 # mlqueue
 
-mlqueue is a machine-wide queue for coordinating local ML jobs across
-repositories: one durable daemon (`mlqd`) plus a CLI (`mlq`). The daemon
-admits arbitrary commands through a single per-job `maxParallelRuns`
-declaration, so independently acting agents cannot start an unsafe number of
-runs at once.
+**mlqueue** is a machine-wide queue for local ML work: one durable daemon
+(`mlqd`) and one CLI (`mlq`). Agents and shells across repositories submit
+commands through the same service so they cannot accidentally start an unsafe
+number of runs at once.
 
-The design rationale, invariants, and full model live in [PLAN.md](PLAN.md).
+It is a **coordination** tool for a single Linux user on one workstation—not a
+cluster scheduler, not a GPU allocator, and not a security boundary.
 
-## The admission model
+Full design rationale and invariants live in [PLAN.md](PLAN.md).
 
-Each job declares one number, `--max-parallel-runs N` (default `1`):
+## Install
 
-> This job is safe to run only when the total number of concurrent managed
-> jobs, including itself, is no greater than N.
+```bash
+cargo install --path .    # installs mlq + mlqd into ~/.cargo/bin
+mlq daemon install        # systemd user unit: enable + start
+# without systemd:
+mlq daemon run            # foreground daemon
+```
 
-A candidate starts exactly when `|running| + 1 <= min(candidate limit, every
-running limit)`. The default of `1` makes unspecified work exclusive; three
-`--max-parallel-runs 3` jobs may share; a `1` job waits for the machine and
-makes everything else wait for it. When a restrictive job reaches the head of
-the queue, it is *protected*: while the jobs that originally blocked it are
-still running, any equal-priority eligible job may backfill an open slot once
-each; when those blockers drain, the frontier freezes and later submissions
-can no longer pass it (bounding starvation without duration estimates).
+Confirm:
 
-Each submission also has a signed `--priority P` (default `0`). Eligible jobs
-are ordered by higher priority first, then FIFO within the same priority.
-Positive priorities supersede queued default/negative-priority work; negative
-priorities yield to default and positive work. Priority never preempts a job
-that already holds a run lease. A blocked protected job allows backfill only
-from its own priority, and a newly eligible higher-priority job replaces a
-lower-priority reservation.
-Strict priority can starve lower-priority work under a sustained stream of
-higher-priority arrivals, so nonzero values should be chosen deliberately.
-
-The daemon deliberately does **not** discover GPUs, meter VRAM/CPU, infer
-workload types, or preempt work. Cooperation is the contract: all managed
-work goes through the queue, and commands must stay foregrounded in their
-process group (no daemonizing/`setsid`).
+```bash
+mlq --version
+mlq daemon status
+```
 
 ## Quick start
 
 ```bash
-cargo install --path .    # installs mlq + mlqd
-mlq daemon install        # systemd user service (enable + start)
-# or, without systemd:
-mlq daemon run            # foreground daemon
+# exclusive smoke job (default maxParallelRuns = 1, priority = 0)
+mlq submit --name smoke -- python train.py --smoke
 
-mlq submit --name smoke --priority 1 --max-parallel-runs 1 -- python train.py --smoke
-mlq status                # live queue only (limits, protected job, reasons)
-mlq status -f             # most recent finished runs only
-mlq follow-tts            # announce completions and newly running work
-mlq logs 1 --follow       # exits with the attempt's outcome
-mlq wait 1 [--timeout 2h] # block until terminal; exit 0 / exit-code / 128+sig
-mlq set-max-parallel-runs 1 3 # update a queued or live job's limit
-mlq set-priority 1 2          # retune a queued/held job (not running)
-mlq cancel 1 [--force]
+# allow sharing with other cooperative jobs (only when known-safe)
+mlq submit --name cleanrl --max-parallel-runs 3 -- python train.py
+
+# prefer this job over default-priority queue work (does not preempt runners)
+mlq submit --name urgent --priority 1 --max-parallel-runs 1 -- python eval.py
+
+mlq status                # live queue: running, queued, held
+mlq status -f             # recent finished runs only
+mlq show 1
+mlq logs 1 --follow       # exit code matches the attempt
+mlq wait 1                # block until terminal; exit 0 / exit-code / 128+sig
+mlq cancel 1              # SIGTERM; add --force for SIGKILL after grace
 ```
 
-Workflow commands: `hold`, `release`, `retry`, `set-max-parallel-runs`,
-`set-priority`, `recover list`, `recover resolve`, plus
-`--after-success`/`--after-completion`
-dependency chains, `--max-attempts`/`--retry-delay` retry policy, and
-`--json` everywhere. Every mutation takes an idempotency key
-(`--idempotency-key`) and is safely retryable.
+## Admission model
 
-Changing a live job updates its active attempt and run lease atomically. A
-live limit cannot be lowered below the current number of active leases,
-because that would immediately violate the queue's symmetric admission
-contract; wait for enough work to drain, then retry the change.
+Every job declares one concurrency number, `--max-parallel-runs N` (default
+**1**):
 
-`mlq follow-tts` uses the backend and voice configured by the local `tts`
-command. Use `--tts-backend BACKEND` to override that selection for this
-follower.
+> This job is safe to run only while the total number of concurrent managed
+> jobs, including itself, is at most **N**.
+
+Admission is **symmetric**. A candidate starts only when the resulting set of
+run leases still satisfies every running job’s limit *and* the candidate’s:
+
+```text
+|running| + 1  <=  min(candidate N, every running N)
+```
+
+| Situation | Result |
+|---|---|
+| Machine idle, job with `1` | Starts alone |
+| Two jobs with `3`, candidate with `3` | Starts as the third |
+| Two jobs with `3`, candidate with `1` | Waits until the machine is empty |
+| Job with `1` running, candidate with `3` | Waits |
+| Job with `2` + candidate with `4` | Candidate may start; effective cap is `2` |
+
+Default `1` means “unknown work is exclusive.” Raise `N` only when the
+workload is safe next to *arbitrary* other managed jobs, not only next to
+copies of itself.
+
+The queue does **not** discover GPUs, meter VRAM/CPU, infer job types, or
+preempt healthy work. Cooperation is the contract: submit through `mlq`, and
+keep the command (and descendants) foregrounded in the runner’s process group
+(no `setsid` / daemonizing).
+
+### Protection and backfill
+
+When a restrictive job reaches the head of the queue, it is **protected**.
+While the attempts that originally blocked it are still advancing, equal-
+priority eligible jobs may backfill open slots once each. When those blockers
+drain, the frontier freezes so later arrivals cannot starve the protected job
+indefinitely.
+
+### Priority
+
+Each job has a signed `--priority P` (default **0**). Eligible jobs are ordered
+by **higher priority first**, then FIFO within the same priority.
+
+- Priority never preempts a job that already holds a run lease.
+- A protected job only allows equal-priority backfill.
+- A newly eligible higher-priority job can replace a lower-priority
+  reservation.
+- Sustained high-priority submissions can starve lower-priority work—use
+  nonzero values deliberately.
+
+```bash
+mlq submit --priority 1  --max-parallel-runs 1 -- COMMAND...   # ahead of default
+mlq submit --priority -1 --max-parallel-runs 3 -- COMMAND...   # yields to default
+mlq set-priority 12 2     # retune queued or held job only
+```
+
+## CLI
+
+| Command | Purpose |
+|---|---|
+| `submit` | Enqueue a command (`--` then argv) |
+| `status` | Live queue (leases, protection, reasons) |
+| `status -f` | Most recent finished runs only |
+| `show JOB` | Full job detail and attempts |
+| `logs JOB` | Stdout/stderr; `--follow` exits with attempt outcome |
+| `wait JOB` | Block until terminal (`--timeout`, exit codes below) |
+| `cancel JOB` | Cancel; `--force` escalates to SIGKILL after grace |
+| `hold` / `release` | Park and restore a queued job |
+| `retry JOB` | Requeue a failed or lost job |
+| `set-max-parallel-runs JOB N` | Change limit on queued **or live** jobs |
+| `set-priority JOB P` | Change priority on **queued/held** jobs only |
+| `follow-tts` | Speak completions and newly running work via local `tts` |
+| `daemon …` | `status` / `run` / `install` / `uninstall` |
+| `recover …` | List or resolve orphaned/quarantined attempts |
+
+Common flags:
+
+- `--json` on most commands for machine-readable output
+- `--idempotency-key KEY` on mutations (auto-generated if omitted; safe to
+  retry an identical request)
+- Submit: `--name`, `--cwd`, `--env KEY=VAL`, `--inherit-env VAR`,
+  `--max-attempts`, `--retry-delay`, `--after-success JOB`,
+  `--after-completion JOB`
+
+### `wait` and `logs --follow` exit codes
+
+| Outcome | Exit |
+|---|---|
+| Success | `0` |
+| Command failed | command’s exit code |
+| Killed by signal | `128 + signal` |
+| `--timeout` expired | `124` |
+
+### Changing a live limit
+
+`set-max-parallel-runs` updates the job, its live attempt, and its run lease
+atomically. Lowering a limit below the current number of active leases is
+rejected—wait for work to drain, then retry.
+
+## Submit recipe for agents
+
+```bash
+mlq submit \
+  --name NAME \
+  --max-parallel-runs N \
+  --cwd /absolute/repo/path \
+  -- COMMAND...
+```
+
+- Always set `--max-parallel-runs` explicitly (`1` for exclusive / unknown /
+  multi-GPU / benchmarks).
+- Omit `--priority` unless queue precedence is intentional.
+- Prefer dependency edges (`--after-success` / `--after-completion`) over
+  shell backgrounding.
+- Enqueue the full known DAG, then `mlq wait` on leaves.
+- Secrets: prefer files over `--env` (env is stored in SQLite as plaintext).
+
+A ready-made agent skill ships in [`skills/queue-ml-jobs/`](skills/queue-ml-jobs/).
+Install or link it next to the CLI in agent environments.
 
 ## Durability
 
-- SQLite (WAL, `synchronous=FULL`) under `$XDG_STATE_HOME/mlqueue`; Unix
-  socket under `$XDG_RUNTIME_DIR/mlqueue` with peer-UID checks.
-- Every running attempt is supervised by a small detached runner process, so
-  daemon crashes/restarts/upgrades never kill workers — the restarted daemon
-  adopts live runners and finalizes durable results exactly once.
-- Run leases are released only when an attempt's entire process group is
-  provably empty; cancellation is SIGTERM, then opt-in SIGKILL after a grace
-  period.
-
-## Agent integration
-
-`skills/queue-ml-jobs/` ships an agent skill that routes ML work through the
-queue and picks conservative explicit limits (`1` for exclusive/unknown work,
-`3` for small characterized CleanRL runs). Install or link it into agent
-environments alongside the CLI.
+- **SQLite** (WAL, `synchronous=FULL`) under `$XDG_STATE_HOME/mlqueue`
+- **Unix socket** under `$XDG_RUNTIME_DIR/mlqueue` with peer-UID checks
+- Each attempt is supervised by a small detached **runner**; daemon restarts
+  and upgrades do not kill workers—the new daemon adopts live runners and
+  finalizes results exactly once
+- A run lease is held until the attempt’s **entire process group** is gone
+- Cancel is SIGTERM, then optional SIGKILL after a configured grace period
 
 ## Development
 
 ```bash
-cargo test        # scheduler/property, db, protocol unit tests + e2e suite
+cargo test        # unit + property tests and e2e (real daemons/runners/CLI)
 cargo clippy
+cargo install --path . --force && mlq daemon install   # rebuild + restart unit
 ```
 
-The end-to-end suite (`tests/e2e.rs`) runs real daemons, runners, and CLI
-binaries in isolated temp directories, covering the concurrency formula,
-signed priority ordering, windowed-then-frozen backfill, cancellation, retries,
-dependency skips, idempotency replay/conflict, and daemon-crash recovery.
+The e2e suite (`tests/e2e.rs`) covers the concurrency formula, signed priority
+ordering, windowed-then-frozen backfill, live limit updates, cancellation,
+retries, dependency skips, idempotency replay/conflict, and daemon-crash
+recovery.
