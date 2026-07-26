@@ -1183,6 +1183,7 @@ fn apply_mutation(
                     &json!({
                         "name": params.name,
                         "maxParallelRuns": params.max_parallel_runs,
+                        "priority": params.priority,
                     })
                     .to_string(),
                 ),
@@ -1246,30 +1247,123 @@ fn apply_mutation(
                 ));
             }
             let row = db::job_row(tx, *job)?.ok_or_else(|| api_not_found(*job))?;
-            if !matches!(row.state, JobState::Queued | JobState::Held) {
+            if !matches!(
+                row.state,
+                JobState::Queued
+                    | JobState::Held
+                    | JobState::Starting
+                    | JobState::Running
+                    | JobState::NeedsAttention
+            ) {
                 return Err(ApiError::new(
                     error_codes::INVALID_STATE,
                     format!(
-                        "maxParallelRuns is immutable after launch preparation; job {} is {}",
+                        "maxParallelRuns cannot be changed after a job finishes; job {} is {}",
                         row.id, row.state
                     ),
                 ));
             }
-            invalidate_reservation_if_protected(
-                tx,
-                row.id,
-                "protected job concurrency limit was changed",
-                now,
-            )?;
+            // In particular, do not invalidate and recreate a protected
+            // job's reservation for an exact-value no-op.
+            if row.max_parallel_runs == *max_parallel_runs {
+                return Ok((job_reply(tx, paths, *job)?, Vec::new()));
+            }
+            let active_attempt = match row.state {
+                JobState::Queued | JobState::Held => {
+                    invalidate_reservation_if_protected(
+                        tx,
+                        row.id,
+                        "protected job concurrency limit was changed",
+                        now,
+                    )?;
+                    None
+                }
+                JobState::Starting | JobState::Running | JobState::NeedsAttention => {
+                    let attempt = db::live_attempt_for_job(tx, row.id)?.ok_or_else(|| {
+                        ApiError::new(
+                            error_codes::INVALID_STATE,
+                            format!("job {} has no live attempt to update", row.id),
+                        )
+                    })?;
+                    let active_leases = db::active_leases(tx)?;
+                    let active_count = active_leases.len() as u64;
+                    if u64::from(*max_parallel_runs) < active_count {
+                        return Err(ApiError::new(
+                            error_codes::INVALID_ARGUMENT,
+                            format!(
+                                "cannot lower maxParallelRuns to {max_parallel_runs} while \
+                                 {active_count} run leases are active; wait for the active \
+                                 count to fall to {max_parallel_runs} or lower"
+                            ),
+                        ));
+                    }
+                    if !active_leases.iter().any(|(id, _)| *id == attempt.id) {
+                        return Err(ApiError::new(
+                            error_codes::INVALID_STATE,
+                            format!("job {} has no active run lease to update", row.id),
+                        ));
+                    }
+                    db::set_active_attempt_max_parallel_runs(tx, attempt.id, *max_parallel_runs)?;
+                    Some((attempt.id, active_count))
+                }
+                _ => unreachable!("state eligibility checked above"),
+            };
             db::set_job_max_parallel_runs(tx, row.id, *max_parallel_runs, now)?;
             db::append_event(
                 tx,
                 Some(row.id),
-                None,
+                active_attempt.map(|(attempt, _)| attempt),
                 "max_parallel_runs_changed",
                 "client",
                 Some(
-                    &json!({ "from": row.max_parallel_runs, "to": max_parallel_runs }).to_string(),
+                    &json!({
+                        "from": row.max_parallel_runs,
+                        "to": max_parallel_runs,
+                        "activeLeases": active_attempt.map(|(_, count)| count),
+                    })
+                    .to_string(),
+                ),
+            )?;
+            Ok((job_reply(tx, paths, *job)?, Vec::new()))
+        }
+        Op::SetPriority { job, priority } => {
+            let row = db::job_row(tx, *job)?.ok_or_else(|| api_not_found(*job))?;
+            // Priority only affects scheduling order among non-running work.
+            // Live jobs keep their lease; changing their priority would imply
+            // preemption semantics we deliberately do not implement.
+            if !matches!(row.state, JobState::Queued | JobState::Held) {
+                return Err(ApiError::new(
+                    error_codes::INVALID_STATE,
+                    format!(
+                        "priority can only be changed for queued or held jobs; job {} is {}",
+                        row.id, row.state
+                    ),
+                ));
+            }
+            if row.priority == *priority {
+                return Ok((job_reply(tx, paths, *job)?, Vec::new()));
+            }
+            if row.state == JobState::Queued {
+                invalidate_reservation_if_protected(
+                    tx,
+                    row.id,
+                    "protected job priority was changed",
+                    now,
+                )?;
+            }
+            db::set_job_priority(tx, row.id, *priority, now)?;
+            db::append_event(
+                tx,
+                Some(row.id),
+                None,
+                "priority_changed",
+                "client",
+                Some(
+                    &json!({
+                        "from": row.priority,
+                        "to": priority,
+                    })
+                    .to_string(),
                 ),
             )?;
             Ok((job_reply(tx, paths, *job)?, Vec::new()))

@@ -11,8 +11,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::domain::{AttemptId, JobId};
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const DEFAULT_MAX_FRAME_BYTES: u32 = 1 << 20;
+
+fn is_zero(value: &i64) -> bool {
+    *value == 0
+}
 
 // Stable error codes.
 pub mod error_codes {
@@ -52,6 +56,7 @@ pub enum Op {
     Release { job: JobId },
     Retry { job: JobId },
     SetMaxParallelRuns { job: JobId, max_parallel_runs: u32 },
+    SetPriority { job: JobId, priority: i64 },
     DaemonStatus,
     RecoverList,
     RecoverResolve { job: JobId, attempt: i64, resolve_as: ResolveAs },
@@ -67,6 +72,7 @@ impl Op {
                 | Op::Release { .. }
                 | Op::Retry { .. }
                 | Op::SetMaxParallelRuns { .. }
+                | Op::SetPriority { .. }
                 | Op::RecoverResolve { .. }
         )
     }
@@ -84,6 +90,7 @@ impl Op {
             Op::Release { .. } => "release",
             Op::Retry { .. } => "retry",
             Op::SetMaxParallelRuns { .. } => "set_max_parallel_runs",
+            Op::SetPriority { .. } => "set_priority",
             Op::DaemonStatus => "daemon_status",
             Op::RecoverList => "recover_list",
             Op::RecoverResolve { .. } => "recover_resolve",
@@ -109,6 +116,10 @@ pub struct SubmitParams {
     /// Explicit persisted environment (baseline plus client-resolved values).
     pub env: BTreeMap<String, String>,
     pub max_parallel_runs: u32,
+    // Omitting zero preserves request hashes for default-priority submissions
+    // already recorded by protocol v3 daemons.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub priority: i64,
     pub max_attempts: u32,
     pub retry_delay_ms: u64,
     #[serde(default)]
@@ -165,6 +176,8 @@ pub struct JobView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state_reason: Option<String>,
     pub max_parallel_runs: u32,
+    #[serde(default)]
+    pub priority: i64,
     pub cwd: String,
     pub args: Vec<String>,
     pub max_attempts: u32,
@@ -382,21 +395,31 @@ mod tests {
 
     #[test]
     fn request_hash_is_stable_and_payload_sensitive() {
-        let mk = |limit| {
+        let mk = |limit, priority| {
             Op::Submit(SubmitParams {
                 name: "x".into(),
                 cwd: "/tmp".into(),
                 args: vec!["true".into()],
                 env: BTreeMap::new(),
                 max_parallel_runs: limit,
+                priority,
                 max_attempts: 1,
                 retry_delay_ms: 0,
                 after_success: vec![],
                 after_completion: vec![],
             })
         };
-        assert_eq!(mk(1).request_hash(), mk(1).request_hash());
-        assert_ne!(mk(1).request_hash(), mk(2).request_hash());
+        assert_eq!(mk(1, 0).request_hash(), mk(1, 0).request_hash());
+        assert_ne!(mk(1, 0).request_hash(), mk(2, 0).request_hash());
+        assert_ne!(mk(1, 0).request_hash(), mk(1, -1).request_hash());
+
+        let default_json = serde_json::to_string(&mk(1, 0)).unwrap();
+        assert!(!default_json.contains("priority"), "{default_json}");
+        let prioritized_json = serde_json::to_string(&mk(1, 1)).unwrap();
+        assert!(
+            prioritized_json.contains("\"priority\":1"),
+            "{prioritized_json}"
+        );
     }
 
     #[test]

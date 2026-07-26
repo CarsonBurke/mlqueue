@@ -733,23 +733,204 @@ fn second_daemon_instance_is_refused() {
 }
 
 #[test]
-fn set_max_parallel_runs_only_while_queued() {
+fn set_max_parallel_runs_updates_queued_and_live_jobs_safely() {
     let q = TestQueue::new();
-    let blocker = q.submit(&["--name", "blocker"], &["sleep", "1.5"]);
-    q.wait_state(blocker, "running", Duration::from_secs(10));
-    let queued = q.submit(&["--name", "tune-me"], &["sh", "-c", "true"]);
+    let first = q.submit(
+        &["--max-parallel-runs", "2", "--name", "first"],
+        &["sleep", "30"],
+    );
+    let second = q.submit(
+        &["--max-parallel-runs", "2", "--name", "second"],
+        &["sleep", "30"],
+    );
+    for job in [first, second] {
+        q.wait_state(job, "running", Duration::from_secs(10));
+    }
+
+    let queued = q.submit(
+        &["--max-parallel-runs", "2", "--name", "tune-me"],
+        &["sleep", "30"],
+    );
+
+    // Reapplying the same value is a true no-op, including for this protected
+    // queue head; it must not perturb the active reservation.
+    q.cli(&["set-max-parallel-runs", &queued.to_string(), "2"]);
+    assert_eq!(q.status()["reservation"]["protectedJob"], queued);
 
     q.cli(&["set-max-parallel-runs", &queued.to_string(), "3"]);
     assert_eq!(q.job(queued)["maxParallelRuns"], 3);
-    // Now compatible with the running blocker? No: blocker declared 1, so the
-    // queued job still waits — the lower limit wins.
+    // Both active declarations still cap the machine at two, so changing only
+    // the queued candidate cannot admit it.
     assert_eq!(q.job_state(queued), "queued");
 
-    // Immutable once running.
-    let output = q.try_cli(&["set-max-parallel-runs", &blocker.to_string(), "2"]);
-    assert!(!output.status.success());
+    // Raising one live declaration is not enough; raising both opens the third
+    // slot and the queued job starts on the mutation-triggered scheduler pass.
+    let message = q.cli(&["set-max-parallel-runs", &first.to_string(), "3"]);
+    assert!(
+        message.contains("maxParallelRuns is now 3 (running)"),
+        "message: {message}"
+    );
+    assert_eq!(q.job_state(queued), "queued");
+    q.cli(&["set-max-parallel-runs", &second.to_string(), "3"]);
+    q.wait_state(queued, "running", Duration::from_secs(10));
 
-    q.wait_state(queued, "succeeded", Duration::from_secs(10));
+    // Job, attempt, and lease views all reflect the live change.
+    for job in [first, second] {
+        let detail = q.job(job);
+        assert_eq!(detail["maxParallelRuns"], 3);
+        assert_eq!(detail["attempts"][0]["maxParallelRuns"], 3);
+    }
+    assert_eq!(q.status()["effectiveLimit"], 3);
+
+    // Three leases are active while the third job keeps running. A limit of
+    // two would make that current set invalid, so the mutation is rejected
+    // without changing any persisted copy.
+    let output = q.try_cli(&["set-max-parallel-runs", &first.to_string(), "2"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("while 3 run leases are active"),
+        "stderr: {stderr}"
+    );
+    let detail = q.job(first);
+    assert_eq!(detail["maxParallelRuns"], 3);
+    assert_eq!(detail["attempts"][0]["maxParallelRuns"], 3);
+
+    // Once the third lease drains, lowering to the two active leases is safe
+    // and updates the effective scheduler limit immediately.
+    q.cli(&["cancel", &queued.to_string()]);
+    q.wait_state(queued, "cancelled", Duration::from_secs(10));
+    q.cli(&["set-max-parallel-runs", &first.to_string(), "2"]);
+    let detail = q.job(first);
+    assert_eq!(detail["maxParallelRuns"], 2);
+    assert_eq!(detail["attempts"][0]["maxParallelRuns"], 2);
+    assert_eq!(q.status()["effectiveLimit"], 2);
+
+    for job in [first, second] {
+        q.cli(&["cancel", &job.to_string()]);
+        q.wait_state(job, "cancelled", Duration::from_secs(10));
+    }
+}
+
+#[test]
+fn set_priority_updates_queued_jobs_and_rejects_running() {
+    let q = TestQueue::new();
+    let blocker = q.submit(&["--name", "blocker"], &["sleep", "30"]);
+    q.wait_state(blocker, "running", Duration::from_secs(10));
+
+    let first = q.submit(&["--name", "first", "--priority", "0"], &["sleep", "30"]);
+    let second = q.submit(&["--name", "second", "--priority", "0"], &["sleep", "30"]);
+    assert_eq!(
+        q.status()["reservation"]["protectedJob"].as_i64(),
+        Some(first),
+        "FIFO protection while priorities are equal"
+    );
+
+    // Same value is a no-op that leaves the protected reservation alone.
+    let message = q.cli(&["set-priority", &first.to_string(), "0"]);
+    assert!(
+        message.contains("priority is now 0 (queued)"),
+        "message: {message}"
+    );
+    assert_eq!(
+        q.status()["reservation"]["protectedJob"].as_i64(),
+        Some(first)
+    );
+
+    // Raising a later job above the protected head supersedes the reservation.
+    let message = q.cli(&["set-priority", &second.to_string(), "2"]);
+    assert!(
+        message.contains("priority is now 2 (queued)"),
+        "message: {message}"
+    );
+    assert_eq!(q.job(second)["priority"], 2);
+    assert_eq!(
+        q.status()["reservation"]["protectedJob"].as_i64(),
+        Some(second)
+    );
+
+    // Held jobs may also be retuned before release.
+    q.cli(&["hold", &first.to_string()]);
+    q.cli(&["set-priority", &first.to_string(), "-1"]);
+    assert_eq!(q.job(first)["priority"], -1);
+    assert_eq!(q.job_state(first), "held");
+
+    // Running work cannot change priority (no preemption).
+    let output = q.try_cli(&["set-priority", &blocker.to_string(), "9"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("queued or held"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(q.job(blocker)["priority"], 0);
+
+    // Negative priorities parse as a positional value.
+    q.cli(&["release", &first.to_string()]);
+    q.cli(&["set-priority", &first.to_string(), "-4"]);
+    assert_eq!(q.job(first)["priority"], -4);
+
+    q.cli(&["cancel", &blocker.to_string()]);
+    q.wait_state(blocker, "cancelled", Duration::from_secs(10));
+    q.wait_state(second, "running", Duration::from_secs(10));
+    assert_eq!(q.job_state(first), "queued");
+
+    q.cli(&["cancel", &second.to_string()]);
+    q.wait_state(second, "cancelled", Duration::from_secs(10));
+    q.wait_state(first, "running", Duration::from_secs(10));
+    q.cli(&["cancel", &first.to_string()]);
+    q.wait_state(first, "cancelled", Duration::from_secs(10));
+}
+
+#[test]
+fn signed_priorities_strictly_order_queued_jobs_without_preempting_running_work() {
+    let q = TestQueue::new();
+    let blocker = q.submit(
+        &["--priority", "-5", "--name", "running-low-priority"],
+        &["sleep", "30"],
+    );
+    q.wait_state(blocker, "running", Duration::from_secs(10));
+
+    let low = q.submit(&["--priority", "-1", "--name", "low"], &["sleep", "30"]);
+    let default = q.submit(&["--name", "default"], &["sleep", "30"]);
+    let high = q.submit(&["--priority", "1", "--name", "high"], &["sleep", "30"]);
+
+    // Higher-priority arrivals supersede queued reservations, not active
+    // leases. The already-running negative-priority job remains untouched.
+    assert_eq!(q.job_state(blocker), "running");
+    assert_eq!(q.job(high)["priority"], 1);
+    assert_eq!(q.job(default)["priority"], 0);
+    assert_eq!(q.job(low)["priority"], -1);
+    assert_eq!(
+        q.status()["reservation"]["protectedJob"].as_i64(),
+        Some(high)
+    );
+    assert!(
+        q.job(default)["eligibility"]
+            .as_str()
+            .unwrap()
+            .starts_with("waiting_for_higher_priority"),
+        "default-priority work should wait behind priority 1"
+    );
+    let status = q.cli(&["status"]);
+    assert!(status.contains("PRI"), "status header: {status}");
+
+    q.cli(&["cancel", &blocker.to_string()]);
+    q.wait_state(blocker, "cancelled", Duration::from_secs(10));
+    q.wait_state(high, "running", Duration::from_secs(10));
+    assert_eq!(q.job_state(default), "queued");
+    assert_eq!(q.job_state(low), "queued");
+
+    q.cli(&["cancel", &high.to_string()]);
+    q.wait_state(high, "cancelled", Duration::from_secs(10));
+    q.wait_state(default, "running", Duration::from_secs(10));
+    assert_eq!(q.job_state(low), "queued");
+
+    q.cli(&["cancel", &default.to_string()]);
+    q.wait_state(default, "cancelled", Duration::from_secs(10));
+    q.wait_state(low, "running", Duration::from_secs(10));
+    q.cli(&["cancel", &low.to_string()]);
+    q.wait_state(low, "cancelled", Duration::from_secs(10));
 }
 
 #[test]

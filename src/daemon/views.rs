@@ -87,15 +87,34 @@ fn eligibility_reason(
             } else if job.retry_not_before.is_some_and(|at| at > now) {
                 Some("waiting_for_retry_delay".to_string())
             } else if let Some(res) = reservation {
-                if res.job_id == job.id {
+                let frontier = db::backfill_frontier(conn, res)?;
+                let protected = db::job_row(conn, res.job_id)?;
+                if matches!(frontier, db::BackfillFrontier::Unsupported(_)) {
+                    Some("admission_blocked: reservation needs operator attention".to_string())
+                } else if res.job_id == job.id {
                     Some("protected_drain: waiting for active jobs to drain".to_string())
+                } else if let Some(protected) = &protected
+                    && job.priority > protected.priority
+                {
+                    Some(format!(
+                        "supersedes_lower_priority: priority {} job will displace protected \
+                         priority {} job {} on the next scheduling pass",
+                        job.priority, protected.priority, protected.id
+                    ))
+                } else if let Some(protected) = &protected
+                    && job.priority < protected.priority
+                {
+                    Some(format!(
+                        "waiting_for_higher_priority: protected job {} has priority {}",
+                        protected.id, protected.priority
+                    ))
                 } else if res.consumed.contains(&job.id) {
                     Some(format!(
                         "backfill_bypass_consumed: already bypassed protected job {} once",
                         res.job_id
                     ))
                 } else {
-                    match db::backfill_frontier(conn, res)? {
+                    match frontier {
                         db::BackfillFrontier::OpenWindow => Some(format!(
                             "backfill_window_open: may bypass protected job {} once while \
                              its original blockers run",
@@ -117,8 +136,8 @@ fn eligibility_reason(
                                 ))
                             }
                         }
-                        db::BackfillFrontier::Unsupported(_) => Some(
-                            "admission_blocked: reservation needs operator attention".to_string(),
+                        db::BackfillFrontier::Unsupported(_) => unreachable!(
+                            "unsupported reservation handled before priority explanations"
                         ),
                     }
                 }
@@ -156,6 +175,7 @@ pub fn job_view(
         eligibility: eligibility_reason(conn, job, reservation.as_ref(), now_ms())?,
         state_reason: job.state_reason.clone(),
         max_parallel_runs: job.max_parallel_runs,
+        priority: job.priority,
         cwd: job.cwd.clone(),
         args: job.args.clone(),
         max_attempts: job.max_attempts as u32,

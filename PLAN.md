@@ -102,30 +102,36 @@ to stay foregrounded or wait for the cgroup extension.
 
 ### Queue rank
 
-Order eligible jobs by monotonic submission sequence (FIFO). Dependencies,
-holds, and retry delays determine eligibility before ranking. Priority is not
-part of the MVP; add it only if concrete workflows demonstrate that FIFO plus
-protected backfill is insufficient.
+Order eligible jobs by signed priority descending, then monotonic submission
+sequence ascending (FIFO within a priority). Priority defaults to `0`; positive
+values supersede queued default/negative work, while negative values yield to
+all higher priorities. Dependencies, holds, and retry delays determine
+eligibility before ranking. Priority never preempts an active run lease.
+This is strict priority and may starve lower-priority work under sustained
+higher-priority arrivals; callers must choose nonzero values deliberately.
 
 ### Greedy admission
 
 On each scheduling pass:
 
 1. Reconcile active run leases and terminal attempts.
-2. Start an existing protected job immediately if it is now compatible.
-3. If a reservation exists and its owner is still blocked, restrict candidates
-   to eligible jobs whose one bypass is not consumed: every such job while the
-   backfill window is open, only those at or before the frozen cutoff once the
-   window has closed. Later jobs are not part of that scheduling pass.
-4. Without a reservation, consider every eligible job in FIFO order. When the
-   first job is incompatible with the cumulative shadow set, protect it before
-   considering lower jobs. Seed the consumed set with attempts already active
-   and jobs selected earlier in that same shadow batch, then switch immediately
-   to the reservation candidate rules in step 3.
-5. Admit the first compatible candidate in the permitted FIFO set.
-6. Add its lease to a shadow running set and repeat until no candidate can be
+2. If the highest eligible job has greater priority than the protected job,
+   invalidate the lower-priority reservation. Running blockers are untouched.
+3. Start an existing protected job immediately if it is now compatible.
+4. If a reservation exists and its owner is still blocked, restrict candidates
+   to equal-priority eligible jobs whose one bypass is not consumed: every such
+   job while the backfill window is open, only those at or before the frozen
+   cutoff once the window has closed. Lower-priority and later jobs are not
+   part of that scheduling pass.
+5. Without a reservation, consider every eligible job in priority/FIFO order.
+   When the first job is incompatible with the cumulative shadow set, protect
+   it before considering lower-ranked jobs. Seed the consumed set with attempts
+   already active and jobs selected earlier in that same shadow batch, then
+   switch immediately to the reservation candidate rules in step 4.
+6. Admit the first compatible candidate in the permitted priority/FIFO set.
+7. Add its lease to a shadow running set and repeat until no candidate can be
    admitted.
-7. Commit attempts, leases, reservation creation/satisfaction/invalidation, and
+8. Commit attempts, leases, reservation creation/satisfaction/invalidation, and
    seeded or newly consumed backfill rows in one transaction after
    revalidation.
 
@@ -147,9 +153,10 @@ frozen frontier:
    initial blockers: the attempts holding (shadow) leases at that moment.
 2. While any initial blocker still holds its lease in a live-advancing state
    (prepared, authorized, or running), the backfill window is open: every
-   eligible job whose bypass is unconsumed may pass the protected job,
-   regardless of submission order. The machine was already busy with work
-   that predates the protection; open slots are not idled on its account.
+   equal-priority eligible job whose bypass is unconsumed may pass the protected
+   job, regardless of submission order. Lower-priority jobs remain queued. The
+   machine was already busy with work that predates the protection; same-rank
+   open slots are not idled on its account.
 3. On the first pass after the last initial blocker stops advancing, freeze
    the frontier: pin the current maximum submission sequence as the backfill
    cutoff, exactly once. The stored cutoff is an explicit unfrozen sentinel
@@ -160,14 +167,17 @@ frozen frontier:
    unconsumed jobs submitted at or before the cutoff, excluding the protected
    job. This includes a previously held or dependency-delayed job that later
    becomes eligible; membership is not snapshotted separately.
-5. Admit compatible candidates in FIFO order. Record each job that starts as
-   a backfill; the same job cannot bypass this reservation again through a
-   retry or another attempt, in the open window or after the freeze.
+5. Admit compatible equal-priority candidates in FIFO order. Record each job
+   that starts as a backfill; the same job cannot bypass this reservation again
+   through a retry or another attempt, in the open window or after the freeze.
 6. Jobs submitted after the frozen cutoff may not pass the protected job.
 7. When nothing fits, launch nothing. Re-run the same checks after an active
    attempt finishes; do not mistake “currently full” for an exhausted frontier.
 8. Start the protected job as soon as the compatibility formula permits,
    before reconsidering any backfill.
+9. If a higher-priority job becomes eligible, invalidate the lower-priority
+   reservation and plan from the higher-ranked head. If it cannot fit, protect
+   it instead; lower priorities cannot use its spare capacity.
 
 The window plus one-bypass-per-job rule bounds scheduler-created starvation
 without requiring duration estimates or assuming retries are finite: the
@@ -374,11 +384,14 @@ its event are committed together.
 - Explicit persisted environment.
 - State, retry policy, and dependency metadata.
 - Positive `max_parallel_runs`, default `1`.
+- Signed priority, default `0`.
 - Created, updated, and terminal timestamps.
 
-The value is immutable after a job reaches `starting`. A queued job may change
-it through an explicit idempotent mutation that also invalidates and reruns the
-current scheduling decision.
+Queued and held jobs may change `max_parallel_runs` through an explicit
+idempotent mutation that also invalidates and reruns the current scheduling
+decision. A live job may change it atomically with its active attempt and run
+lease. To preserve the admission invariant, a live value cannot be lowered
+below the current active-lease count. Finished jobs remain immutable.
 
 ### `dependencies`
 
@@ -390,7 +403,8 @@ current scheduling decision.
 
 - Attempt ID, job ID, and monotonically increasing attempt number.
 - Launch token and detailed attempt state.
-- A copied immutable `max_parallel_runs` used by its lease.
+- A copied `max_parallel_runs` used by its lease. It changes only as part of
+  the same transaction as an explicit live-job limit update.
 - Runner and command PID/process-group identity: boot ID and `/proc` start
   times, not PID alone.
 - Start, observation, cancellation, and finish timestamps.
@@ -400,7 +414,8 @@ current scheduling decision.
 ### `run_leases`
 
 - Attempt ID as the unique owner.
-- Copied `max_parallel_runs`.
+- Copied `max_parallel_runs`, updated atomically with the active attempt and
+  job when a safe live limit change is requested.
 - Acquisition and release timestamps.
 
 The active lease rows are the source of truth for the scheduler formula.
@@ -580,7 +595,7 @@ terminal result is `cancelled`, even if a signal handler returns zero.
 Initial commands:
 
 ```text
-mlq [--idempotency-key KEY] submit --max-parallel-runs N --name NAME
+mlq [--idempotency-key KEY] submit --max-parallel-runs N --priority P --name NAME
         --cwd PATH [--after-success JOB]... [--after-completion JOB]...
         [--max-attempts N] [--retry-delay DURATION] -- COMMAND [ARGS...]
 mlq status [--watch] [--json]
@@ -607,10 +622,12 @@ mlq [--idempotency-key KEY] recover resolve JOB --attempt N
 The protocol always requires a mutation key. The CLI generates one before a
 mutation and retains it for automatic transport retries; an explicit global
 flag lets an agent safely rerun a whole CLI invocation after losing its output.
-`submit` defaults to `--max-parallel-runs 1`. Dependency flags are repeatable
-and inserted atomically with the job. Human and JSON status explain:
+`submit` defaults to `--max-parallel-runs 1 --priority 0`. Dependency flags
+are repeatable and inserted atomically with the job. Human and JSON status
+explain:
 
 - The declared limit for every job and active attempt.
+- Every job's signed priority and priority-related waiting reason.
 - Current run-lease count and effective minimum running limit.
 - Why a candidate is incompatible.
 - The protected job, and its open window or frozen cutoff.
@@ -638,7 +655,8 @@ benchmarks, experiment batches, and dependent chains. It requires the agent to:
    and desired failure behavior.
 3. Verify that the command stays in the foreground and does not daemonize or
    escape its process group.
-4. Deliberately choose `maxParallelRuns` for each submission.
+4. Deliberately choose `maxParallelRuns` for each submission and use priority
+   `0` unless the user or workflow explicitly requires different ordering.
 5. Use `1` for large-model training, near-full-device workloads, multi-GPU
    training, benchmark-sensitive work, unfamiliar commands, or uncertainty.
 6. Use a value above `1` only from known workload behavior. Small characterized
@@ -749,7 +767,7 @@ Exit criteria:
 ### Phase 2: workflow features and agent skill
 
 - Dependencies with cycle detection and failure propagation.
-- Hold, release, retry, and queued-limit changes.
+- Hold, release, retry, and queued/live-limit changes.
 - Complete structured JSON and decision explanations.
 - Build, validate, and forward-test `queue-ml-jobs`.
 
@@ -795,10 +813,14 @@ they require a demonstrated need that `maxParallelRuns` cannot solve.
 - Limits `1`, `2`, `3`, and mixed sets use the minimum declaration.
 - The active set always satisfies `count <= every active limit`.
 - Batch decisions are evaluated cumulatively.
+- Higher priorities run before lower priorities; equal priorities remain FIFO.
+- Running jobs are never preempted by priority changes in the queued set.
+- Higher-priority eligible jobs replace lower-priority reservations, and lower
+  priorities cannot backfill a protected higher-priority job.
 - A restrictive candidate never starts beside an incompatible permissive job.
 - A permissive candidate never starts beside a restrictive running job.
-- Any eligible job may pass once while the window is open; post-cutoff
-  arrivals never pass a frozen frontier.
+- Any equal-priority eligible job may pass once while the window is open;
+  post-cutoff arrivals never pass a frozen frontier.
 - Cancelling, holding, or changing the limit of the protected job invalidates its
   reservation deterministically.
 - Reservations restore identically after daemon restart; the window is
@@ -814,7 +836,10 @@ they require a demonstrated need that `maxParallelRuns` cannot solve.
 - Client disconnect after commit but before response.
 - Oversized, malformed, slow, truncated, and duplicate-key frames.
 - Slow log followers and arbitrary binary output.
-- Multiple clients racing submit, cancel, hold, retry, and queued-limit change.
+- Multiple clients racing submit, cancel, hold, retry, and queued/live-limit
+  changes.
+- Live limit changes update the job, attempt, and active lease atomically;
+  decreases below the active-lease count are rejected without partial writes.
 - Operation tombstones prevent key reuse after job cleanup.
 
 ### Process and recovery tests
@@ -837,8 +862,11 @@ they require a demonstrated need that `maxParallelRuns` cannot solve.
   work.
 - Three `maxParallelRuns=3` jobs may run together; a fourth may not.
 - A `maxParallelRuns=1` job starts only with no other active lease.
-- Compatible jobs may backfill a protected restrictive job once each while
-  its original blockers run; submissions after the frontier froze cannot pass.
+- Priority defaults to `0`; positive/default/negative queued jobs run in
+  descending priority order without preempting active leases.
+- Compatible equal-priority jobs may backfill a protected restrictive job once
+  each while its original blockers run; submissions after the frontier froze
+  cannot pass.
 - Concurrent clients cannot corrupt state, duplicate work, or over-admit.
 - Every mutation is safely retryable through its idempotency key.
 - Daemon restart does not kill workers, lose completed runner results, or forget
@@ -848,8 +876,8 @@ they require a demonstrated need that `maxParallelRuns` cannot solve.
 - MVP workload commands remain foregrounded in their assigned process group;
   daemonizing/`setsid` workloads are explicitly unsupported by the contract.
 - Dependency chains terminate explicitly after failed prerequisites.
-- Status explains concurrency declarations, active limits, protection, and
-  backfill decisions.
+- Status explains priorities, concurrency declarations, active limits,
+  protection, and backfill decisions.
 - The agent skill consistently routes ML work through the queue and chooses
   conservative explicit limits.
 
@@ -870,11 +898,12 @@ with the evidence that resolved them.
 Phases 0–2 are implemented: the shared library with pure scheduler, SQLite
 model, framed Unix-socket protocol, singleton daemon with serialized
 coordinator, detached attempt runners, recovery, dependencies with skip
-propagation, retry policy, hold/release/retry/queued-limit mutations, the
-full CLI, and the `queue-ml-jobs` agent skill. `tests/e2e.rs` exercises real
-daemon/runner/CLI binaries against the acceptance criteria (formula limits,
-windowed-then-frozen backfill, cancellation, idempotency replay/conflict,
-dependency skips, retries, daemon-crash adoption, singleton locking).
+propagation, retry policy, hold/release/retry/queued/live-limit mutations, the
+signed priority scheduler, full CLI, and the `queue-ml-jobs` agent skill.
+`tests/e2e.rs` exercises real daemon/runner/CLI binaries against the acceptance
+criteria (formula limits, signed priority, windowed-then-frozen backfill,
+cancellation, idempotency replay/conflict, dependency skips, retries,
+daemon-crash adoption, singleton locking).
 
 Decisions resolved during implementation:
 
@@ -940,3 +969,9 @@ Decisions resolved during implementation:
   pinned exactly once), so no schema migration was needed; active version-1
   reservations are still interpreted exactly, as permanently frozen
   frontiers.
+- Scheduler semantics version 3 added strict signed priority: a higher-ranked
+  eligible job supersedes a lower protected reservation, and lower priorities
+  cannot backfill it. The priority migration defaults every existing job to
+  `0` and upgrades known active version-1/2 reservations atomically, which
+  preserves their immediate same-priority behavior; defensive readers still
+  understand historical versions and fail closed on unknown ones.

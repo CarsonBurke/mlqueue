@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::domain::{
@@ -124,6 +124,15 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX events_job ON events(job_id);
     "#,
+    // v2: signed scheduling priority; higher values rank before lower values,
+    // with the existing job ID remaining the FIFO tiebreaker.
+    r#"
+    ALTER TABLE jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;
+    CREATE INDEX jobs_state_priority_sequence ON jobs(state, priority DESC, id ASC);
+    UPDATE scheduler_reservation
+       SET semantics_version = 3
+     WHERE status = 'active' AND semantics_version IN (1, 2);
+    "#,
 ];
 
 pub fn open(path: &Path) -> Result<Connection> {
@@ -173,6 +182,7 @@ pub struct JobRow {
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub max_parallel_runs: u32,
+    pub priority: i64,
     pub max_attempts: i64,
     pub retry_delay_ms: i64,
     pub retry_not_before: Option<i64>,
@@ -238,9 +248,9 @@ pub struct EventRow {
     pub event_type: String,
 }
 
-const JOB_COLUMNS: &str = "id, name, state, cwd, args, env, max_parallel_runs, max_attempts, \
-     retry_delay_ms, retry_not_before, attempt_count, state_reason, created_at, updated_at, \
-     finished_at";
+const JOB_COLUMNS: &str = "id, name, state, cwd, args, env, max_parallel_runs, priority, \
+     max_attempts, retry_delay_ms, retry_not_before, attempt_count, state_reason, created_at, \
+     updated_at, finished_at";
 
 fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRow> {
     let state: String = row.get(2)?;
@@ -254,14 +264,15 @@ fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRow> {
         args: serde_json::from_str(&args).expect("valid args JSON in database"),
         env: serde_json::from_str(&env).expect("valid env JSON in database"),
         max_parallel_runs: row.get(6)?,
-        max_attempts: row.get(7)?,
-        retry_delay_ms: row.get(8)?,
-        retry_not_before: row.get(9)?,
-        attempt_count: row.get(10)?,
-        state_reason: row.get(11)?,
-        created_at: row.get(12)?,
-        updated_at: row.get(13)?,
-        finished_at: row.get(14)?,
+        priority: row.get(7)?,
+        max_attempts: row.get(8)?,
+        retry_delay_ms: row.get(9)?,
+        retry_not_before: row.get(10)?,
+        attempt_count: row.get(11)?,
+        state_reason: row.get(12)?,
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
+        finished_at: row.get(15)?,
     })
 }
 
@@ -307,9 +318,9 @@ fn attempt_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttemptRow> {
 /// submission time; parents are validated to exist by the caller.
 pub fn insert_job(conn: &Connection, params: &SubmitParams, now: i64) -> Result<JobId> {
     conn.execute(
-        "INSERT INTO jobs (name, state, cwd, args, env, max_parallel_runs, max_attempts, \
-         retry_delay_ms, attempt_count, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?9)",
+        "INSERT INTO jobs (name, state, cwd, args, env, max_parallel_runs, priority, \
+         max_attempts, retry_delay_ms, attempt_count, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?10)",
         params![
             params.name,
             JobState::Queued.as_str(),
@@ -317,6 +328,7 @@ pub fn insert_job(conn: &Connection, params: &SubmitParams, now: i64) -> Result<
             serde_json::to_string(&params.args)?,
             serde_json::to_string(&params.env)?,
             params.max_parallel_runs,
+            params.priority,
             params.max_attempts,
             params.retry_delay_ms as i64,
             now,
@@ -408,6 +420,56 @@ pub fn set_job_max_parallel_runs(conn: &Connection, id: JobId, value: u32, now: 
     Ok(())
 }
 
+pub fn set_job_priority(conn: &Connection, id: JobId, value: i64, now: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE jobs SET priority = ?2, updated_at = ?3 WHERE id = ?1",
+        params![id, value, now],
+    )?;
+    Ok(())
+}
+
+/// Change the declaration copied into a live attempt and its active lease.
+/// The caller must run this inside the same transaction as the corresponding
+/// job-row update and must first verify that the resulting active lease set
+/// still satisfies the admission invariant.
+pub fn set_active_attempt_max_parallel_runs(
+    conn: &Connection,
+    attempt: AttemptId,
+    value: u32,
+) -> Result<()> {
+    ensure!(value > 0, "maxParallelRuns must be positive");
+    let mutable: bool = conn.query_row(
+        "SELECT EXISTS (
+             SELECT 1 FROM attempts a
+             JOIN run_leases l ON l.attempt_id = a.id
+             WHERE a.id = ?1
+               AND a.state IN ('prepared','authorized','running','orphaned','quarantined')
+               AND l.released_at IS NULL
+         )",
+        [attempt],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        mutable,
+        "attempt {attempt} is not live with an active run lease"
+    );
+
+    let updated_attempts = conn.execute(
+        "UPDATE attempts SET max_parallel_runs = ?2 WHERE id = ?1 \
+         AND state IN ('prepared','authorized','running','orphaned','quarantined')",
+        params![attempt, value],
+    )?;
+    debug_assert_eq!(updated_attempts, 1);
+
+    let updated_leases = conn.execute(
+        "UPDATE run_leases SET max_parallel_runs = ?2 \
+         WHERE attempt_id = ?1 AND released_at IS NULL",
+        params![attempt, value],
+    )?;
+    debug_assert_eq!(updated_leases, 1);
+    Ok(())
+}
+
 pub fn max_job_seq(conn: &Connection) -> Result<i64> {
     // sqlite_sequence records the highest id ever allocated, so a future
     // retention cleanup deleting the newest rows can never lower the frozen
@@ -477,10 +539,10 @@ pub fn jobs_with_violated_dependencies(conn: &Connection) -> Result<Vec<(JobId, 
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// FIFO-ordered jobs eligible for admission right now.
+/// Priority/FIFO-ordered jobs eligible for admission right now.
 pub fn eligible_candidates(conn: &Connection, now: i64) -> Result<Vec<Candidate>> {
     let mut stmt = conn.prepare(
-        "SELECT j.id, j.max_parallel_runs FROM jobs j
+        "SELECT j.id, j.max_parallel_runs, j.priority FROM jobs j
          WHERE j.state = 'queued'
            AND (j.retry_not_before IS NULL OR j.retry_not_before <= ?1)
            AND NOT EXISTS (
@@ -493,11 +555,16 @@ pub fn eligible_candidates(conn: &Connection, now: i64) -> Result<Vec<Candidate>
                          AND p.state IN ('succeeded','failed','cancelled','lost','skipped'))
                  )
            )
-         ORDER BY j.id",
+         ORDER BY j.priority DESC, j.id ASC",
     )?;
     let rows = stmt.query_map([now], |row| {
         let id: JobId = row.get(0)?;
-        Ok(Candidate { job_id: id, seq: id, limit: row.get(1)? })
+        Ok(Candidate {
+            job_id: id,
+            seq: id,
+            limit: row.get(1)?,
+            priority: row.get(2)?,
+        })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
@@ -779,8 +846,8 @@ pub fn freeze_reservation_cutoff(conn: &Connection, id: i64, cutoff_seq: i64) ->
 /// it right now. Single source of truth for the coordinator and the views.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackfillFrontier {
-    /// An initial blocker is still advancing: any eligible job whose bypass
-    /// is unconsumed may pass the protected job once.
+    /// An initial blocker is still advancing: any equal-priority eligible job
+    /// whose bypass is unconsumed may pass the protected job once.
     OpenWindow,
     /// The window closed but the sentinel is still stored; the next pass
     /// plans against this cutoff and pins it.
@@ -796,7 +863,7 @@ pub fn backfill_frontier(conn: &Connection, res: &ReservationRow) -> Result<Back
         // v1 froze the cutoff at creation; a permanently frozen frontier at
         // the stored cutoff remains its exact meaning.
         1 => Ok(BackfillFrontier::Frozen(res.cutoff_seq)),
-        SCHEDULER_SEMANTICS_VERSION => {
+        2 | SCHEDULER_SEMANTICS_VERSION => {
             if res.cutoff_seq != RESERVATION_CUTOFF_UNFROZEN {
                 Ok(BackfillFrontier::Frozen(res.cutoff_seq))
             } else if any_blockers_advancing(conn, &res.initial_blockers)? {
@@ -953,6 +1020,7 @@ mod tests {
             args: vec!["true".into()],
             env: BTreeMap::new(),
             max_parallel_runs: limit,
+            priority: 0,
             max_attempts: 1,
             retry_delay_ms: 0,
             after_success: vec![],
@@ -976,12 +1044,88 @@ mod tests {
         let id;
         {
             let conn = open(&path).unwrap();
-            id = insert_job(&conn, &submit_params("a", 1), 1000).unwrap();
+            let mut params = submit_params("a", 1);
+            params.priority = -2;
+            id = insert_job(&conn, &params, 1000).unwrap();
         }
         let conn = open(&path).unwrap();
         let job = job_row(&conn, id).unwrap().unwrap();
         assert_eq!(job.name, "a");
         assert_eq!(job.state, JobState::Queued);
+        assert_eq!(job.priority, -2);
+    }
+
+    #[test]
+    fn set_job_priority_updates_row() {
+        let conn = open_in_memory().unwrap();
+        let id = insert_job(&conn, &submit_params("p", 1), 1000).unwrap();
+        set_job_priority(&conn, id, 4, 1001).unwrap();
+        assert_eq!(job_row(&conn, id).unwrap().unwrap().priority, 4);
+        set_job_priority(&conn, id, -3, 1002).unwrap();
+        assert_eq!(job_row(&conn, id).unwrap().unwrap().priority, -3);
+    }
+
+    #[test]
+    fn v1_database_migrates_priority_and_active_reservation_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mlqueue-v1.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            configure(&conn).unwrap();
+            conn.execute_batch(MIGRATIONS[0]).unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+            conn.execute_batch(
+                r#"
+                INSERT INTO jobs (
+                    name, state, cwd, args, env, max_parallel_runs, max_attempts,
+                    retry_delay_ms, attempt_count, created_at, updated_at
+                ) VALUES ('old', 'queued', '/tmp', '["true"]', '{}', 1, 1, 0, 0, 1, 1);
+                INSERT INTO scheduler_reservation (
+                    job_id, cutoff_seq, semantics_version, status, initial_blockers, created_at
+                ) VALUES (1, 0, 2, 'active', '[]', 1);
+                "#,
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        assert_eq!(job_row(&conn, 1).unwrap().unwrap().priority, 0);
+        assert_eq!(
+            active_reservation(&conn)
+                .unwrap()
+                .unwrap()
+                .semantics_version,
+            SCHEDULER_SEMANTICS_VERSION
+        );
+    }
+
+    #[test]
+    fn eligible_candidates_order_by_priority_then_fifo() {
+        let conn = open_in_memory().unwrap();
+        let mut low = submit_params("low", 1);
+        low.priority = -1;
+        let low = insert_job(&conn, &low, 1000).unwrap();
+        let default_first = insert_job(&conn, &submit_params("default-first", 1), 1001).unwrap();
+        let default_second = insert_job(&conn, &submit_params("default-second", 1), 1002).unwrap();
+        let mut high = submit_params("high", 1);
+        high.priority = 1;
+        let high = insert_job(&conn, &high, 1003).unwrap();
+
+        let candidates = eligible_candidates(&conn, 2000).unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.job_id)
+                .collect::<Vec<_>>(),
+            vec![high, default_first, default_second, low]
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.priority)
+                .collect::<Vec<_>>(),
+            vec![1, 0, 0, -1]
+        );
     }
 
     #[test]
@@ -993,10 +1137,33 @@ mod tests {
         assert_eq!(attempt.number, 1);
         assert_eq!(attempt.max_parallel_runs, 3);
         assert_eq!(active_leases(&conn).unwrap().len(), 1);
-        assert_eq!(job_row(&conn, id).unwrap().unwrap().state, JobState::Starting);
+        assert_eq!(
+            job_row(&conn, id).unwrap().unwrap().state,
+            JobState::Starting
+        );
 
-        release_lease(&conn, attempt.id, 1002).unwrap();
+        set_active_attempt_max_parallel_runs(&conn, attempt.id, 4).unwrap();
+        set_job_max_parallel_runs(&conn, id, 4, 1002).unwrap();
+        assert_eq!(
+            attempt_row(&conn, attempt.id)
+                .unwrap()
+                .unwrap()
+                .max_parallel_runs,
+            4
+        );
+        assert_eq!(active_leases(&conn).unwrap()[0].1.limit, 4);
+        assert_eq!(job_row(&conn, id).unwrap().unwrap().max_parallel_runs, 4);
+
+        release_lease(&conn, attempt.id, 1003).unwrap();
         assert!(active_leases(&conn).unwrap().is_empty());
+        assert!(set_active_attempt_max_parallel_runs(&conn, attempt.id, 5).is_err());
+        assert_eq!(
+            attempt_row(&conn, attempt.id)
+                .unwrap()
+                .unwrap()
+                .max_parallel_runs,
+            4
+        );
     }
 
     #[test]

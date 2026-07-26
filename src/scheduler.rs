@@ -20,12 +20,14 @@ pub struct ActiveLease {
 }
 
 /// A job eligible to start: queued, not held, dependencies satisfied, retry
-/// delay elapsed. Must be supplied in FIFO submission order.
+/// delay elapsed. Must be supplied in priority/FIFO order.
 #[derive(Debug, Clone)]
 pub struct Candidate {
     pub job_id: JobId,
     pub seq: i64,
     pub limit: u32,
+    /// Higher values rank first. Sequence is the FIFO tiebreaker.
+    pub priority: i64,
 }
 
 /// The persisted protected-job reservation, if one is active.
@@ -33,11 +35,11 @@ pub struct Candidate {
 pub struct ReservationSnapshot {
     pub job_id: JobId,
     /// `None` while the backfill window is open: an initial blocker of the
-    /// protected job is still advancing, so any eligible job may consume its
-    /// single bypass regardless of submission order. `Some` once the frontier
-    /// is frozen; jobs submitted after the cutoff may then never pass. The
-    /// coordinator derives this from blocker liveness and the persisted
-    /// cutoff.
+    /// protected job is still advancing, so any equal-priority eligible job
+    /// may consume its single bypass regardless of submission order. `Some`
+    /// once the frontier is frozen; jobs submitted after the cutoff may then
+    /// never pass. The coordinator derives this from blocker liveness and the
+    /// persisted cutoff.
     pub cutoff_seq: Option<i64>,
     /// Jobs whose single backfill bypass is already consumed (seeded with the
     /// jobs active at creation plus every backfill admitted since).
@@ -91,16 +93,19 @@ pub fn can_admit(active_limits: &[u32], candidate_limit: u32) -> bool {
 
 /// One greedy scheduling pass over a consistent snapshot.
 ///
-/// `eligible` must be sorted by ascending `seq`. A reservation created in
-/// this pass starts with an open backfill window (its blockers are the shadow
-/// set, which is active by construction); the coordinator freezes the cutoff
-/// on the pass where those blockers stop advancing.
+/// `eligible` must be sorted by descending priority, then ascending `seq`.
+/// A reservation created in this pass starts with an open backfill window
+/// (its blockers are the shadow set, which is active by construction); the
+/// coordinator freezes the cutoff on the pass where those blockers stop
+/// advancing. Lower-priority jobs never backfill past a protected job.
 pub fn plan_pass(
     active: &[ActiveLease],
     eligible: &[Candidate],
     reservation: Option<&ReservationSnapshot>,
 ) -> PassOutcome {
-    debug_assert!(eligible.windows(2).all(|w| w[0].seq < w[1].seq));
+    debug_assert!(eligible.windows(2).all(|w| {
+        w[0].priority > w[1].priority || (w[0].priority == w[1].priority && w[0].seq < w[1].seq)
+    }));
 
     let mut outcome = PassOutcome::default();
     let mut shadow_limits: Vec<u32> = active.iter().map(|l| l.limit).collect();
@@ -134,6 +139,23 @@ pub fn plan_pass(
         res = None;
     }
 
+    // A newly eligible higher-priority job supersedes a lower-priority
+    // protected reservation. Running leases remain untouched; the highest
+    // ranked queued job will either start or become the new protected job.
+    if let Some(r) = &res {
+        let protected = eligible
+            .iter()
+            .find(|c| c.job_id == r.job_id)
+            .expect("protected job verified eligible");
+        if eligible
+            .first()
+            .is_some_and(|head| head.priority > protected.priority)
+        {
+            outcome.invalidate_reservation = Some("higher-priority job superseded protected job");
+            res = None;
+        }
+    }
+
     loop {
         match &mut res {
             Some(r) => {
@@ -161,11 +183,13 @@ pub fn plan_pass(
                 }
 
                 // Step 3: restrict candidates to the backfill frontier —
-                // any eligible job while the window is open, only pre-cutoff
-                // jobs once frozen — whose single bypass is unconsumed.
+                // any equal-priority eligible job while the window is open,
+                // only pre-cutoff jobs once frozen — whose single bypass is
+                // unconsumed.
                 let backfill = eligible.iter().find(|c| {
                     r.cutoff_seq.is_none_or(|cutoff| c.seq <= cutoff)
                         && c.job_id != r.job_id
+                        && c.priority == protected.priority
                         && !r.consumed.contains(&c.job_id)
                         && !started.contains(&c.job_id)
                         && can_admit(&shadow_limits, c.limit)
@@ -184,8 +208,8 @@ pub fn plan_pass(
                 }
             }
             None => {
-                // Step 4: without a reservation, consider FIFO order; the
-                // first job either starts or becomes protected.
+                // Step 4: without a reservation, consider priority/FIFO
+                // order; the first job either starts or becomes protected.
                 let Some(head) = eligible.iter().find(|c| !started.contains(&c.job_id)) else {
                     break;
                 };
@@ -233,7 +257,21 @@ mod tests {
     }
 
     fn cand(job_id: JobId, limit: u32) -> Candidate {
-        Candidate { job_id, seq: job_id, limit }
+        Candidate {
+            job_id,
+            seq: job_id,
+            limit,
+            priority: 0,
+        }
+    }
+
+    fn prioritized(job_id: JobId, limit: u32, priority: i64) -> Candidate {
+        Candidate {
+            job_id,
+            seq: job_id,
+            limit,
+            priority,
+        }
     }
 
     fn start_ids(outcome: &PassOutcome) -> Vec<JobId> {
@@ -272,6 +310,60 @@ mod tests {
         let res = outcome.create_reservation.expect("fourth job is protected");
         assert_eq!(res.job_id, 4);
         assert_eq!(res.initial_consumed, BTreeSet::from([1, 2, 3]));
+    }
+
+    #[test]
+    fn higher_priority_runs_first_and_equal_priority_stays_fifo() {
+        let eligible = vec![
+            prioritized(3, 4, 1),
+            prioritized(1, 4, 0),
+            prioritized(4, 4, 0),
+            prioritized(2, 4, -1),
+        ];
+        let outcome = plan_pass(&[], &eligible, None);
+        assert_eq!(start_ids(&outcome), vec![3, 1, 4, 2]);
+    }
+
+    #[test]
+    fn lower_priority_cannot_backfill_a_protected_job() {
+        let active = vec![
+            ActiveLease { job_id: 100, limit: 3 },
+            ActiveLease { job_id: 101, limit: 3 },
+        ];
+        let res = ReservationSnapshot {
+            job_id: 1,
+            cutoff_seq: None,
+            consumed: BTreeSet::from([100, 101]),
+        };
+        let eligible = vec![prioritized(1, 1, 1), prioritized(2, 3, 0)];
+        let outcome = plan_pass(&active, &eligible, Some(&res));
+        assert!(outcome.starts.is_empty());
+        assert!(outcome.invalidate_reservation.is_none());
+    }
+
+    #[test]
+    fn higher_priority_supersedes_a_lower_priority_reservation() {
+        let active = vec![
+            ActiveLease { job_id: 100, limit: 3 },
+            ActiveLease { job_id: 101, limit: 3 },
+        ];
+        let res = ReservationSnapshot {
+            job_id: 1,
+            cutoff_seq: Some(3),
+            consumed: BTreeSet::from([100, 101]),
+        };
+        let eligible = vec![
+            prioritized(4, 1, 1),
+            prioritized(1, 1, 0),
+            prioritized(2, 3, 0),
+        ];
+        let outcome = plan_pass(&active, &eligible, Some(&res));
+        assert!(outcome.starts.is_empty());
+        assert_eq!(
+            outcome.invalidate_reservation,
+            Some("higher-priority job superseded protected job")
+        );
+        assert_eq!(outcome.create_reservation.unwrap().job_id, 4);
     }
 
     #[test]
@@ -432,7 +524,13 @@ mod tests {
                         for _ in 0..=rng(2) {
                             next_seq += 1;
                             let limit = [1, 1, 2, 3, 3, 4][rng(6) as usize];
-                            queued.push(Candidate { job_id: next_seq, seq: next_seq, limit });
+                            let priority = rng(3) as i64 - 1;
+                            queued.push(Candidate {
+                                job_id: next_seq,
+                                seq: next_seq,
+                                limit,
+                                priority,
+                            });
                         }
                     }
                     // Finish a random active job.
@@ -453,6 +551,9 @@ mod tests {
                     res.cutoff_seq = Some(next_seq);
                 }
 
+                queued.sort_by_key(|candidate| {
+                    (std::cmp::Reverse(candidate.priority), candidate.seq)
+                });
                 let outcome = plan_pass(&active, &queued, reservation.as_ref());
 
                 // Apply decisions exactly as the coordinator would.

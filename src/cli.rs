@@ -52,6 +52,9 @@ enum Command {
     Status {
         #[arg(long)]
         watch: bool,
+        /// Show only the most recent finished runs (not the live queue).
+        #[arg(short = 'f', long)]
+        finished: bool,
         #[arg(long)]
         json: bool,
     },
@@ -117,10 +120,19 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Change a queued job's concurrency declaration.
+    /// Change a queued or live job's concurrency declaration.
     SetMaxParallelRuns {
         job: JobId,
         max_parallel_runs: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change a queued or held job's scheduling priority.
+    SetPriority {
+        job: JobId,
+        /// Higher values run before lower values; equal priorities remain FIFO.
+        #[arg(allow_hyphen_values = true)]
+        priority: i64,
         #[arg(long)]
         json: bool,
     },
@@ -200,6 +212,10 @@ struct SubmitArgs {
     /// jobs, including itself, stays at or below this value.
     #[arg(long, default_value_t = 1)]
     max_parallel_runs: u32,
+    /// Scheduling priority. Higher values run before lower values; jobs with
+    /// equal priority remain FIFO. Running jobs are never preempted.
+    #[arg(long, default_value_t = 0, allow_hyphen_values = true)]
+    priority: i64,
     /// Total attempts allowed before the job fails permanently.
     #[arg(long, default_value_t = 1)]
     max_attempts: u32,
@@ -234,7 +250,7 @@ pub fn main() -> Result<()> {
 
     match cli.command {
         Command::Submit(args) => submit(&paths, args, key),
-        Command::Status { watch, json } => status(&paths, watch, json),
+        Command::Status { watch, finished, json } => status(&paths, watch, finished, json),
         Command::FollowTts { tts_backend } => follow_tts(&paths, tts_backend.as_deref()),
         Command::Show { job, json } => {
             let reply = send(&paths, Op::Show { job }, None)?;
@@ -256,6 +272,9 @@ pub fn main() -> Result<()> {
         Command::Retry { job, json } => mutate_job(&paths, Op::Retry { job }, key, json),
         Command::SetMaxParallelRuns { job, max_parallel_runs, json } => {
             mutate_job(&paths, Op::SetMaxParallelRuns { job, max_parallel_runs }, key, json)
+        }
+        Command::SetPriority { job, priority, json } => {
+            mutate_job(&paths, Op::SetPriority { job, priority }, key, json)
         }
         Command::Daemon { command: DaemonCommand::Status { json } } => {
             let reply = send(&paths, Op::DaemonStatus, None)?;
@@ -351,6 +370,20 @@ fn format_mutation_message(op: &Op, job: &JobView) -> String {
         }
     }
 
+    if matches!(op, Op::SetMaxParallelRuns { .. }) {
+        return format!(
+            "job {} [{}] maxParallelRuns is now {} ({})",
+            job.id, job.name, job.max_parallel_runs, job.state
+        );
+    }
+
+    if matches!(op, Op::SetPriority { .. }) {
+        return format!(
+            "job {} [{}] priority is now {} ({})",
+            job.id, job.name, job.priority, job.state
+        );
+    }
+
     let extra = match (&job.eligibility, &job.state_reason) {
         (_, Some(reason)) => format!(" ({reason})"),
         (Some(reason), _) => format!(" ({reason})"),
@@ -414,6 +447,7 @@ fn submit(paths: &Paths, args: SubmitArgs, key: String) -> Result<()> {
         args: args.command,
         env,
         max_parallel_runs: args.max_parallel_runs,
+        priority: args.priority,
         max_attempts: args.max_attempts,
         retry_delay_ms: args.retry_delay.map(|delay| delay.as_millis() as u64).unwrap_or(0),
         after_success: args.after_success,
@@ -425,17 +459,22 @@ fn submit(paths: &Paths, args: SubmitArgs, key: String) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&job)?);
     } else {
         println!(
-            "submitted job {} [{}] with maxParallelRuns {}",
-            job.id, job.name, job.max_parallel_runs
+            "submitted job {} [{}] with maxParallelRuns {} and priority {}",
+            job.id, job.name, job.max_parallel_runs, job.priority
         );
     }
     Ok(())
 }
 
-fn status(paths: &Paths, watch: bool, json: bool) -> Result<()> {
+fn status(paths: &Paths, watch: bool, finished: bool, json: bool) -> Result<()> {
     loop {
         let reply = send(paths, Op::Status, None)?;
-        let Reply::Status(view) = reply else { bail!(client::unexpected("status")) };
+        let Reply::Status(mut view) = reply else { bail!(client::unexpected("status")) };
+        if finished {
+            view.jobs.retain(|job| job.finished_at.is_some());
+        } else {
+            view.jobs.retain(|job| job.finished_at.is_none());
+        }
         if json {
             println!("{}", serde_json::to_string_pretty(&view)?);
         } else {
@@ -443,7 +482,7 @@ fn status(paths: &Paths, watch: bool, json: bool) -> Result<()> {
                 // Clear screen and home the cursor.
                 print!("\x1b[2J\x1b[H");
             }
-            print_status(&view);
+            print_status(&view, finished);
             std::io::stdout().flush()?;
         }
         if !watch {
@@ -721,14 +760,29 @@ fn tts_command(backend: Option<&str>) -> std::process::Command {
     command
 }
 
-fn print_status(view: &StatusView) {
-    print!("{}", render_status(view));
+fn print_status(view: &StatusView, finished_only: bool) {
+    print!("{}", render_status(view, finished_only));
 }
 
-fn render_status(view: &StatusView) -> String {
+fn render_status(view: &StatusView, finished_only: bool) -> String {
     use std::fmt::Write as _;
 
     let mut output = String::new();
+    let (live, queued, held, finished) = status_sections(view);
+
+    if finished_only {
+        if finished.is_empty() {
+            writeln!(output, "no finished runs").unwrap();
+            return output;
+        }
+        writeln!(output, "Finished Runs").unwrap();
+        write_status_header(&mut output);
+        for job in finished {
+            write_status_job(&mut output, job);
+        }
+        return output;
+    }
+
     match view.effective_limit {
         Some(limit) => writeln!(
             output,
@@ -755,23 +809,16 @@ fn render_status(view: &StatusView) -> String {
         writeln!(output, "ADMISSION BLOCKED: operator attention required (see daemon logs)")
             .unwrap();
     }
-    if view.jobs.is_empty() {
+
+    let has_queue = !live.is_empty() || !queued.is_empty() || !held.is_empty();
+    if !has_queue {
         writeln!(output, "no jobs").unwrap();
         return output;
     }
 
-    let (live, queued, held, finished) = status_sections(view);
     if !live.is_empty() || !queued.is_empty() {
         write_status_header(&mut output);
         for job in live.into_iter().chain(queued) {
-            write_status_job(&mut output, job);
-        }
-    }
-    if !finished.is_empty() {
-        writeln!(output).unwrap();
-        writeln!(output, "Finished Runs").unwrap();
-        write_status_header(&mut output);
-        for job in finished {
             write_status_job(&mut output, job);
         }
     }
@@ -816,9 +863,9 @@ fn status_sections(
         };
         (rank, job.id)
     });
-    queued.sort_by_key(|job| job.id);
+    queued.sort_by_key(|job| (Reverse(job.priority), job.id));
     queued.truncate(STATUS_QUEUE_LIMIT);
-    held.sort_by_key(|job| job.id);
+    held.sort_by_key(|job| (Reverse(job.priority), job.id));
     held.truncate(STATUS_HELD_LIMIT);
     finished.sort_by_key(|job| Reverse((job.finished_at, job.id)));
     finished.truncate(STATUS_FINISHED_LIMIT);
@@ -830,12 +877,13 @@ fn write_status_header(output: &mut String) {
 
     writeln!(
         output,
-        "{:<6} {:<width$} {:<15} {:<6} {:<9} REASON",
+        "{:<6} {:<width$} {:<15} {:<3} {:<3} {:<5} REASON",
         "JOB",
         "NAME",
         "STATE",
-        "LIMIT",
-        "ATTEMPTS",
+        "PRI",
+        "MAX",
+        "TRIES",
         width = STATUS_NAME_WIDTH,
     )
     .unwrap();
@@ -857,10 +905,11 @@ fn write_status_job(output: &mut String, job: &JobView) {
     };
     writeln!(
         output,
-        "{:<6} {:<width$} {:<15} {:<6} {:<9} {}",
+        "{:<6} {:<width$} {:<15} {:<3} {:<3} {:<5} {}",
         job.id,
         truncate(&job.name, STATUS_NAME_WIDTH),
         job.state,
+        job.priority,
         job.max_parallel_runs,
         format!("{}/{}", job.attempt_count, job.max_attempts),
         reason,
@@ -881,6 +930,7 @@ fn print_job_detail(job: &JobView) {
     if job.cancel_requested == Some(true) {
         println!("  cancel requested: yes");
     }
+    println!("  priority:         {}", job.priority);
     println!("  maxParallelRuns:  {}", job.max_parallel_runs);
     println!("  cwd:              {}", job.cwd);
     println!("  command:          {}", shell_join(&job.args));
@@ -1225,6 +1275,7 @@ mod tests {
             eligibility: None,
             state_reason: None,
             max_parallel_runs: 1,
+            priority: 0,
             cwd: "/tmp".into(),
             args: vec!["true".into()],
             max_attempts: 1,
@@ -1255,6 +1306,56 @@ mod tests {
         let force = format_mutation_message(&Op::Cancel { job: 106, force: true }, &job);
         assert!(force.contains("cancel requested (force)"));
         assert!(!force.contains("is now running"));
+    }
+
+    #[test]
+    fn submit_accepts_negative_priority() {
+        let cli = Cli::try_parse_from(["mlq", "submit", "--priority", "-1", "--", "true"])
+            .unwrap();
+        let Command::Submit(args) = cli.command else {
+            panic!("expected submit command")
+        };
+        assert_eq!(args.priority, -1);
+    }
+
+    #[test]
+    fn set_priority_accepts_negative_value() {
+        let cli = Cli::try_parse_from(["mlq", "set-priority", "7", "-2"]).unwrap();
+        let Command::SetPriority { job, priority, .. } = cli.command else {
+            panic!("expected set-priority command")
+        };
+        assert_eq!(job, 7);
+        assert_eq!(priority, -2);
+    }
+
+    #[test]
+    fn set_priority_mutation_message_reports_new_value() {
+        let mut job = status_job(7, "queued", None);
+        job.name = "retune".into();
+        job.priority = 3;
+        let msg = format_mutation_message(&Op::SetPriority { job: 7, priority: 3 }, &job);
+        assert_eq!(msg, "job 7 [retune] priority is now 3 (queued)");
+    }
+
+    #[test]
+    fn queued_status_orders_by_priority_then_fifo() {
+        let low = status_job(1, "queued", None);
+        let mut high_first = status_job(2, "queued", None);
+        high_first.priority = 1;
+        let mut high_second = status_job(3, "queued", None);
+        high_second.priority = 1;
+        let view = StatusView {
+            jobs: vec![low, high_second, high_first],
+            active_leases: 0,
+            effective_limit: None,
+            reservation: None,
+            admission_blocked: false,
+        };
+        let (_, queued, _, _) = status_sections(&view);
+        assert_eq!(
+            queued.iter().map(|job| job.id).collect::<Vec<_>>(),
+            vec![2, 3, 1]
+        );
     }
 
     #[test]
@@ -1318,21 +1419,68 @@ mod tests {
             vec![205, 210, 203, 208, 201, 206, 211, 204, 209, 202]
         );
 
-        let output = render_status(&view);
-        assert_eq!(output.matches("JOB    NAME").count(), 3, "{output}");
-        let finished_header = output.find("Finished Runs").unwrap();
-        let held_header = output.find("Held Jobs").unwrap();
-        assert!(output.find("running-3").unwrap() < output.find("queued-100").unwrap());
-        assert!(output.find("queued-109").unwrap() < finished_header);
-        assert!(finished_header < output.find("succeeded-205").unwrap());
-        assert!(output.find("succeeded-202").unwrap() < held_header);
-        assert!(held_header < output.find("held-50").unwrap());
-        assert!(!output.contains("queued-110"));
-        assert!(!output.contains("queued-111"));
-        assert!(!output.contains("held-60"));
-        assert!(!output.contains("held-61"));
-        assert!(!output.contains("succeeded-200"));
-        assert!(!output.contains("succeeded-207"));
+        // Default status is the live queue only.
+        let queue_only = render_status(&view, false);
+        assert!(!queue_only.contains("Finished Runs"), "{queue_only}");
+        assert!(!queue_only.contains("succeeded-205"), "{queue_only}");
+        assert!(queue_only.contains("active leases:"), "{queue_only}");
+        assert_eq!(queue_only.matches("JOB    NAME").count(), 2, "{queue_only}");
+        let held_header = queue_only.find("Held Jobs").unwrap();
+        assert!(queue_only.find("running-3").unwrap() < queue_only.find("queued-100").unwrap());
+        assert!(queue_only.find("queued-109").unwrap() < held_header);
+        assert!(held_header < queue_only.find("held-50").unwrap());
+        assert!(!queue_only.contains("queued-110"));
+        assert!(!queue_only.contains("queued-111"));
+        assert!(!queue_only.contains("held-60"));
+        assert!(!queue_only.contains("held-61"));
+
+        // -f is finished-only: no live queue rows or admission header.
+        let finished_only = render_status(&view, true);
+        assert!(finished_only.starts_with("Finished Runs\n"), "{finished_only}");
+        assert!(!finished_only.contains("active leases:"), "{finished_only}");
+        assert!(!finished_only.contains("running-3"), "{finished_only}");
+        assert!(!finished_only.contains("queued-100"), "{finished_only}");
+        assert!(!finished_only.contains("Held Jobs"), "{finished_only}");
+        assert!(finished_only.contains("succeeded-205"), "{finished_only}");
+        assert!(finished_only.contains("succeeded-202"), "{finished_only}");
+        assert!(!finished_only.contains("succeeded-200"));
+        assert!(!finished_only.contains("succeeded-207"));
+        assert_eq!(finished_only.matches("JOB    NAME").count(), 1, "{finished_only}");
+    }
+
+    #[test]
+    fn status_finished_only_empty_when_no_history() {
+        let empty = StatusView {
+            jobs: vec![],
+            active_leases: 0,
+            effective_limit: None,
+            reservation: None,
+            admission_blocked: false,
+        };
+        assert_eq!(render_status(&empty, true).trim(), "no finished runs");
+
+        let live_only = StatusView {
+            jobs: vec![status_job(1, "running", None)],
+            active_leases: 1,
+            effective_limit: Some(1),
+            reservation: None,
+            admission_blocked: false,
+        };
+        assert_eq!(render_status(&live_only, true).trim(), "no finished runs");
+
+        let history = StatusView {
+            jobs: vec![status_job(9, "succeeded", Some(100))],
+            active_leases: 0,
+            effective_limit: None,
+            reservation: None,
+            admission_blocked: false,
+        };
+        let shown = render_status(&history, true);
+        assert!(shown.contains("Finished Runs"), "{shown}");
+        assert!(shown.contains("succeeded-9"), "{shown}");
+        let hidden = render_status(&history, false);
+        assert!(hidden.contains("no jobs"), "{hidden}");
+        assert!(!hidden.contains("Finished Runs"), "{hidden}");
     }
 
     #[test]

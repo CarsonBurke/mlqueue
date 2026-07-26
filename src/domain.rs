@@ -20,7 +20,9 @@ pub type AttemptId = i64;
 ///   frontier at its stored cutoff.
 /// - 2: blocker-scoped backfill window. The cutoff starts as the unfrozen
 ///   sentinel and is pinned once, when the initial blockers stop advancing.
-pub const SCHEDULER_SEMANTICS_VERSION: i64 = 2;
+/// - 3: signed strict priority. Higher-priority eligible jobs supersede lower
+///   protected jobs, and only equal-priority jobs may backfill a reservation.
+pub const SCHEDULER_SEMANTICS_VERSION: i64 = 3;
 
 pub fn now_ms() -> i64 {
     SystemTime::now()

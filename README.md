@@ -20,9 +20,19 @@ running limit)`. The default of `1` makes unspecified work exclusive; three
 `--max-parallel-runs 3` jobs may share; a `1` job waits for the machine and
 makes everything else wait for it. When a restrictive job reaches the head of
 the queue, it is *protected*: while the jobs that originally blocked it are
-still running, any eligible job may backfill an open slot once each; when
-those blockers drain, the frontier freezes and later submissions can no
-longer pass it (bounding starvation without duration estimates).
+still running, any equal-priority eligible job may backfill an open slot once
+each; when those blockers drain, the frontier freezes and later submissions
+can no longer pass it (bounding starvation without duration estimates).
+
+Each submission also has a signed `--priority P` (default `0`). Eligible jobs
+are ordered by higher priority first, then FIFO within the same priority.
+Positive priorities supersede queued default/negative-priority work; negative
+priorities yield to default and positive work. Priority never preempts a job
+that already holds a run lease. A blocked protected job allows backfill only
+from its own priority, and a newly eligible higher-priority job replaces a
+lower-priority reservation.
+Strict priority can starve lower-priority work under a sustained stream of
+higher-priority arrivals, so nonzero values should be chosen deliberately.
 
 The daemon deliberately does **not** discover GPUs, meter VRAM/CPU, infer
 workload types, or preempt work. Cooperation is the contract: all managed
@@ -37,19 +47,28 @@ mlq daemon install        # systemd user service (enable + start)
 # or, without systemd:
 mlq daemon run            # foreground daemon
 
-mlq submit --name smoke --max-parallel-runs 1 -- python train.py --smoke
-mlq status                # limits, protected job, admission reasons
+mlq submit --name smoke --priority 1 --max-parallel-runs 1 -- python train.py --smoke
+mlq status                # live queue only (limits, protected job, reasons)
+mlq status -f             # most recent finished runs only
 mlq follow-tts            # announce completions and newly running work
 mlq logs 1 --follow       # exits with the attempt's outcome
 mlq wait 1 [--timeout 2h] # block until terminal; exit 0 / exit-code / 128+sig
+mlq set-max-parallel-runs 1 3 # update a queued or live job's limit
+mlq set-priority 1 2          # retune a queued/held job (not running)
 mlq cancel 1 [--force]
 ```
 
 Workflow commands: `hold`, `release`, `retry`, `set-max-parallel-runs`,
-`recover list`, `recover resolve`, plus `--after-success`/`--after-completion`
+`set-priority`, `recover list`, `recover resolve`, plus
+`--after-success`/`--after-completion`
 dependency chains, `--max-attempts`/`--retry-delay` retry policy, and
 `--json` everywhere. Every mutation takes an idempotency key
 (`--idempotency-key`) and is safely retryable.
+
+Changing a live job updates its active attempt and run lease atomically. A
+live limit cannot be lowered below the current number of active leases,
+because that would immediately violate the queue's symmetric admission
+contract; wait for enough work to drain, then retry the change.
 
 `mlq follow-tts` uses the backend and voice configured by the local `tts`
 command. Use `--tts-backend BACKEND` to override that selection for this
@@ -82,5 +101,5 @@ cargo clippy
 
 The end-to-end suite (`tests/e2e.rs`) runs real daemons, runners, and CLI
 binaries in isolated temp directories, covering the concurrency formula,
-windowed-then-frozen backfill, cancellation, retries, dependency skips,
-idempotency replay/conflict, and daemon-crash recovery.
+signed priority ordering, windowed-then-frozen backfill, cancellation, retries,
+dependency skips, idempotency replay/conflict, and daemon-crash recovery.

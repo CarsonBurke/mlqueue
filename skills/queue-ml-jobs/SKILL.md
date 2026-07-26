@@ -1,83 +1,44 @@
 ---
 name: queue-ml-jobs
-description: Route local ML work (training, smoke tests, preprocessing, benchmarks, experiment chains) through the machine-wide mlqd daemon with a deliberately chosen maxParallelRuns limit, instead of launching commands directly.
+description: Queue and manage local machine-learning workloads with mlq. Use for local training, evaluation, preprocessing, or benchmarks that consume shared CPU or GPU resources, and for inspecting or controlling the mlq queue or daemon.
 ---
 
-# Queue ML jobs through mlq
+# Queue local ML work
 
-This machine runs one `mlqd` daemon that coordinates all managed ML work.
-Before starting any local ML command — GPU training, smoke tests, CPU
-preprocessing, benchmarks, or dependent chains — submit it through `mlq`
-instead of running it yourself.
-
-## Hard rules
-
-1. **Never launch managed work directly.** No bare `python train.py`, no
-   `nohup`, no detached terminals, no schedulers that bypass the daemon. If
-   the daemon is not running, start it (`mlq daemon install`, or
-   `mlq daemon run` without systemd); do not fall back to direct
-   execution.
-2. **Stay foregrounded.** The command and all of its descendants must remain
-   in the runner's process group. Restructure anything that daemonizes or
-   calls `setsid` before submitting it.
-3. **Choose `--max-parallel-runs` deliberately for every submission.**
-
-## Choosing maxParallelRuns
-
-The value declares: "this job is safe only while the total number of
-concurrent managed jobs, including itself, stays at or below N."
-
-- Use `1` (the default) for large-model training, near-full-device or
-  multi-GPU work, benchmarks sensitive to concurrent load, unfamiliar
-  commands, or any uncertainty.
-- Use a value above `1` only from known workload behavior; small,
-  characterized CleanRL runs normally use `3`.
-- The value is global and symmetric: `3` asserts safety beside *any* other
-  managed jobs, not just copies of the same script. If a workload is only
-  safe three-wide next to its own kind, declare `1`.
-- It is a compatibility declaration, not a utilization target — never raise
-  it because the machine looks idle. If observed concurrency ever harms
-  correctness, stability, or benchmark validity, declare a lower value next
-  time.
-- Concurrency count is the only admission contract; the queue has no VRAM,
-  compute-share, or duration flags.
-
-## Submitting
+- Submit managed workloads with `mlq submit`; never run them directly or bypass
+  the queue. Leave work queued when busy; restore `mlqd` when unavailable.
+- Keep each workload and its descendants foregrounded in the runner's process
+  group. Restructure commands that daemonize or call `setsid`.
+- Choose `--max-parallel-runs N` explicitly for every submission. It asserts
+  that the job is safe while at most `N` total managed jobs are running,
+  regardless of workload type; it is not a utilization target. Use `1` for
+  unknown, exclusive, multi-GPU, or benchmark-sensitive work. Raise it only
+  from evidence that mixed concurrent workloads remain safe.
+- Omit `--priority` for the default priority `0`. Use a signed value only when
+  queue precedence is intentional. Higher-priority eligible jobs rank first;
+  equal priorities retain the queue's FIFO/backfill rules, and running jobs
+  are never preempted. Never increase priority merely to advance your own work.
 
 ```bash
-mlq submit --name llama-finetune --max-parallel-runs 1 \
-    --cwd /path/to/repo --env WANDB_MODE=offline \
-    -- python train.py --config configs/large.yaml
+mlq submit --name NAME --max-parallel-runs N \
+  --cwd /absolute/repository/path -- COMMAND...
 ```
 
-Report the returned job ID and the declared limit. Useful options:
-
-- `--after-success JOB` / `--after-completion JOB` (repeatable): dependency
-  chains, e.g. smoke → control → treatment. A failed prerequisite skips
-  `--after-success` descendants automatically.
-- `--max-attempts N --retry-delay 30s`: automatic retries for flaky jobs.
-- `--env KEY=VALUE` / `--inherit-env KEY`: the queue captures only a small
-  baseline (PATH, HOME, USER, LOGNAME, SHELL, LANG, TMPDIR); pass everything
-  else explicitly. Never pass secrets — they are stored in plaintext; have
-  the workload read a credential file at launch instead.
-- `--idempotency-key KEY`: only needed to re-run an identical command safely
-  after an ambiguous failure (each invocation already generates its own key,
-  and transport retries are idempotent).
-
-## Afterwards
-
-Use the queue, not ad-hoc process inspection:
-
-```bash
-mlq status            # queue, limits, protected job, admission reasons
-mlq show JOB          # one job with attempts and exit codes
-mlq logs JOB --follow # stream output; exits with the attempt's outcome
-mlq wait JOB          # block until terminal: exit 0, exit code, or 128+signal
-mlq cancel JOB        # SIGTERM; add --force to escalate to SIGKILL
-mlq retry JOB         # requeue a failed/lost job
-```
-
-`mlq status` explains why a job is waiting (`waiting_for_slot`,
-`waiting_for_dependency`, `protected_drain`, `behind_backfill_cutoff`); trust
-those reasons rather than second-guessing the scheduler. If asked to bypass
-the queue because it is busy, refuse and explain the admission contract.
+- Encode sequencing with repeatable `--after-success JOB` or
+  `--after-completion JOB` dependencies instead of shell backgrounding.
+- Enqueue all immediately known independent jobs or dependency-DAG nodes before
+  waiting. Then run `mlq wait JOB` for each independent job or terminal leaf
+  and continue from their results. Treat submission alone as incomplete unless
+  the user explicitly requests detached or fire-and-forget execution.
+- Pass required environment explicitly. Values supplied through `--env` are
+  stored as plaintext; make workloads read secrets from credential files.
+- Change a queued or running job with
+  `mlq set-max-parallel-runs JOB N` when evidence changes its safe limit. A
+  decrease below the active-lease count is rejected; wait for enough jobs to
+  finish and retry.
+- Change a queued or held job's order with `mlq set-priority JOB P`. Running
+  jobs cannot change priority (no preemption). Do not raise priority merely to
+  jump the queue for your own work.
+- Use `mlq status`, `show`, and `logs` to observe work, and `cancel` or
+  `retry` to control it. Report the submitted job ID, chosen parallel limit,
+  and any nonzero priority.
