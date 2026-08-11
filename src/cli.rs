@@ -284,7 +284,7 @@ pub fn main() -> Result<()> {
                 println!("  active leases:  {}", view.active_leases);
                 println!("  queued jobs:    {}", view.queued_jobs);
                 if view.admission_blocked {
-                    println!("  ADMISSION BLOCKED: operator attention required");
+                    println!("  admission blocked");
                 }
             }
             Ok(())
@@ -348,33 +348,28 @@ fn mutate_job(paths: &Paths, op: Op, key: String, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Human-readable result of a mutating op. Cancel of live work is asynchronous:
-/// the job stays `running`/`starting` until the process group drains, so a bare
-/// "is now running" would look like a no-op or a bug.
+/// Human-readable result of a mutating op. Cancel of live work is asynchronous
+/// (state stays starting/running until the process group drains), so that path
+/// reports intent rather than a false "is now running".
 fn format_mutation_message(op: &Op, job: &JobView) -> String {
-    if let Op::Cancel { force, .. } = op {
-        // Live cancel never flips job state in the same reply; gate on state so a
-        // missing cancel_requested flag cannot reintroduce "is now running".
-        if matches!(job.state.as_str(), "starting" | "running" | "needs_attention") {
-            let force = if *force { " (force)" } else { "" };
-            return format!(
-                "job {} [{}] cancel requested{}; still {} — waiting for cancel to complete",
-                job.id, job.name, force, job.state
-            );
-        }
+    if let Op::Cancel { force, .. } = op
+        && matches!(job.state.as_str(), "starting" | "running" | "needs_attention")
+    {
+        let force = if *force { " (force)" } else { "" };
+        return format!("job {} [{}] cancel requested{force}", job.id, job.name);
     }
 
     if matches!(op, Op::SetMaxParallelRuns { .. }) {
         return format!(
-            "job {} [{}] maxParallelRuns is now {} ({})",
-            job.id, job.name, job.max_parallel_runs, job.state
+            "job {} [{}] maxParallelRuns is now {}",
+            job.id, job.name, job.max_parallel_runs
         );
     }
 
     if matches!(op, Op::SetPriority { .. }) {
         return format!(
-            "job {} [{}] priority is now {} ({})",
-            job.id, job.name, job.priority, job.state
+            "job {} [{}] priority is now {}",
+            job.id, job.name, job.priority
         );
     }
 
@@ -451,7 +446,7 @@ fn submit(paths: &Paths, args: SubmitArgs, key: String) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&job)?);
     } else {
         println!(
-            "submitted job {} [{}] with maxParallelRuns {} and priority {}",
+            "submitted job {} [{}] maxParallelRuns={} priority={}",
             job.id, job.name, job.max_parallel_runs, job.priority
         );
     }
@@ -774,7 +769,7 @@ fn render_status(view: &StatusView, finished_only: bool) -> String {
     match view.effective_limit {
         Some(limit) => writeln!(
             output,
-            "active leases: {} (effective minimum limit {})",
+            "active leases: {} (effective limit {})",
             view.active_leases, limit
         )
         .unwrap(),
@@ -794,8 +789,7 @@ fn render_status(view: &StatusView, finished_only: bool) -> String {
         .unwrap();
     }
     if view.admission_blocked {
-        writeln!(output, "ADMISSION BLOCKED: operator attention required (see daemon logs)")
-            .unwrap();
+        writeln!(output, "admission blocked (see daemon logs)").unwrap();
     }
 
     let has_queue = !live.is_empty() || !queued.is_empty() || !held.is_empty();
@@ -1275,14 +1269,10 @@ mod tests {
         job.cancel_requested = Some(true);
 
         let msg = format_mutation_message(&Op::Cancel { job: 106, force: false }, &job);
-        assert_eq!(
-            msg,
-            "job 106 [normuon_2k] cancel requested; still running — waiting for cancel to complete"
-        );
+        assert_eq!(msg, "job 106 [normuon_2k] cancel requested");
 
         let force = format_mutation_message(&Op::Cancel { job: 106, force: true }, &job);
-        assert!(force.contains("cancel requested (force)"));
-        assert!(!force.contains("is now running"));
+        assert_eq!(force, "job 106 [normuon_2k] cancel requested (force)");
     }
 
     #[test]
@@ -1311,7 +1301,7 @@ mod tests {
         job.name = "retune".into();
         job.priority = 3;
         let msg = format_mutation_message(&Op::SetPriority { job: 7, priority: 3 }, &job);
-        assert_eq!(msg, "job 7 [retune] priority is now 3 (queued)");
+        assert_eq!(msg, "job 7 [retune] priority is now 3");
     }
 
     #[test]
