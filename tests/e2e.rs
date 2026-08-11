@@ -170,6 +170,37 @@ fn submit_runs_captures_logs_and_reports() {
 }
 
 #[test]
+fn submit_resolves_relative_executables_against_the_job_cwd() {
+    let q = TestQueue::new();
+    // Only the job's --cwd contains the script; the daemon's own working
+    // directory (the crate root under `cargo test`) does not. A relative
+    // command launches from the job cwd, so validation must look there.
+    let bin = q.dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let script = bin.join("hello.sh");
+    std::fs::write(&script, "#!/bin/sh\necho cwd-relative-marker\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let job = q.submit(&["--name", "relative-exe"], &["bin/hello.sh"]);
+    q.wait_state(job, "succeeded", Duration::from_secs(10));
+    let stdout = q.cli(&["logs", &job.to_string()]);
+    assert!(stdout.contains("cwd-relative-marker"), "stdout log: {stdout:?}");
+
+    // A genuinely missing relative executable is still rejected, and the
+    // message names the resolved path so the mistake is visible.
+    let cwd = q.dir.path().to_str().unwrap();
+    let rejected = q.try_cli(&[
+        "submit", "--name", "missing-exe", "--cwd", cwd, "--", "bin/nope.sh",
+    ]);
+    assert!(!rejected.status.success(), "missing executable must be rejected");
+    let stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert!(
+        stderr.contains("bin/nope.sh") && stderr.contains(cwd),
+        "rejection should name the resolved path: {stderr}"
+    );
+}
+
+#[test]
 fn status_displays_long_job_names() {
     let q = TestQueue::new();
     let name = "long-job-name-now-fits-in-status";

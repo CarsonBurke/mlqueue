@@ -1570,8 +1570,15 @@ fn validate_submission_fs(params: &SubmitParams) -> ApiResult<()> {
     }
     let executable = &params.args[0];
     if executable.contains('/') {
-        if !std::path::Path::new(executable).is_file() {
-            return Err(invalid(format!("executable {executable} does not exist")));
+        // A relative path launches relative to the job's cwd (the runner
+        // chdirs before exec), so it must be validated there — never against
+        // the daemon's own working directory.
+        let resolved = cwd.join(executable);
+        if !resolved.is_file() {
+            return Err(invalid(format!(
+                "executable {} does not exist",
+                resolved.display()
+            )));
         }
     } else {
         let path = params.env.get("PATH").map(String::as_str).unwrap_or("");
