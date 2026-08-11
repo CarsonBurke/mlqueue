@@ -8,7 +8,8 @@ number of runs at once.
 It is a **coordination** tool for a single Linux user on one workstation—not a
 cluster scheduler, not a GPU allocator, and not a security boundary.
 
-Full design rationale and invariants live in [PLAN.md](PLAN.md).
+Design rationale, components, and invariants live in
+[ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Install
 

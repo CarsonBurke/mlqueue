@@ -1,6 +1,6 @@
 //! Framed Unix-socket protocol: big-endian u32 length-prefixed JSON with a
 //! hard frame limit checked before allocation, plus the stable public JSON
-//! views (camelCase, per the plan's `maxParallelRuns` convention).
+//! views (camelCase, per the architecture's `maxParallelRuns` convention).
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
