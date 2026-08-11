@@ -100,6 +100,7 @@ str_enum!(JobState {
     Failed => "failed",
     Cancelled => "cancelled",
     Lost => "lost",
+    // Read-only legacy state retained so pre-v3 history remains truthful.
     Skipped => "skipped",
     NeedsAttention => "needs_attention",
 });
@@ -136,27 +137,6 @@ impl AttemptState {
     }
 }
 
-str_enum!(DepRequirement {
-    Success => "success",
-    Completion => "completion",
-});
-
-impl DepRequirement {
-    /// Whether a terminal parent state satisfies this requirement.
-    pub fn satisfied_by(self, parent: JobState) -> bool {
-        match self {
-            Self::Success => parent == JobState::Succeeded,
-            Self::Completion => parent.is_terminal(),
-        }
-    }
-
-    /// Whether a terminal parent state makes this requirement permanently
-    /// unsatisfiable, which skips the child.
-    pub fn violated_by(self, parent: JobState) -> bool {
-        parent.is_terminal() && !self.satisfied_by(parent)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,16 +165,5 @@ mod tests {
         }
         assert_eq!("prepared".parse::<AttemptState>().unwrap(), AttemptState::Prepared);
         assert!("bogus".parse::<JobState>().is_err());
-    }
-
-    #[test]
-    fn dependency_requirements() {
-        assert!(DepRequirement::Success.satisfied_by(JobState::Succeeded));
-        assert!(!DepRequirement::Success.satisfied_by(JobState::Failed));
-        assert!(DepRequirement::Success.violated_by(JobState::Failed));
-        assert!(DepRequirement::Success.violated_by(JobState::Skipped));
-        assert!(!DepRequirement::Success.violated_by(JobState::Running));
-        assert!(DepRequirement::Completion.satisfied_by(JobState::Failed));
-        assert!(!DepRequirement::Completion.violated_by(JobState::Failed));
     }
 }

@@ -1,5 +1,5 @@
 //! Builders for the stable public JSON views. Status must explain the
-//! declared limits, the effective minimum, protection, and why each queued
+//! declared limits, the effective limit, protection, and why each queued
 //! job is not running.
 
 use anyhow::Result;
@@ -9,8 +9,8 @@ use crate::db::{self, AttemptRow, EventRow, JobRow, ReservationRow};
 use crate::domain::{JobState, now_ms};
 use crate::paths::Paths;
 use crate::protocol::{
-    AttemptView, DependencyView, EventView, FollowTtsJobView, FollowTtsSnapshotView, JobView,
-    ReservationView, StatusView,
+    AttemptView, EventView, FollowTtsJobView, FollowTtsSnapshotView, JobView, ReservationView,
+    StatusView,
 };
 
 const TTS_NAME_LIMIT: usize = 80;
@@ -51,21 +51,6 @@ pub fn attempt_view(paths: &Paths, attempt: &AttemptRow) -> AttemptView {
     }
 }
 
-fn dependency_views(conn: &Connection, job: &JobRow) -> Result<Vec<DependencyView>> {
-    let mut views = Vec::new();
-    for dep in db::dependencies_of(conn, job.id)? {
-        let parent_state = db::job_row(conn, dep.parent_id)?
-            .map(|parent| parent.state)
-            .unwrap_or(JobState::Lost);
-        views.push(DependencyView {
-            parent: dep.parent_id,
-            requirement: dep.requirement.as_str().to_string(),
-            satisfied: dep.requirement.satisfied_by(parent_state),
-        });
-    }
-    Ok(views)
-}
-
 /// Derived (never persisted) explanation for why a non-terminal job is not
 /// running right now.
 fn eligibility_reason(
@@ -77,63 +62,44 @@ fn eligibility_reason(
     let reason = match job.state {
         JobState::Held => Some("held".to_string()),
         JobState::Starting => Some("launching".to_string()),
-        JobState::NeedsAttention => {
-            Some("attempt needs recovery; see mlq recover list".to_string())
-        }
+        JobState::NeedsAttention => Some("needs_recovery".to_string()),
         JobState::Queued => {
-            let deps = dependency_views(conn, job)?;
-            if deps.iter().any(|d| !d.satisfied) {
-                Some("waiting_for_dependency".to_string())
-            } else if job.retry_not_before.is_some_and(|at| at > now) {
+            if job.retry_not_before.is_some_and(|at| at > now) {
                 Some("waiting_for_retry_delay".to_string())
             } else if let Some(res) = reservation {
                 let frontier = db::backfill_frontier(conn, res)?;
                 let protected = db::job_row(conn, res.job_id)?;
                 if matches!(frontier, db::BackfillFrontier::Unsupported(_)) {
-                    Some("admission_blocked: reservation needs operator attention".to_string())
+                    Some("admission_blocked".to_string())
                 } else if res.job_id == job.id {
-                    Some("protected_drain: waiting for active jobs to drain".to_string())
+                    Some("protected_drain".to_string())
                 } else if let Some(protected) = &protected
                     && job.priority > protected.priority
                 {
                     Some(format!(
-                        "supersedes_lower_priority: priority {} job will displace protected \
-                         priority {} job {} on the next scheduling pass",
-                        job.priority, protected.priority, protected.id
+                        "supersedes_lower_priority: job {} (pri {})",
+                        protected.id, protected.priority
                     ))
                 } else if let Some(protected) = &protected
                     && job.priority < protected.priority
                 {
                     Some(format!(
-                        "waiting_for_higher_priority: protected job {} has priority {}",
+                        "waiting_for_higher_priority: job {} (pri {})",
                         protected.id, protected.priority
                     ))
                 } else if res.consumed.contains(&job.id) {
-                    Some(format!(
-                        "backfill_bypass_consumed: already bypassed protected job {} once",
-                        res.job_id
-                    ))
+                    Some(format!("backfill_bypass_consumed: job {}", res.job_id))
                 } else {
                     match frontier {
-                        db::BackfillFrontier::OpenWindow => Some(format!(
-                            "backfill_window_open: may bypass protected job {} once while \
-                             its original blockers run",
-                            res.job_id
-                        )),
+                        db::BackfillFrontier::OpenWindow => {
+                            Some(format!("backfill_window_open: job {}", res.job_id))
+                        }
                         db::BackfillFrontier::Frozen(cutoff)
                         | db::BackfillFrontier::FreezePending(cutoff) => {
                             if job.id > cutoff {
-                                Some(format!(
-                                    "behind_backfill_cutoff: submitted after job {}'s backfill \
-                                     frontier froze",
-                                    res.job_id
-                                ))
+                                Some(format!("behind_backfill_cutoff: job {}", res.job_id))
                             } else {
-                                Some(format!(
-                                    "backfill_eligible: may bypass protected job {} once when \
-                                     a slot opens",
-                                    res.job_id
-                                ))
+                                Some(format!("backfill_eligible: job {}", res.job_id))
                             }
                         }
                         db::BackfillFrontier::Unsupported(_) => unreachable!(
@@ -185,7 +151,6 @@ pub fn job_view(
         created_at: job.created_at,
         updated_at: job.updated_at,
         finished_at: job.finished_at,
-        dependencies: dependency_views(conn, job)?,
         attempts,
         cancel_requested,
     })

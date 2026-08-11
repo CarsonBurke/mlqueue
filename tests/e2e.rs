@@ -251,10 +251,7 @@ fn follow_tts_announces_completion_and_the_next_running_job() {
     );
 
     let first = q.submit(&["--name", "tts-first"], &["sleep", "0.4"]);
-    let next = q.submit(
-        &["--name", "tts-next", "--after-success", &first.to_string()],
-        &["sleep", "2"],
-    );
+    let next = q.submit(&["--name", "tts-next"], &["sleep", "2"]);
     q.wait_state(next, "running", Duration::from_secs(10));
     let expected_finished = format!("job {first}, tts first finished successfully");
     let expected_running = format!("Now running: job {next}, tts next");
@@ -351,13 +348,6 @@ fn restrictive_job_is_protected_and_the_backfill_window_stays_open() {
         q.wait_state(job, "running", Duration::from_secs(10));
     }
 
-    // Dependency-delayed permissive job: ineligible now, but first in FIFO
-    // order among the backfill candidates once `gate` completes.
-    let backfill = q.submit(
-        &["--max-parallel-runs", "3", "--name", "backfill", "--after-completion", &gate.to_string()],
-        &["sleep", "1"],
-    );
-
     // The exclusive job is the eligible head and cannot start beside the
     // 3-wide set: it becomes the protected job.
     let exclusive =
@@ -366,9 +356,13 @@ fn restrictive_job_is_protected_and_the_backfill_window_stays_open() {
         q.status()["reservation"]["protectedJob"].as_i64() == Some(exclusive)
     });
 
-    // Submitted after protection, but the original blockers (a, b, gate) are
-    // still running: the backfill window is open and the late job may take a
-    // slot rather than idling it.
+    // Submitted after protection, but the original blockers are still
+    // running: the open window lets these permissive jobs use slots in FIFO
+    // order rather than idling them.
+    let backfill = q.submit(
+        &["--max-parallel-runs", "3", "--name", "backfill"],
+        &["sleep", "1"],
+    );
     let late = q.submit(&["--max-parallel-runs", "3", "--name", "late"], &["sleep", "1"]);
     let status = q.status();
     assert_eq!(status["reservation"]["backfillWindowOpen"], true, "window must be open: {status}");
@@ -379,9 +373,8 @@ fn restrictive_job_is_protected_and_the_backfill_window_stays_open() {
         "late job must be bypass-eligible in the open window: {late_view}"
     );
 
-    // When `gate` drains, the dependency-delayed job is the lowest-sequence
-    // candidate and takes the open slot first; the late job follows when that
-    // backfill finishes, all while the protected job keeps waiting.
+    // The earlier backfill job takes the first open slot; the late job follows
+    // when another slot opens, all while the protected job keeps waiting.
     q.wait_state(backfill, "running", Duration::from_secs(10));
     assert_eq!(q.job_state(exclusive), "queued");
     q.wait_state(late, "running", Duration::from_secs(10));
@@ -462,15 +455,13 @@ fn reservation_and_consumed_bypasses_survive_daemon_restart() {
     for job in [a, b, gate] {
         q.wait_state(job, "running", Duration::from_secs(10));
     }
-    let backfill = q.submit(
-        &["--max-parallel-runs", "3", "--name", "backfill", "--after-completion", &gate.to_string()],
-        &["sleep", "2"],
-    );
     let exclusive =
         q.submit(&["--max-parallel-runs", "1", "--name", "exclusive"], &["sh", "-c", "true"]);
     wait_for("reservation to exist", Duration::from_secs(5), || {
         q.status()["reservation"]["protectedJob"].as_i64() == Some(exclusive)
     });
+    let backfill =
+        q.submit(&["--max-parallel-runs", "3", "--name", "backfill"], &["sleep", "2"]);
     let late = q.submit(&["--max-parallel-runs", "3", "--name", "late"], &["sh", "-c", "true"]);
 
     // The bypass is consumed, then the daemon crashes.
@@ -666,32 +657,6 @@ fn idempotency_key_replays_and_conflicts() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("idempotency_conflict"), "stderr: {stderr}");
-}
-
-#[test]
-fn failed_prerequisite_skips_descendants_but_completion_children_run() {
-    let q = TestQueue::new();
-    let parent = q.submit(&["--name", "parent"], &["sh", "-c", "exit 3"]);
-    let child = q.submit(
-        &["--name", "child", "--after-success", &parent.to_string()],
-        &["sh", "-c", "true"],
-    );
-    let grandchild = q.submit(
-        &["--name", "grandchild", "--after-success", &child.to_string()],
-        &["sh", "-c", "true"],
-    );
-    let cleanup = q.submit(
-        &["--name", "cleanup", "--after-completion", &parent.to_string()],
-        &["sh", "-c", "true"],
-    );
-
-    q.wait_state(parent, "failed", Duration::from_secs(10));
-    q.wait_state(child, "skipped", Duration::from_secs(10));
-    q.wait_state(grandchild, "skipped", Duration::from_secs(10));
-    q.wait_state(cleanup, "succeeded", Duration::from_secs(10));
-
-    let detail = q.job(parent);
-    assert_eq!(detail["attempts"][0]["exitCode"], 3);
 }
 
 #[test]

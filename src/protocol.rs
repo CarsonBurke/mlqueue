@@ -11,7 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::domain::{AttemptId, JobId};
 
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 pub const DEFAULT_MAX_FRAME_BYTES: u32 = 1 << 20;
 
 fn is_zero(value: &i64) -> bool {
@@ -104,10 +104,54 @@ impl Op {
         let canonical = serde_json::to_vec(self).expect("op serializes");
         hex::encode(Sha256::digest(&canonical))
     }
+
+    /// Protocol v5 serialized empty dependency arrays on every ordinary
+    /// submit. Accept that exact legacy hash for replay after upgrading to v6;
+    /// submissions that actually declared dependencies cannot be represented
+    /// by v6 and therefore correctly remain conflicts.
+    pub(crate) fn legacy_v5_request_hash(&self) -> Option<String> {
+        let Self::Submit(params) = self else { return None };
+        let legacy = LegacyV5Op::Submit(LegacyV5SubmitParams {
+            name: &params.name,
+            cwd: &params.cwd,
+            args: &params.args,
+            env: &params.env,
+            max_parallel_runs: params.max_parallel_runs,
+            priority: params.priority,
+            max_attempts: params.max_attempts,
+            retry_delay_ms: params.retry_delay_ms,
+            after_success: &[],
+            after_completion: &[],
+        });
+        let canonical = serde_json::to_vec(&legacy).expect("legacy op serializes");
+        Some(hex::encode(Sha256::digest(&canonical)))
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum LegacyV5Op<'a> {
+    Submit(LegacyV5SubmitParams<'a>),
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyV5SubmitParams<'a> {
+    name: &'a str,
+    cwd: &'a str,
+    args: &'a [String],
+    env: &'a BTreeMap<String, String>,
+    max_parallel_runs: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    priority: i64,
+    max_attempts: u32,
+    retry_delay_ms: u64,
+    after_success: &'a [JobId],
+    after_completion: &'a [JobId],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SubmitParams {
     pub name: String,
     pub cwd: String,
@@ -122,10 +166,6 @@ pub struct SubmitParams {
     pub priority: i64,
     pub max_attempts: u32,
     pub retry_delay_ms: u64,
-    #[serde(default)]
-    pub after_success: Vec<JobId>,
-    #[serde(default)]
-    pub after_completion: Vec<JobId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,18 +229,9 @@ pub struct JobView {
     pub updated_at: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<i64>,
-    pub dependencies: Vec<DependencyView>,
     pub attempts: Vec<AttemptView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cancel_requested: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DependencyView {
-    pub parent: JobId,
-    pub requirement: String,
-    pub satisfied: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -405,8 +436,6 @@ mod tests {
                 priority,
                 max_attempts: 1,
                 retry_delay_ms: 0,
-                after_success: vec![],
-                after_completion: vec![],
             })
         };
         assert_eq!(mk(1, 0).request_hash(), mk(1, 0).request_hash());
@@ -419,6 +448,25 @@ mod tests {
         assert!(
             prioritized_json.contains("\"priority\":1"),
             "{prioritized_json}"
+        );
+
+        let current = mk(1, 0);
+        let legacy_json = concat!(
+            r#"{"type":"submit","name":"x","cwd":"/tmp","args":["true"],"env":{},"maxParallelRuns":1,"maxAttempts":1,"retryDelayMs":0,"#,
+            r#""afterSuccess":[],"afterCompletion":[]}"#
+        );
+        let legacy_hash = hex::encode(Sha256::digest(legacy_json.as_bytes()));
+        assert_eq!(current.legacy_v5_request_hash().as_deref(), Some(legacy_hash.as_str()));
+        assert_ne!(current.request_hash(), legacy_hash);
+        assert!(Op::Status.legacy_v5_request_hash().is_none());
+
+        let removed_dependency = concat!(
+            r#"{"type":"submit","name":"x","cwd":"/tmp","args":["true"],"env":{},"maxParallelRuns":1,"maxAttempts":1,"retryDelayMs":0,"#,
+            r#""afterSuccess":[42]}"#
+        );
+        assert!(
+            serde_json::from_str::<Op>(removed_dependency).is_err(),
+            "removed dependency keys must not be silently discarded"
         );
     }
 

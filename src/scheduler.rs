@@ -19,8 +19,8 @@ pub struct ActiveLease {
     pub limit: u32,
 }
 
-/// A job eligible to start: queued, not held, dependencies satisfied, retry
-/// delay elapsed. Must be supplied in priority/FIFO order.
+/// A job eligible to start: queued, not held, retry delay elapsed. Must be
+/// supplied in priority/FIFO order.
 #[derive(Debug, Clone)]
 pub struct Candidate {
     pub job_id: JobId,
@@ -130,8 +130,8 @@ pub fn plan_pass(
     });
 
     // A persisted reservation whose protected job is no longer eligible
-    // (cancelled, held, or dependency-ineligible again) is defensively
-    // invalidated; mutations normally do this with a precise reason.
+    // (cancelled or held) is defensively invalidated; mutations normally do
+    // this with a precise reason.
     if let Some(r) = &res
         && !eligible.iter().any(|c| c.job_id == r.job_id)
     {

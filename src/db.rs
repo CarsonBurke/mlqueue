@@ -10,7 +10,7 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::domain::{
-    AttemptId, AttemptState, DepRequirement, JobId, JobState, SCHEDULER_SEMANTICS_VERSION, now_ms,
+    AttemptId, AttemptState, JobId, JobState, SCHEDULER_SEMANTICS_VERSION, now_ms,
 };
 use crate::protocol::SubmitParams;
 use crate::scheduler::{ActiveLease, Candidate};
@@ -133,6 +133,40 @@ const MIGRATIONS: &[&str] = &[
        SET semantics_version = 3
      WHERE status = 'active' AND semantics_version IN (1, 2);
     "#,
+    // v3: stop creating job dependency edges. Jobs whose prerequisites were
+    // unresolved at upgrade time must never become runnable merely because
+    // the feature disappeared; terminalize that snapshot before dropping the
+    // edges. Historical skipped jobs remain truthful legacy records.
+    r#"
+    CREATE TEMP TABLE _mlqueue_v3_blocked_jobs (
+        job_id INTEGER PRIMARY KEY,
+        migrated_at INTEGER NOT NULL
+    );
+    INSERT INTO _mlqueue_v3_blocked_jobs (job_id, migrated_at)
+    SELECT DISTINCT child.id,
+           CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+      FROM jobs child
+      JOIN dependencies d ON d.child_id = child.id
+      JOIN jobs parent ON parent.id = d.parent_id
+     WHERE child.state IN ('queued', 'held')
+       AND NOT (
+           (d.requirement = 'success' AND parent.state = 'succeeded')
+           OR (d.requirement = 'completion'
+               AND parent.state IN ('succeeded','failed','cancelled','lost','skipped'))
+       );
+    UPDATE jobs
+       SET state = 'cancelled',
+           state_reason = 'dependency feature removed before prerequisites completed',
+           updated_at = (SELECT migrated_at FROM _mlqueue_v3_blocked_jobs WHERE job_id = jobs.id),
+           finished_at = (SELECT migrated_at FROM _mlqueue_v3_blocked_jobs WHERE job_id = jobs.id)
+     WHERE id IN (SELECT job_id FROM _mlqueue_v3_blocked_jobs);
+    INSERT INTO events (ts, job_id, attempt_id, type, actor, details)
+    SELECT migrated_at, job_id, NULL, 'job_cancelled', 'migration',
+           '{"reason":"dependency feature removed before prerequisites completed"}'
+      FROM _mlqueue_v3_blocked_jobs;
+    DROP TABLE _mlqueue_v3_blocked_jobs;
+    DROP TABLE IF EXISTS dependencies;
+    "#,
 ];
 
 pub fn open(path: &Path) -> Result<Connection> {
@@ -217,13 +251,6 @@ pub struct AttemptRow {
     pub authorized_at: Option<i64>,
     pub running_at: Option<i64>,
     pub finished_at: Option<i64>,
-}
-
-#[derive(Debug, Clone)]
-pub struct DependencyRow {
-    pub parent_id: JobId,
-    pub child_id: JobId,
-    pub requirement: DepRequirement,
 }
 
 #[derive(Debug, Clone)]
@@ -313,9 +340,6 @@ fn attempt_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttemptRow> {
 // Jobs
 // ---------------------------------------------------------------------------
 
-/// Insert a job and its dependency edges. Edges only point from existing
-/// parents to the brand-new child, so a cycle is structurally impossible at
-/// submission time; parents are validated to exist by the caller.
 pub fn insert_job(conn: &Connection, params: &SubmitParams, now: i64) -> Result<JobId> {
     conn.execute(
         "INSERT INTO jobs (name, state, cwd, args, env, max_parallel_runs, priority, \
@@ -334,23 +358,7 @@ pub fn insert_job(conn: &Connection, params: &SubmitParams, now: i64) -> Result<
             now,
         ],
     )?;
-    let job_id = conn.last_insert_rowid();
-    // Declaring the same parent under both flags keeps the stricter
-    // requirement: success implies completion, never the reverse.
-    let mut edges: std::collections::BTreeMap<JobId, DepRequirement> = std::collections::BTreeMap::new();
-    for parent in &params.after_completion {
-        edges.insert(*parent, DepRequirement::Completion);
-    }
-    for parent in &params.after_success {
-        edges.insert(*parent, DepRequirement::Success);
-    }
-    for (parent, requirement) in edges {
-        conn.execute(
-            "INSERT INTO dependencies (parent_id, child_id, requirement) VALUES (?1, ?2, ?3)",
-            params![parent, job_id, requirement.as_str()],
-        )?;
-    }
-    Ok(job_id)
+    Ok(conn.last_insert_rowid())
 }
 
 pub fn job_row(conn: &Connection, id: JobId) -> Result<Option<JobRow>> {
@@ -361,13 +369,6 @@ pub fn job_row(conn: &Connection, id: JobId) -> Result<Option<JobRow>> {
             job_from_row,
         )
         .optional()?)
-}
-
-pub fn job_exists(conn: &Connection, id: JobId) -> Result<bool> {
-    Ok(conn
-        .query_row("SELECT 1 FROM jobs WHERE id = ?1", [id], |_| Ok(()))
-        .optional()?
-        .is_some())
 }
 
 /// Jobs shown by `status`: all non-terminal plus the most recent terminal.
@@ -504,58 +505,12 @@ pub fn bounded_job_names_in_state(
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-// ---------------------------------------------------------------------------
-// Dependencies
-// ---------------------------------------------------------------------------
-
-pub fn dependencies_of(conn: &Connection, child: JobId) -> Result<Vec<DependencyRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT parent_id, child_id, requirement FROM dependencies WHERE child_id = ?1 \
-         ORDER BY parent_id",
-    )?;
-    let rows = stmt.query_map([child], |row| {
-        let requirement: String = row.get(2)?;
-        Ok(DependencyRow {
-            parent_id: row.get(0)?,
-            child_id: row.get(1)?,
-            requirement: requirement.parse().expect("valid requirement in database"),
-        })
-    })?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-}
-
-/// Queued/held jobs with a dependency that can never be satisfied (a parent
-/// terminal in a non-qualifying state). One iteration of skip propagation;
-/// the caller loops until it returns nothing.
-pub fn jobs_with_violated_dependencies(conn: &Connection) -> Result<Vec<(JobId, JobId)>> {
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT j.id, p.id FROM jobs j
-         JOIN dependencies d ON d.child_id = j.id
-         JOIN jobs p ON p.id = d.parent_id
-         WHERE j.state IN ('queued', 'held')
-           AND d.requirement = 'success'
-           AND p.state IN ('failed', 'cancelled', 'lost', 'skipped')",
-    )?;
-    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-}
-
 /// Priority/FIFO-ordered jobs eligible for admission right now.
 pub fn eligible_candidates(conn: &Connection, now: i64) -> Result<Vec<Candidate>> {
     let mut stmt = conn.prepare(
         "SELECT j.id, j.max_parallel_runs, j.priority FROM jobs j
          WHERE j.state = 'queued'
            AND (j.retry_not_before IS NULL OR j.retry_not_before <= ?1)
-           AND NOT EXISTS (
-               SELECT 1 FROM dependencies d
-               JOIN jobs p ON p.id = d.parent_id
-               WHERE d.child_id = j.id
-                 AND NOT (
-                     (d.requirement = 'success' AND p.state = 'succeeded')
-                     OR (d.requirement = 'completion'
-                         AND p.state IN ('succeeded','failed','cancelled','lost','skipped'))
-                 )
-           )
          ORDER BY j.priority DESC, j.id ASC",
     )?;
     let rows = stmt.query_map([now], |row| {
@@ -1024,8 +979,6 @@ mod tests {
             priority: 0,
             max_attempts: 1,
             retry_delay_ms: 0,
-            after_success: vec![],
-            after_completion: vec![],
         }
     }
 
@@ -1101,6 +1054,75 @@ mod tests {
     }
 
     #[test]
+    fn v2_migration_never_releases_unresolved_dependency_jobs() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        conn.execute_batch(MIGRATIONS[1]).unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        conn.execute_batch(
+            r#"
+            INSERT INTO jobs (
+                id, name, state, cwd, args, env, max_parallel_runs, max_attempts,
+                retry_delay_ms, attempt_count, created_at, updated_at
+            ) VALUES
+                (1, 'running-parent', 'running', '/tmp', '["true"]', '{}', 1, 1, 0, 1, 1, 10),
+                (2, 'waiting-success', 'queued', '/tmp', '["true"]', '{}', 1, 1, 0, 0, 2, 20),
+                (3, 'waiting-held', 'held', '/tmp', '["true"]', '{}', 1, 1, 0, 0, 3, 30),
+                (4, 'succeeded-parent', 'succeeded', '/tmp', '["true"]', '{}', 1, 1, 0, 1, 4, 40),
+                (5, 'ready-success', 'queued', '/tmp', '["true"]', '{}', 1, 1, 0, 0, 5, 50),
+                (6, 'failed-parent', 'failed', '/tmp', '["true"]', '{}', 1, 1, 0, 1, 6, 60),
+                (7, 'ready-completion', 'queued', '/tmp', '["true"]', '{}', 1, 1, 0, 0, 7, 70),
+                (8, 'impossible-success', 'queued', '/tmp', '["true"]', '{}', 1, 1, 0, 0, 8, 80),
+                (9, 'historical-skip', 'skipped', '/tmp', '["true"]', '{}', 1, 1, 0, 0, 9, 90);
+            INSERT INTO dependencies (parent_id, child_id, requirement) VALUES
+                (1, 2, 'success'),
+                (1, 3, 'completion'),
+                (4, 5, 'success'),
+                (6, 7, 'completion'),
+                (6, 8, 'success');
+            "#,
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        for id in [2, 3, 8] {
+            let job = job_row(&conn, id).unwrap().unwrap();
+            assert_eq!(
+                job.state,
+                JobState::Cancelled,
+                "job {id} must not become runnable"
+            );
+            assert_eq!(
+                job.state_reason.as_deref(),
+                Some("dependency feature removed before prerequisites completed")
+            );
+            assert_eq!(job.finished_at, Some(job.updated_at));
+            assert!(job.updated_at > 80, "job {id} needs an upgrade-time timestamp");
+        }
+        assert_eq!(job_row(&conn, 5).unwrap().unwrap().state, JobState::Queued);
+        assert_eq!(job_row(&conn, 7).unwrap().unwrap().state, JobState::Queued);
+        assert_eq!(job_row(&conn, 9).unwrap().unwrap().state, JobState::Skipped);
+        let dependencies_exist: bool = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'dependencies')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!dependencies_exist);
+        let migration_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'job_cancelled' AND actor = 'migration'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migration_events, 3);
+    }
+
+    #[test]
     fn eligible_candidates_order_by_priority_then_fifo() {
         let conn = open_in_memory().unwrap();
         let mut low = submit_params("low", 1);
@@ -1168,46 +1190,12 @@ mod tests {
     }
 
     #[test]
-    fn eligible_candidates_respect_dependencies_and_retry_delay() {
+    fn eligible_candidates_respect_retry_delay() {
         let conn = open_in_memory().unwrap();
-        let parent = insert_job(&conn, &submit_params("parent", 1), 1000).unwrap();
-        let mut child_params = submit_params("child", 1);
-        child_params.after_success = vec![parent];
-        let child = insert_job(&conn, &child_params, 1001).unwrap();
-
-        let ids: Vec<JobId> =
-            eligible_candidates(&conn, 2000).unwrap().iter().map(|c| c.job_id).collect();
-        assert_eq!(ids, vec![parent], "child must wait for parent");
-
-        update_job_state(&conn, parent, JobState::Succeeded, None, 3000).unwrap();
-        let ids: Vec<JobId> =
-            eligible_candidates(&conn, 3000).unwrap().iter().map(|c| c.job_id).collect();
-        assert_eq!(ids, vec![child]);
-
-        set_job_retry_not_before(&conn, child, Some(9000), 3000).unwrap();
+        let job = insert_job(&conn, &submit_params("retry", 1), 1000).unwrap();
+        set_job_retry_not_before(&conn, job, Some(9000), 1001).unwrap();
         assert!(eligible_candidates(&conn, 3000).unwrap().is_empty());
         assert_eq!(eligible_candidates(&conn, 9000).unwrap().len(), 1);
-    }
-
-    #[test]
-    fn violated_dependencies_are_reported_for_skipping() {
-        let conn = open_in_memory().unwrap();
-        let parent = insert_job(&conn, &submit_params("parent", 1), 1000).unwrap();
-        let mut child_params = submit_params("child", 1);
-        child_params.after_success = vec![parent];
-        let child = insert_job(&conn, &child_params, 1001).unwrap();
-        let mut completion_params = submit_params("completion-child", 1);
-        completion_params.after_completion = vec![parent];
-        let completion_child = insert_job(&conn, &completion_params, 1002).unwrap();
-
-        update_job_state(&conn, parent, JobState::Failed, None, 2000).unwrap();
-        let violated = jobs_with_violated_dependencies(&conn).unwrap();
-        assert_eq!(violated, vec![(child, parent)]);
-
-        // after-completion child becomes eligible instead.
-        let ids: Vec<JobId> =
-            eligible_candidates(&conn, 3000).unwrap().iter().map(|c| c.job_id).collect();
-        assert!(ids.contains(&completion_child));
     }
 
     #[test]
@@ -1309,20 +1297,6 @@ mod tests {
         assert!(any_blockers_advancing(&conn, &[attempt.id]).unwrap());
         release_lease(&conn, attempt.id, 2000).unwrap();
         assert!(!any_blockers_advancing(&conn, &[attempt.id]).unwrap());
-    }
-
-    #[test]
-    fn duplicate_dependency_declaration_keeps_the_stricter_requirement() {
-        let conn = open_in_memory().unwrap();
-        let parent = insert_job(&conn, &submit_params("parent", 1), 1000).unwrap();
-        let mut child_params = submit_params("child", 1);
-        child_params.after_success = vec![parent];
-        child_params.after_completion = vec![parent];
-        let child = insert_job(&conn, &child_params, 1001).unwrap();
-
-        let deps = dependencies_of(&conn, child).unwrap();
-        assert_eq!(deps.len(), 1);
-        assert_eq!(deps[0].requirement, DepRequirement::Success);
     }
 
     #[test]

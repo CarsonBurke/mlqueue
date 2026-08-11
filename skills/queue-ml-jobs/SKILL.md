@@ -24,12 +24,10 @@ mlq submit --name NAME --max-parallel-runs N \
   --cwd /absolute/repository/path -- COMMAND...
 ```
 
-- Encode sequencing with repeatable `--after-success JOB` or
-  `--after-completion JOB` dependencies instead of shell backgrounding.
-- Enqueue all immediately known independent jobs or dependency-DAG nodes before
-  waiting. Then run `mlq wait JOB` for each independent job or terminal leaf
-  and continue from their results. Treat submission alone as incomplete unless
-  the user explicitly requests detached or fire-and-forget execution.
+- Enqueue independent jobs you can start now. For sequential or conditional
+  follow-ups, `mlq wait JOB`, inspect the outcome (and metrics if needed), then
+  submit the next job. Treat submission alone as incomplete unless the user
+  explicitly requests detached or fire-and-forget execution.
 - Pass required environment explicitly. Values supplied through `--env` are
   stored as plaintext; make workloads read secrets from credential files.
 - Change a queued or running job with

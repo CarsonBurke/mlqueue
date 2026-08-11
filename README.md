@@ -129,8 +129,7 @@ Common flags:
 - `--idempotency-key KEY` on mutations (auto-generated if omitted; safe to
   retry an identical request)
 - Submit: `--name`, `--cwd`, `--env KEY=VAL`, `--inherit-env VAR`,
-  `--max-attempts`, `--retry-delay`, `--after-success JOB`,
-  `--after-completion JOB`
+  `--max-attempts`, `--retry-delay`
 
 ### `wait` and `logs --follow` exit codes
 
@@ -161,9 +160,8 @@ mlq submit \
 - Always set `--max-parallel-runs` explicitly (`1` for exclusive / unknown /
   multi-GPU / benchmarks).
 - Omit `--priority` unless queue precedence is intentional.
-- Prefer dependency edges (`--after-success` / `--after-completion`) over
-  shell backgrounding.
-- Enqueue the full known DAG, then `mlq wait` on leaves.
+- Enqueue independent work, then `mlq wait` before conditional follow-ups.
+  Metric or success-gated pipelines belong in the submitter, not the daemon.
 - Secrets: prefer files over `--env` (env is stored in SQLite as plaintext).
 
 A ready-made agent skill ships in [`skills/queue-ml-jobs/`](skills/queue-ml-jobs/).
@@ -189,5 +187,4 @@ cargo install --path . --force && mlq daemon install   # rebuild + restart unit
 
 The e2e suite (`tests/e2e.rs`) covers the concurrency formula, signed priority
 ordering, windowed-then-frozen backfill, live limit updates, cancellation,
-retries, dependency skips, idempotency replay/conflict, and daemon-crash
-recovery.
+retries, idempotency replay/conflict, and daemon-crash recovery.

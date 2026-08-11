@@ -222,12 +222,6 @@ struct SubmitArgs {
     /// Delay before an automatic retry (e.g. "30s", "5m").
     #[arg(long, value_parser = humantime::parse_duration)]
     retry_delay: Option<Duration>,
-    /// Start only after this job succeeds (repeatable).
-    #[arg(long = "after-success")]
-    after_success: Vec<JobId>,
-    /// Start only after this job reaches any terminal state (repeatable).
-    #[arg(long = "after-completion")]
-    after_completion: Vec<JobId>,
     /// Explicit KEY=VALUE environment entry (repeatable).
     #[arg(long = "env")]
     env: Vec<String>,
@@ -450,8 +444,6 @@ fn submit(paths: &Paths, args: SubmitArgs, key: String) -> Result<()> {
         priority: args.priority,
         max_attempts: args.max_attempts,
         retry_delay_ms: args.retry_delay.map(|delay| delay.as_millis() as u64).unwrap_or(0),
-        after_success: args.after_success,
-        after_completion: args.after_completion,
     };
     let reply = send(paths, Op::Submit(params), Some(key))?;
     let Reply::Submitted { job } = reply else { bail!(client::unexpected("submitted job")) };
@@ -617,10 +609,6 @@ fn follow_tts_announcement(events: &[EventView]) -> Option<String> {
             }
             "job_lost" => {
                 outcomes.push(format!("{} was lost", name()));
-                started.remove(&event.job);
-            }
-            "job_skipped" => {
-                outcomes.push(format!("{} was skipped", name()));
                 started.remove(&event.job);
             }
             "retry_scheduled" => {
@@ -935,16 +923,6 @@ fn print_job_detail(job: &JobView) {
     println!("  cwd:              {}", job.cwd);
     println!("  command:          {}", shell_join(&job.args));
     println!("  attempts:         {}/{}", job.attempt_count, job.max_attempts);
-    if !job.dependencies.is_empty() {
-        for dep in &job.dependencies {
-            println!(
-                "  depends on:       job {} ({}, {})",
-                dep.parent,
-                dep.requirement,
-                if dep.satisfied { "satisfied" } else { "unsatisfied" }
-            );
-        }
-    }
     for attempt in &job.attempts {
         let outcome = match (attempt.exit_code, attempt.term_signal) {
             (Some(code), _) => format!(" exit {code}"),
@@ -1045,7 +1023,7 @@ const EXIT_TIMED_OUT: i32 = 124;
 
 /// Map a terminal outcome onto a process exit code: 0 for success, 128+N
 /// for a death by signal N, the command's own non-zero exit code where one
-/// exists, and 1 otherwise (skipped, lost, cancelled or failed pre-launch).
+/// exists, and 1 otherwise (legacy skipped, lost, cancelled or failed pre-launch).
 fn outcome_exit_code(succeeded: bool, exit_code: Option<i32>, term_signal: Option<i32>) -> i32 {
     if succeeded {
         return 0;
@@ -1285,7 +1263,6 @@ mod tests {
             created_at: id,
             updated_at: finished_at.unwrap_or(id),
             finished_at,
-            dependencies: vec![],
             attempts: vec![],
             cancel_requested: None,
         }

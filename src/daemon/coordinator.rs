@@ -127,9 +127,6 @@ impl Coordinator {
         if let Err(err) = self.reconcile_all() {
             tracing::error!("reconcile failed: {err:#}");
         }
-        if let Err(err) = self.propagate_skips() {
-            tracing::error!("skip propagation failed: {err:#}");
-        }
         if let Err(err) = self.schedule() {
             tracing::error!("scheduling pass failed: {err:#}");
         }
@@ -255,7 +252,9 @@ impl Coordinator {
     fn handle_mutation(&mut self, op: &Op, key: &str) -> ApiResult<Reply> {
         let hash = op.request_hash();
         if let Some((stored_hash, stored_response)) = db::lookup_operation(&self.conn, key)? {
-            if stored_hash != hash {
+            let matches_legacy_v5_submit =
+                op.legacy_v5_request_hash().as_deref() == Some(stored_hash.as_str());
+            if stored_hash != hash && !matches_legacy_v5_submit {
                 return Err(ApiError::new(
                     error_codes::IDEMPOTENCY_CONFLICT,
                     format!("idempotency key {key:?} was already used with a different request"),
@@ -765,37 +764,6 @@ impl Coordinator {
         Ok(())
     }
 
-    /// Skip queued/held jobs whose success dependency terminally failed;
-    /// cascades until a fixed point.
-    fn propagate_skips(&mut self) -> Result<()> {
-        loop {
-            let violated = db::jobs_with_violated_dependencies(&self.conn)?;
-            if violated.is_empty() {
-                return Ok(());
-            }
-            let now = now_ms();
-            let tx = self.conn.transaction()?;
-            for (job, parent) in violated {
-                db::update_job_state(
-                    &tx,
-                    job,
-                    JobState::Skipped,
-                    Some(&format!("prerequisite job {parent} did not succeed")),
-                    now,
-                )?;
-                db::append_event(
-                    &tx,
-                    Some(job),
-                    None,
-                    "job_skipped",
-                    "daemon",
-                    Some(&json!({ "failedPrerequisite": parent }).to_string()),
-                )?;
-            }
-            tx.commit()?;
-        }
-    }
-
     // -----------------------------------------------------------------------
     // Scheduling
     // -----------------------------------------------------------------------
@@ -1171,7 +1139,6 @@ fn apply_mutation(
 ) -> ApiResult<(Reply, Vec<PostAction>)> {
     match op {
         Op::Submit(params) => {
-            validate_submission_parents(tx, params)?;
             let job = db::insert_job(tx, params, now)?;
             db::append_event(
                 tx,
@@ -1582,18 +1549,6 @@ fn validate_submission_fs(params: &SubmitParams) -> ApiResult<()> {
             return Err(invalid(format!(
                 "executable {executable} not found on the persisted PATH"
             )));
-        }
-    }
-    Ok(())
-}
-
-fn validate_submission_parents(tx: &Transaction<'_>, params: &SubmitParams) -> ApiResult<()> {
-    for parent in params.after_success.iter().chain(&params.after_completion) {
-        if !db::job_exists(tx, *parent)? {
-            return Err(ApiError::new(
-                error_codes::NOT_FOUND,
-                format!("dependency parent job {parent} does not exist"),
-            ));
         }
     }
     Ok(())
