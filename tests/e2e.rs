@@ -798,7 +798,7 @@ fn set_max_parallel_runs_updates_queued_and_live_jobs_safely() {
     // slot and the queued job starts on the mutation-triggered scheduler pass.
     let message = q.cli(&["set-max-parallel-runs", &first.to_string(), "3"]);
     assert!(
-        message.contains("maxParallelRuns is now 3 (running)"),
+        message.contains("maxParallelRuns is now 3"),
         "message: {message}"
     );
     assert_eq!(q.job_state(queued), "queued");
@@ -813,31 +813,42 @@ fn set_max_parallel_runs_updates_queued_and_live_jobs_safely() {
     }
     assert_eq!(q.status()["effectiveLimit"], 3);
 
-    // Three leases are active while the third job keeps running. A limit of
-    // two would make that current set invalid, so the mutation is rejected
-    // without changing any persisted copy.
-    let output = q.try_cli(&["set-max-parallel-runs", &first.to_string(), "2"]);
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("while 3 run leases are active"),
-        "stderr: {stderr}"
-    );
-    let detail = q.job(first);
-    assert_eq!(detail["maxParallelRuns"], 3);
-    assert_eq!(detail["attempts"][0]["maxParallelRuns"], 3);
-
-    // Once the third lease drains, lowering to the two active leases is safe
-    // and updates the effective scheduler limit immediately.
-    q.cli(&["cancel", &queued.to_string()]);
-    q.wait_state(queued, "cancelled", Duration::from_secs(10));
+    // Three leases are active. Lowering one declaration to 2 makes the set
+    // temporarily oversubscribed (no preemption); the limit still applies to
+    // future admissions, and the job/attempt/lease copies all update now.
     q.cli(&["set-max-parallel-runs", &first.to_string(), "2"]);
     let detail = q.job(first);
     assert_eq!(detail["maxParallelRuns"], 2);
     assert_eq!(detail["attempts"][0]["maxParallelRuns"], 2);
     assert_eq!(q.status()["effectiveLimit"], 2);
+    assert_eq!(q.status()["activeLeases"], 3);
 
-    for job in [first, second] {
+    // A fourth job must stay queued while three leases remain and the
+    // effective declaration is only 2.
+    let fourth = q.submit(
+        &["--max-parallel-runs", "3", "--name", "must-wait"],
+        &["sleep", "30"],
+    );
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(q.job_state(fourth), "queued");
+
+    // After the third lease drains, two remain at effective limit 2; still no
+    // room for a third start until someone else finishes or limits rise.
+    q.cli(&["cancel", &queued.to_string()]);
+    q.wait_state(queued, "cancelled", Duration::from_secs(10));
+    assert_eq!(q.status()["activeLeases"], 2);
+    assert_eq!(q.status()["effectiveLimit"], 2);
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(q.job_state(fourth), "queued");
+
+    // Raise the tight declaration so three can coexist again; the waiter
+    // admits on the mutation-triggered scheduler pass.
+    q.cli(&["set-max-parallel-runs", &first.to_string(), "3"]);
+    q.wait_state(fourth, "running", Duration::from_secs(10));
+    assert_eq!(q.status()["activeLeases"], 3);
+    assert_eq!(q.status()["effectiveLimit"], 3);
+
+    for job in [first, second, fourth] {
         q.cli(&["cancel", &job.to_string()]);
         q.wait_state(job, "cancelled", Duration::from_secs(10));
     }

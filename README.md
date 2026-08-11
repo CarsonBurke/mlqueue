@@ -145,7 +145,8 @@ Common flags:
 
 `set-max-parallel-runs` updates the job, its live attempt, and its run lease
 atomically. Lowering a limit below the current number of active leases is
-rejected—wait for work to drain, then retry.
+allowed: existing work keeps running (no preemption), and the scheduler
+refuses new admissions until the active set drains to a compatible size.
 
 ## Submit recipe for agents
 

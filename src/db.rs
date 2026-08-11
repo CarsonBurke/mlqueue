@@ -430,8 +430,9 @@ pub fn set_job_priority(conn: &Connection, id: JobId, value: i64, now: i64) -> R
 
 /// Change the declaration copied into a live attempt and its active lease.
 /// The caller must run this inside the same transaction as the corresponding
-/// job-row update and must first verify that the resulting active lease set
-/// still satisfies the admission invariant.
+/// job-row update. Lowering a limit may leave the active set temporarily
+/// oversubscribed relative to the new declaration; that is intentional
+/// (no preemption)—admission will refuse new starts until the set drains.
 pub fn set_active_attempt_max_parallel_runs(
     conn: &Connection,
     attempt: AttemptId,

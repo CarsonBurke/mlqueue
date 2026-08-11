@@ -1287,16 +1287,10 @@ fn apply_mutation(
                     })?;
                     let active_leases = db::active_leases(tx)?;
                     let active_count = active_leases.len() as u64;
-                    if u64::from(*max_parallel_runs) < active_count {
-                        return Err(ApiError::new(
-                            error_codes::INVALID_ARGUMENT,
-                            format!(
-                                "cannot lower maxParallelRuns to {max_parallel_runs} while \
-                                 {active_count} run leases are active; wait for the active \
-                                 count to fall to {max_parallel_runs} or lower"
-                            ),
-                        ));
-                    }
+                    // Lowering below the current active count is allowed: we
+                    // do not preempt healthy work, so excess leases keep
+                    // running and drain naturally. Admission (`can_admit`)
+                    // refuses new starts until the set is compatible again.
                     if !active_leases.iter().any(|(id, _)| *id == attempt.id) {
                         return Err(ApiError::new(
                             error_codes::INVALID_STATE,

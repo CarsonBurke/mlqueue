@@ -33,9 +33,9 @@ mlq submit --name NAME --max-parallel-runs N \
 - Pass required environment explicitly. Values supplied through `--env` are
   stored as plaintext; make workloads read secrets from credential files.
 - Change a queued or running job with
-  `mlq set-max-parallel-runs JOB N` when evidence changes its safe limit. A
-  decrease below the active-lease count is rejected; wait for enough jobs to
-  finish and retry.
+  `mlq set-max-parallel-runs JOB N` when evidence changes its safe limit.
+  Lowering below the current active-lease count is allowed: existing work
+  keeps running, and new admissions wait until the set drains.
 - Change a queued or held job's order with `mlq set-priority JOB P`. Running
   jobs cannot change priority (no preemption). Do not raise priority merely to
   jump the queue for your own work.
