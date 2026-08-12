@@ -80,6 +80,7 @@ Each job declares:
 ```text
 maxParallelRuns  positive integer, default 1   CLI: --max-parallel-runs
 priority         signed i64, default 0         CLI: --priority
+timeLimitMs      optional positive integer     CLI: --time-limit DURATION
 ```
 
 JSON uses camelCase (`maxParallelRuns`). Rust/SQLite use snake_case.
@@ -203,7 +204,7 @@ new versions never create that state.
 
 | Table | Role |
 |---|---|
-| `jobs` | Command, cwd, env, state, `max_parallel_runs`, `priority`, retries, timestamps |
+| `jobs` | Command, cwd, env, state, concurrency/priority, retries, optional time limit, timestamps |
 | `attempts` | Launch token, state, copied limit, runner/command identity, exit |
 | `run_leases` | One active lease per attempt; source of truth for the formula |
 | `scheduler_reservation` | Protected job, cutoff, initial blockers, semantics version |
@@ -258,6 +259,19 @@ valid, quarantine corrupt identity, retain leases for orphans.
   (SIGTERM, optional SIGKILL after grace).
 - Lease released only when the group is empty.
 - Natural exit before signal delivery can win (`cancellation_too_late`).
+
+### Per-attempt wall-clock limits
+
+- An optional limit starts at successful command spawn, not submission or
+  authorization. Queue wait is excluded; everything executed by the command,
+  including compilation and descendants, is included.
+- Expiry is a failed attempt and therefore follows the ordinary retry policy.
+- The runner sends SIGTERM to the command process group and always schedules
+  SIGKILL after the cancellation grace period. It publishes the timed-out
+  result only after the group is empty, so the run lease remains truthful.
+- The detached runner owns the monotonic deadline, so daemon restart does not
+  reset it. The command spawn time is also persisted; if the runner dies, the
+  daemon takes over SIGTERM/SIGKILL enforcement while retaining the lease.
 
 ### Group emptiness
 

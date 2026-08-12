@@ -39,6 +39,9 @@ mlq submit --name cleanrl --max-parallel-runs 3 -- python train.py
 # prefer this job over default-priority queue work (does not preempt runners)
 mlq submit --name urgent --priority 1 --max-parallel-runs 1 -- python eval.py
 
+# bound each attempt to two hours (queue wait is not counted)
+mlq submit --name bounded --time-limit 2h -- cargo run --release --bin train
+
 mlq status                # live queue: running, queued, held
 mlq status -f             # recent finished runs only
 mlq show 1
@@ -130,7 +133,16 @@ Common flags:
 - `--idempotency-key KEY` on mutations (auto-generated if omitted; safe to
   retry an identical request)
 - Submit: `--name`, `--cwd`, `--env KEY=VAL`, `--inherit-env VAR`,
-  `--max-attempts`, `--retry-delay`
+  `--max-attempts`, `--retry-delay`, `--time-limit`
+
+`submit --time-limit DURATION` is a per-attempt wall-clock limit. It starts
+when the runner spawns the command, so queue wait is excluded, while command
+startup, compilation, and all descendants are included. Expiry sends SIGTERM
+to the command process group, escalates to SIGKILL after the configured grace
+period, and records a failed attempt; normal retry policy still applies.
+The detached runner enforces the limit across daemon restarts; if that runner
+dies, the daemon resumes enforcement from the persisted command start time.
+As with any failed attempt, a separate user cancellation suppresses retries.
 
 ### `wait` and `logs --follow` exit codes
 
@@ -177,6 +189,8 @@ Install or link it next to the CLI in agent environments.
   finalizes results exactly once
 - A run lease is held until the attempt’s **entire process group** is gone
 - Cancel is SIGTERM, then optional SIGKILL after a configured grace period
+- A time-limited attempt always escalates to SIGKILL after the same grace
+  period if its process group has not drained
 
 ## Development
 
@@ -188,4 +202,4 @@ cargo install --path . --force && mlq daemon install   # rebuild + restart unit
 
 The e2e suite (`tests/e2e.rs`) covers the concurrency formula, signed priority
 ordering, windowed-then-frozen backfill, live limit updates, cancellation,
-retries, idempotency replay/conflict, and daemon-crash recovery.
+wall-clock limits, retries, idempotency replay/conflict, and daemon-crash recovery.

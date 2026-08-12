@@ -70,7 +70,7 @@ type ApiResult<T> = Result<T, ApiError>;
 /// transaction. They are idempotently re-derived from committed state by
 /// reconcile, so a crash between commit and action loses nothing.
 enum PostAction {
-    PublishCancel { attempt_id: AttemptId, token: String, force: bool },
+    PublishCancel { attempt_id: AttemptId, token: String, force: bool, requested_at: i64 },
     SignalGroup { pgid: i32, signal: i32 },
 }
 
@@ -293,13 +293,18 @@ impl Coordinator {
 
     fn perform(&mut self, action: PostAction) {
         match action {
-            PostAction::PublishCancel { attempt_id, token, force } => {
+            PostAction::PublishCancel { attempt_id, token, force, requested_at } => {
                 let dir = self.paths.attempt_dir(attempt_id);
                 if let Err(err) = fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir) {
                     tracing::warn!("creating {} for cancel intent: {err}", dir.display());
                 }
                 if let Err(err) =
-                    artifacts::write_artifact(&dir, CANCEL_FILE, &CancelFile { token, force }, false)
+                    artifacts::write_artifact(
+                        &dir,
+                        CANCEL_FILE,
+                        &CancelFile { token, force, requested_at: Some(requested_at) },
+                        false,
+                    )
                 {
                     // Reconcile republishes committed cancellation intent.
                     tracing::warn!("publishing cancel for attempt {attempt_id}: {err}");
@@ -360,7 +365,11 @@ impl Coordinator {
             let _ = artifacts::write_artifact(
                 &dir,
                 CANCEL_FILE,
-                &CancelFile { token: attempt.launch_token.clone(), force: attempt.cancel_force },
+                &CancelFile {
+                    token: attempt.launch_token.clone(),
+                    force: attempt.cancel_force,
+                    requested_at: attempt.cancel_requested_at,
+                },
                 false,
             );
         }
@@ -534,7 +543,15 @@ impl Coordinator {
             Ok(Some(exec)) if exec.token == attempt.launch_token => {
                 let now = now_ms();
                 let tx = self.conn.transaction()?;
-                db::set_attempt_running(&tx, attempt.id, exec.pid, exec.pgid, exec.start_time, now)?;
+                db::set_attempt_running(
+                    &tx,
+                    attempt.id,
+                    exec.pid,
+                    exec.pgid,
+                    exec.start_time,
+                    exec.started_at.unwrap_or(now),
+                    now,
+                )?;
                 db::update_job_state(&tx, attempt.job_id, JobState::Running, None, now)?;
                 db::append_event(
                     &tx,
@@ -602,8 +619,20 @@ impl Coordinator {
             // Orphaned is only entered from running, which has exec identity.
             return self.quarantine(attempt, "orphaned attempt lacks command identity");
         };
+        let job = db::job_row(&self.conn, attempt.job_id)?.context("job of orphaned attempt")?;
+        let deadline = match (attempt.command_started_at, job.time_limit_ms) {
+            (Some(started_at), Some(limit)) => started_at.checked_add(limit),
+            _ => None,
+        };
+        let deadline_expired = deadline.is_some_and(|deadline| now_ms() >= deadline);
+        let timeout_classifies = deadline.is_some_and(|deadline| {
+            now_ms() >= deadline
+                && attempt.cancel_requested_at.is_none_or(|cancelled_at| cancelled_at > deadline)
+        });
         if !identity::group_possibly_alive(pgid, boot, attempt.cmd_start_time) {
-            let (state, message) = if attempt.cancel_requested {
+            let (state, message) = if attempt.timed_out_at.is_some() {
+                (AttemptState::Failed, "time limit exceeded; orphaned process group drained")
+            } else if attempt.cancel_requested {
                 (AttemptState::Cancelled, "cancelled; orphaned process group drained")
             } else {
                 (AttemptState::Lost, "runner died; command exit status unknown")
@@ -612,7 +641,22 @@ impl Coordinator {
         }
         // The group is still live and there is no runner: the daemon itself
         // delivers committed cancellation signals from outside the group.
-        if attempt.cancel_requested {
+        if deadline_expired {
+            let deadline = deadline.expect("timeout precedence requires a deadline");
+            if timeout_classifies && attempt.timed_out_at.is_none() {
+                db::set_attempt_timed_out(&self.conn, attempt.id, deadline)?;
+            }
+            if self.orphan_term_sent.insert(attempt.id) {
+                unsafe {
+                    libc::killpg(pgid, libc::SIGTERM);
+                }
+            }
+            if now_ms().saturating_sub(deadline) >= self.config.cancel_grace_ms as i64 {
+                unsafe {
+                    libc::killpg(pgid, libc::SIGKILL);
+                }
+            }
+        } else if attempt.cancel_requested {
             if self.orphan_term_sent.insert(attempt.id) {
                 unsafe {
                     libc::killpg(pgid, libc::SIGTERM);
@@ -677,6 +721,7 @@ impl Coordinator {
             ResultOutcome::LaunchFailed | ResultOutcome::AuthorizationTimeout => {
                 (AttemptState::Failed, result.message.clone())
             }
+            ResultOutcome::TimedOut => (AttemptState::Failed, result.message.clone()),
             ResultOutcome::Cancelled => (AttemptState::Cancelled, result.message.clone()),
         };
         self.finalize_attempt_and_job(
@@ -1051,6 +1096,7 @@ impl Coordinator {
                         start_wait_ms: self.config.runner_start_wait_ms,
                         cancel_grace_ms: self.config.cancel_grace_ms,
                         poll_ms: self.config.runner_poll_ms,
+                        time_limit_ms: job.time_limit_ms.map(|value| value as u64),
                     },
                     true,
                 )?;
@@ -1151,6 +1197,7 @@ fn apply_mutation(
                         "name": params.name,
                         "maxParallelRuns": params.max_parallel_runs,
                         "priority": params.priority,
+                        "timeLimitMs": params.time_limit_ms,
                     })
                     .to_string(),
                 ),
@@ -1417,6 +1464,8 @@ fn cancel_job(tx: &Transaction<'_>, job: JobId, force: bool, now: i64) -> ApiRes
                     format!("job {} has no live attempt to cancel", row.id),
                 )
             })?;
+            let requested_at = attempt.cancel_requested_at.unwrap_or(now);
+            let publish_force = attempt.cancel_force || force;
             db::set_attempt_cancel_requested(tx, attempt.id, force, now)?;
             db::append_event(
                 tx,
@@ -1452,14 +1501,16 @@ fn cancel_job(tx: &Transaction<'_>, job: JobId, force: bool, now: i64) -> ApiRes
                     Ok(vec![PostAction::PublishCancel {
                         attempt_id: attempt.id,
                         token: attempt.launch_token.clone(),
-                        force,
+                        force: publish_force,
+                        requested_at,
                     }])
                 }
                 AttemptState::Authorized | AttemptState::Running => {
                     Ok(vec![PostAction::PublishCancel {
                         attempt_id: attempt.id,
                         token: attempt.launch_token.clone(),
-                        force,
+                        force: publish_force,
+                        requested_at,
                     }])
                 }
                 // No runner remains; the daemon delivers the signal itself
@@ -1506,6 +1557,12 @@ fn validate_submission_fs(params: &SubmitParams) -> ApiResult<()> {
     }
     if params.max_attempts == 0 {
         return Err(invalid("maxAttempts must be a positive integer".into()));
+    }
+    if params.time_limit_ms == Some(0) {
+        return Err(invalid("timeLimitMs must be a positive integer".into()));
+    }
+    if params.time_limit_ms.is_some_and(|limit| i64::try_from(limit).is_err()) {
+        return Err(invalid("timeLimitMs is too large".into()));
     }
     if params.args.is_empty() {
         return Err(invalid("a command argument vector is required".into()));

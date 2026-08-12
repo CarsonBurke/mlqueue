@@ -41,16 +41,22 @@ impl Drop for KillOnDrop {
 
 impl TestQueue {
     fn new() -> Self {
+        Self::with_runner_poll_ms(20)
+    }
+
+    fn with_runner_poll_ms(runner_poll_ms: u64) -> Self {
         // Keep the tempdir shallow: the Unix socket path must stay under the
         // 108-byte sockaddr_un limit regardless of TMPDIR.
         let dir = tempfile::Builder::new().prefix("mlq-e2e").tempdir_in("/tmp").unwrap();
         std::fs::write(
             dir.path().join("config.toml"),
-            "version = 1\n\
-             tick_interval_ms = 40\n\
-             runner_poll_ms = 20\n\
-             cancel_grace_ms = 800\n\
-             runner_identity_grace_ms = 5000\n",
+            format!(
+                "version = 1\n\
+                 tick_interval_ms = 40\n\
+                 runner_poll_ms = {runner_poll_ms}\n\
+                 cancel_grace_ms = 800\n\
+                 runner_identity_grace_ms = 5000\n"
+            ),
         )
         .unwrap();
         let mut queue = Self { dir, daemon: None };
@@ -167,6 +173,221 @@ fn submit_runs_captures_logs_and_reports() {
     assert!(stdout.contains("out-marker"), "stdout log: {stdout:?}");
     let stderr = q.cli(&["logs", &job.to_string(), "--stderr"]);
     assert!(stderr.contains("err-marker"), "stderr log: {stderr:?}");
+}
+
+#[test]
+fn time_limit_excludes_queue_wait_but_bounds_the_whole_attempt() {
+    let q = TestQueue::new();
+
+    // This job waits behind the blocker longer than its own time limit, but
+    // should still succeed because the clock begins only when its command is
+    // spawned.
+    let blocker = q.submit(&["--name", "blocker"], &["sleep", "0.6"]);
+    let queued = q.submit(
+        &["--name", "queued-limit", "--time-limit", "250ms"],
+        &["sleep", "0.05"],
+    );
+    q.wait_state(blocker, "succeeded", Duration::from_secs(10));
+    q.wait_state(queued, "succeeded", Duration::from_secs(10));
+    assert_eq!(q.job(queued)["timeLimitMs"], 250);
+
+    // The limit covers the complete submitted command and is hard: a group
+    // that ignores SIGTERM is escalated after the configured grace period.
+    let bounded = q.submit(
+        &["--name", "bounded", "--time-limit", "200ms"],
+        &["sh", "-c", "trap '' TERM; exec sleep 30"],
+    );
+    q.wait_state(bounded, "failed", Duration::from_secs(10));
+    let detail = q.job(bounded);
+    let attempt = &detail["attempts"][0];
+    assert_eq!(attempt["state"], "failed");
+    assert_eq!(attempt["termSignal"], libc::SIGKILL);
+    assert!(
+        attempt["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("time limit of 200 ms exceeded")),
+        "attempt detail: {attempt}"
+    );
+}
+
+#[test]
+fn detached_runner_keeps_the_time_limit_across_daemon_restart() {
+    let mut q = TestQueue::new();
+    let job = q.submit(
+        &["--name", "restart-limit", "--time-limit", "300ms"],
+        &["sleep", "30"],
+    );
+    q.wait_state(job, "running", Duration::from_secs(10));
+
+    q.kill_daemon();
+    std::thread::sleep(Duration::from_millis(600));
+    q.start_daemon();
+
+    q.wait_state(job, "failed", Duration::from_secs(10));
+    let detail = q.job(job);
+    assert!(
+        detail["attempts"][0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("time limit of 300 ms exceeded")),
+        "job detail: {detail}"
+    );
+}
+
+#[test]
+fn an_expired_time_limit_wins_over_a_later_cancellation() {
+    // A long runner poll makes the ordering deterministic: the deadline and
+    // cancellation are both first observed by the same supervision pass.
+    let q = TestQueue::with_runner_poll_ms(500);
+    let job = q.submit(
+        &["--name", "timeout-race", "--time-limit", "200ms"],
+        &["sleep", "30"],
+    );
+    q.wait_state(job, "running", Duration::from_secs(10));
+    std::thread::sleep(Duration::from_millis(300));
+    q.cli(&["cancel", &job.to_string()]);
+
+    q.wait_state(job, "failed", Duration::from_secs(10));
+    let detail = q.job(job);
+    assert!(
+        detail["attempts"][0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("time limit of 200 ms exceeded")),
+        "job detail: {detail}"
+    );
+}
+
+#[test]
+fn daemon_enforces_the_time_limit_after_the_runner_dies() {
+    let q = TestQueue::new();
+    let job = q.submit(
+        &["--name", "orphan-limit", "--time-limit", "300ms"],
+        &["sh", "-c", "trap '' TERM; exec sleep 30"],
+    );
+    q.wait_state(job, "running", Duration::from_secs(10));
+
+    let detail = q.job(job);
+    let attempt_dir = detail["attempts"][0]["logDir"].as_str().unwrap();
+    let identity: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(PathBuf::from(attempt_dir).join("identity.json")).unwrap(),
+    )
+    .unwrap();
+    let runner_pid = identity["runner_pid"].as_i64().unwrap() as i32;
+    assert_eq!(unsafe { libc::kill(runner_pid, libc::SIGKILL) }, 0);
+
+    q.wait_state(job, "failed", Duration::from_secs(10));
+    let detail = q.job(job);
+    assert!(
+        detail["attempts"][0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("time limit exceeded")),
+        "job detail: {detail}"
+    );
+}
+
+#[test]
+fn an_early_cancel_does_not_disable_runner_timeout_escalation() {
+    let q = TestQueue::new();
+    let job = q.submit(
+        &["--name", "early-cancel", "--time-limit", "300ms"],
+        &["sh", "-c", "trap '' TERM; exec sleep 30"],
+    );
+    q.wait_state(job, "running", Duration::from_secs(10));
+    q.cli(&["cancel", &job.to_string()]);
+
+    // Cancellation remains the terminal classification, but the later hard
+    // deadline must still escalate the TERM-ignoring process group.
+    q.wait_state(job, "cancelled", Duration::from_secs(10));
+    assert_eq!(q.job(job)["attempts"][0]["termSignal"], libc::SIGKILL);
+}
+
+#[test]
+fn an_early_cancel_does_not_disable_orphan_timeout_escalation() {
+    let q = TestQueue::new();
+    let job = q.submit(
+        &["--name", "orphan-early-cancel", "--time-limit", "300ms"],
+        &["sh", "-c", "trap '' TERM; exec sleep 30"],
+    );
+    q.wait_state(job, "running", Duration::from_secs(10));
+    q.cli(&["cancel", &job.to_string()]);
+
+    let detail = q.job(job);
+    let attempt_dir = detail["attempts"][0]["logDir"].as_str().unwrap();
+    let identity: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(PathBuf::from(attempt_dir).join("identity.json")).unwrap(),
+    )
+    .unwrap();
+    let runner_pid = identity["runner_pid"].as_i64().unwrap() as i32;
+    assert_eq!(unsafe { libc::kill(runner_pid, libc::SIGKILL) }, 0);
+
+    q.wait_state(job, "cancelled", Duration::from_secs(10));
+}
+
+#[test]
+fn repeated_cancel_preserves_the_first_request_timestamp() {
+    let q = TestQueue::with_runner_poll_ms(500);
+    let job = q.submit(
+        &["--name", "repeat-cancel", "--time-limit", "300ms"],
+        &["sh", "-c", "trap '' TERM; exec sleep 30"],
+    );
+    q.wait_state(job, "running", Duration::from_secs(10));
+    q.cli(&["cancel", &job.to_string()]);
+
+    let attempt_dir = q.job(job)["attempts"][0]["logDir"].as_str().unwrap().to_string();
+    let cancel_path = PathBuf::from(&attempt_dir).join("cancel.json");
+    let first: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cancel_path).unwrap()).unwrap();
+    std::thread::sleep(Duration::from_millis(350));
+    q.cli(&["cancel", &job.to_string(), "--force"]);
+    let second: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cancel_path).unwrap()).unwrap();
+    assert_eq!(first["requested_at"], second["requested_at"]);
+    assert_eq!(second["force"], true);
+
+    q.wait_state(job, "cancelled", Duration::from_secs(10));
+}
+
+#[test]
+fn late_observation_of_a_drained_orphan_is_lost_not_timed_out() {
+    let mut q = TestQueue::new();
+    let marker = q.dir.path().join("orphan-drained-marker");
+    let marker_arg = format!("echo run >> {}; sleep 0.1", marker.display());
+    let job = q.submit(
+        &[
+            "--name",
+            "drained-orphan",
+            "--time-limit",
+            "1s",
+            "--max-attempts",
+            "2",
+        ],
+        &["sh", "-c", &marker_arg],
+    );
+    q.wait_state(job, "running", Duration::from_secs(10));
+
+    let detail = q.job(job);
+    let attempt_dir = detail["attempts"][0]["logDir"].as_str().unwrap();
+    let identity: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(PathBuf::from(attempt_dir).join("identity.json")).unwrap(),
+    )
+    .unwrap();
+    let runner_pid = identity["runner_pid"].as_i64().unwrap() as i32;
+    q.kill_daemon();
+    assert_eq!(unsafe { libc::kill(runner_pid, libc::SIGKILL) }, 0);
+
+    // The command drains before its limit, but recovery does not observe the
+    // empty group until after the nominal deadline.
+    std::thread::sleep(Duration::from_millis(1_200));
+    q.start_daemon();
+    q.wait_state(job, "lost", Duration::from_secs(10));
+    assert_eq!(q.job(job)["attemptCount"], 1, "lost work must not auto-retry");
+    assert_eq!(
+        std::fs::read_to_string(&marker)
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "the unknown command must not be duplicated"
+    );
 }
 
 #[test]

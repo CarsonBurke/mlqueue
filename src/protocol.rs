@@ -11,7 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::domain::{AttemptId, JobId};
 
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 pub const DEFAULT_MAX_FRAME_BYTES: u32 = 1 << 20;
 
 fn is_zero(value: &i64) -> bool {
@@ -111,6 +111,9 @@ impl Op {
     /// by v6 and therefore correctly remain conflicts.
     pub(crate) fn legacy_v5_request_hash(&self) -> Option<String> {
         let Self::Submit(params) = self else { return None };
+        if params.time_limit_ms.is_some() {
+            return None;
+        }
         let legacy = LegacyV5Op::Submit(LegacyV5SubmitParams {
             name: &params.name,
             cwd: &params.cwd,
@@ -166,6 +169,9 @@ pub struct SubmitParams {
     pub priority: i64,
     pub max_attempts: u32,
     pub retry_delay_ms: u64,
+    /// Per-attempt wall-clock limit measured from command spawn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_limit_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,6 +228,8 @@ pub struct JobView {
     pub args: Vec<String>,
     pub max_attempts: u32,
     pub retry_delay_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_limit_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_not_before: Option<i64>,
     pub attempt_count: i64,
@@ -436,11 +444,21 @@ mod tests {
                 priority,
                 max_attempts: 1,
                 retry_delay_ms: 0,
+                time_limit_ms: None,
             })
         };
         assert_eq!(mk(1, 0).request_hash(), mk(1, 0).request_hash());
         assert_ne!(mk(1, 0).request_hash(), mk(2, 0).request_hash());
         assert_ne!(mk(1, 0).request_hash(), mk(1, -1).request_hash());
+
+        let mut limited_params = match mk(1, 0) {
+            Op::Submit(params) => params,
+            _ => unreachable!(),
+        };
+        limited_params.time_limit_ms = Some(5_000);
+        let limited = Op::Submit(limited_params);
+        assert_ne!(mk(1, 0).request_hash(), limited.request_hash());
+        assert!(limited.legacy_v5_request_hash().is_none());
 
         let default_json = serde_json::to_string(&mk(1, 0)).unwrap();
         assert!(!default_json.contains("priority"), "{default_json}");
@@ -449,6 +467,8 @@ mod tests {
             prioritized_json.contains("\"priority\":1"),
             "{prioritized_json}"
         );
+        let limited_json = serde_json::to_string(&limited).unwrap();
+        assert!(limited_json.contains("\"timeLimitMs\":5000"), "{limited_json}");
 
         let current = mk(1, 0);
         let legacy_json = concat!(

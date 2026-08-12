@@ -40,6 +40,9 @@ pub struct CommandFile {
     pub start_wait_ms: u64,
     pub cancel_grace_ms: u64,
     pub poll_ms: u64,
+    /// Absent on artifacts created before wall-clock limits were supported.
+    #[serde(default)]
+    pub time_limit_ms: Option<u64>,
 }
 
 /// Written by the runner immediately after starting.
@@ -66,6 +69,9 @@ pub struct ExecFile {
     pub pgid: i32,
     pub start_time: i64,
     pub boot_id: String,
+    /// Wall-clock spawn timestamp for daemon-side orphan deadline recovery.
+    #[serde(default)]
+    pub started_at: Option<i64>,
 }
 
 /// Durable cancellation intent, published by the daemon.
@@ -73,6 +79,9 @@ pub struct ExecFile {
 pub struct CancelFile {
     pub token: String,
     pub force: bool,
+    /// Commit timestamp used to order cancellation against a time limit.
+    #[serde(default)]
+    pub requested_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +93,8 @@ pub enum ResultOutcome {
     LaunchFailed,
     /// A delivered cancellation signal terminated the run.
     Cancelled,
+    /// The per-attempt wall-clock limit expired.
+    TimedOut,
     /// The runner gave up waiting for launch authorization.
     AuthorizationTimeout,
 }
@@ -218,9 +229,9 @@ mod tests {
         // One-shot markers cannot be replaced.
         assert!(write_artifact(dir.path(), START_FILE, &start, true).is_err());
         // Upgradable intent can.
-        let cancel = CancelFile { token: "t".into(), force: false };
+        let cancel = CancelFile { token: "t".into(), force: false, requested_at: Some(1) };
         write_artifact(dir.path(), CANCEL_FILE, &cancel, false).unwrap();
-        let cancel = CancelFile { token: "t".into(), force: true };
+        let cancel = CancelFile { token: "t".into(), force: true, requested_at: Some(2) };
         write_artifact(dir.path(), CANCEL_FILE, &cancel, false).unwrap();
         let read: CancelFile = read_artifact(&dir.path().join(CANCEL_FILE)).unwrap().unwrap();
         assert!(read.force);

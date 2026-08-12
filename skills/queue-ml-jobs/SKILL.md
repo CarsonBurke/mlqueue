@@ -24,6 +24,10 @@ mlq submit --name NAME --max-parallel-runs N \
   --cwd /absolute/repository/path -- COMMAND...
 ```
 
+- Add `--time-limit DURATION` when the user wants a hard per-attempt
+  wall-clock bound. Queue wait is excluded, but command startup, compilation,
+  and descendants count toward the limit.
+
 - Enqueue independent jobs you can start now. For sequential or conditional
   follow-ups, `mlq wait JOB`, inspect the outcome (and metrics if needed), then
   submit the next job. Treat submission alone as incomplete unless the user

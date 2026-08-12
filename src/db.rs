@@ -167,6 +167,13 @@ const MIGRATIONS: &[&str] = &[
     DROP TABLE _mlqueue_v3_blocked_jobs;
     DROP TABLE IF EXISTS dependencies;
     "#,
+    // v4: optional per-attempt wall-clock limit, measured from command spawn.
+    r#"
+    ALTER TABLE jobs ADD COLUMN time_limit_ms INTEGER
+        CHECK (time_limit_ms IS NULL OR time_limit_ms > 0);
+    ALTER TABLE attempts ADD COLUMN command_started_at INTEGER;
+    ALTER TABLE attempts ADD COLUMN timed_out_at INTEGER;
+    "#,
 ];
 
 pub fn open(path: &Path) -> Result<Connection> {
@@ -219,6 +226,7 @@ pub struct JobRow {
     pub priority: i64,
     pub max_attempts: i64,
     pub retry_delay_ms: i64,
+    pub time_limit_ms: Option<i64>,
     pub retry_not_before: Option<i64>,
     pub attempt_count: i64,
     pub state_reason: Option<String>,
@@ -241,6 +249,7 @@ pub struct AttemptRow {
     pub cmd_pid: Option<i32>,
     pub cmd_pgid: Option<i32>,
     pub cmd_start_time: Option<i64>,
+    pub command_started_at: Option<i64>,
     pub exit_code: Option<i32>,
     pub term_signal: Option<i32>,
     pub cancel_requested: bool,
@@ -251,6 +260,7 @@ pub struct AttemptRow {
     pub authorized_at: Option<i64>,
     pub running_at: Option<i64>,
     pub finished_at: Option<i64>,
+    pub timed_out_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -276,8 +286,8 @@ pub struct EventRow {
 }
 
 const JOB_COLUMNS: &str = "id, name, state, cwd, args, env, max_parallel_runs, priority, \
-     max_attempts, retry_delay_ms, retry_not_before, attempt_count, state_reason, created_at, \
-     updated_at, finished_at";
+     max_attempts, retry_delay_ms, time_limit_ms, retry_not_before, attempt_count, state_reason, \
+     created_at, updated_at, finished_at";
 
 fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRow> {
     let state: String = row.get(2)?;
@@ -294,19 +304,20 @@ fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRow> {
         priority: row.get(7)?,
         max_attempts: row.get(8)?,
         retry_delay_ms: row.get(9)?,
-        retry_not_before: row.get(10)?,
-        attempt_count: row.get(11)?,
-        state_reason: row.get(12)?,
-        created_at: row.get(13)?,
-        updated_at: row.get(14)?,
-        finished_at: row.get(15)?,
+        time_limit_ms: row.get(10)?,
+        retry_not_before: row.get(11)?,
+        attempt_count: row.get(12)?,
+        state_reason: row.get(13)?,
+        created_at: row.get(14)?,
+        updated_at: row.get(15)?,
+        finished_at: row.get(16)?,
     })
 }
 
 const ATTEMPT_COLUMNS: &str = "id, job_id, number, state, launch_token, max_parallel_runs, \
      runner_pid, runner_start_time, runner_boot_id, cmd_pid, cmd_pgid, cmd_start_time, \
-     exit_code, term_signal, cancel_requested, cancel_force, cancel_requested_at, message, \
-     created_at, authorized_at, running_at, finished_at";
+     command_started_at, exit_code, term_signal, cancel_requested, cancel_force, \
+     cancel_requested_at, message, created_at, authorized_at, running_at, finished_at, timed_out_at";
 
 fn attempt_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttemptRow> {
     let state: String = row.get(3)?;
@@ -323,16 +334,18 @@ fn attempt_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttemptRow> {
         cmd_pid: row.get(9)?,
         cmd_pgid: row.get(10)?,
         cmd_start_time: row.get(11)?,
-        exit_code: row.get(12)?,
-        term_signal: row.get(13)?,
-        cancel_requested: row.get::<_, i64>(14)? != 0,
-        cancel_force: row.get::<_, i64>(15)? != 0,
-        cancel_requested_at: row.get(16)?,
-        message: row.get(17)?,
-        created_at: row.get(18)?,
-        authorized_at: row.get(19)?,
-        running_at: row.get(20)?,
-        finished_at: row.get(21)?,
+        command_started_at: row.get(12)?,
+        exit_code: row.get(13)?,
+        term_signal: row.get(14)?,
+        cancel_requested: row.get::<_, i64>(15)? != 0,
+        cancel_force: row.get::<_, i64>(16)? != 0,
+        cancel_requested_at: row.get(17)?,
+        message: row.get(18)?,
+        created_at: row.get(19)?,
+        authorized_at: row.get(20)?,
+        running_at: row.get(21)?,
+        finished_at: row.get(22)?,
+        timed_out_at: row.get(23)?,
     })
 }
 
@@ -343,8 +356,8 @@ fn attempt_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttemptRow> {
 pub fn insert_job(conn: &Connection, params: &SubmitParams, now: i64) -> Result<JobId> {
     conn.execute(
         "INSERT INTO jobs (name, state, cwd, args, env, max_parallel_runs, priority, \
-         max_attempts, retry_delay_ms, attempt_count, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?10)",
+         max_attempts, retry_delay_ms, time_limit_ms, attempt_count, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, ?11)",
         params![
             params.name,
             JobState::Queued.as_str(),
@@ -355,6 +368,7 @@ pub fn insert_job(conn: &Connection, params: &SubmitParams, now: i64) -> Result<
             params.priority,
             params.max_attempts,
             params.retry_delay_ms as i64,
+            params.time_limit_ms.map(i64::try_from).transpose()?,
             now,
         ],
     )?;
@@ -665,12 +679,29 @@ pub fn set_attempt_running(
     cmd_pid: i32,
     cmd_pgid: i32,
     cmd_start_time: i64,
+    command_started_at: i64,
     now: i64,
 ) -> Result<()> {
     conn.execute(
         "UPDATE attempts SET state = ?2, cmd_pid = ?3, cmd_pgid = ?4, cmd_start_time = ?5, \
-         running_at = ?6 WHERE id = ?1",
-        params![attempt, AttemptState::Running.as_str(), cmd_pid, cmd_pgid, cmd_start_time, now],
+         command_started_at = ?6, running_at = ?7 WHERE id = ?1",
+        params![
+            attempt,
+            AttemptState::Running.as_str(),
+            cmd_pid,
+            cmd_pgid,
+            cmd_start_time,
+            command_started_at,
+            now
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn set_attempt_timed_out(conn: &Connection, attempt: AttemptId, deadline: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE attempts SET timed_out_at = COALESCE(timed_out_at, ?2) WHERE id = ?1",
+        params![attempt, deadline],
     )?;
     Ok(())
 }
@@ -979,6 +1010,7 @@ mod tests {
             priority: 0,
             max_attempts: 1,
             retry_delay_ms: 0,
+            time_limit_ms: None,
         }
     }
 
@@ -1007,6 +1039,38 @@ mod tests {
         assert_eq!(job.name, "a");
         assert_eq!(job.state, JobState::Queued);
         assert_eq!(job.priority, -2);
+        assert_eq!(job.time_limit_ms, None);
+    }
+
+    #[test]
+    fn time_limit_is_persisted() {
+        let conn = open_in_memory().unwrap();
+        let mut params = submit_params("limited", 1);
+        params.time_limit_ms = Some(12_345);
+        let id = insert_job(&conn, &params, 1000).unwrap();
+        assert_eq!(job_row(&conn, id).unwrap().unwrap().time_limit_ms, Some(12_345));
+    }
+
+    #[test]
+    fn v3_database_migrates_existing_jobs_as_unlimited() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        for migration in &MIGRATIONS[..3] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 3).unwrap();
+        conn.execute_batch(
+            r#"
+            INSERT INTO jobs (
+                name, state, cwd, args, env, max_parallel_runs, priority,
+                max_attempts, retry_delay_ms, attempt_count, created_at, updated_at
+            ) VALUES ('old', 'queued', '/tmp', '["true"]', '{}', 1, 0, 1, 0, 0, 1, 1);
+            "#,
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        assert_eq!(job_row(&conn, 1).unwrap().unwrap().time_limit_ms, None);
     }
 
     #[test]

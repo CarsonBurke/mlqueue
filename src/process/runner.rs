@@ -147,6 +147,12 @@ fn run(dir: &Path) -> anyhow::Result<()> {
                 Some(format!("launch failed: {err}")));
         }
     };
+    // The limit starts when the command is successfully spawned. This
+    // intentionally includes any setup or compilation performed by the
+    // submitted argv, while excluding time spent waiting in the queue.
+    let command_started_at = now_ms();
+    let command_started = Instant::now();
+    let time_limit = command.time_limit_ms.map(Duration::from_millis);
     let child_pid = child.id() as i32;
     let pgid = child_pid;
     let child_start_time =
@@ -160,6 +166,7 @@ fn run(dir: &Path) -> anyhow::Result<()> {
             pgid,
             start_time: child_start_time,
             boot_id: identity::boot_id()?,
+            started_at: Some(command_started_at),
         },
         true,
     )?;
@@ -175,6 +182,7 @@ fn run(dir: &Path) -> anyhow::Result<()> {
     let mut cancel_too_late = false;
     let mut kill_at: Option<Instant> = None;
     let mut kill_sent = false;
+    let mut timed_out = false;
     let mut empty_scans = 0u32;
     let grace = Duration::from_millis(command.cancel_grace_ms);
     loop {
@@ -191,16 +199,67 @@ fn run(dir: &Path) -> anyhow::Result<()> {
             log_line(dir, &format!("command leader exited: {status}"));
             exit_status = Some(status);
         }
-        if let Some(cancel) = read_cancel(dir, &command.token) {
+        // Prove group completion before considering control requests or the
+        // deadline. If the first empty scan lands at the deadline, wait for
+        // the confirming scan instead of misreporting already-finished work.
+        let group_empty = exit_status.is_some() && identity::group_empty_except(pgid, child_pid);
+        if group_empty {
+            empty_scans += 1;
+            if empty_scans >= 2 {
+                break;
+            }
+        } else {
+            empty_scans = 0;
+        }
+        let cancel = read_cancel(dir, &command.token);
+        let deadline_expired = time_limit.is_some_and(|limit| command_started.elapsed() >= limit);
+        let timeout_deadline = command.time_limit_ms.and_then(|limit| {
+            i64::try_from(limit)
+                .ok()
+                .and_then(|limit| command_started_at.checked_add(limit))
+        });
+        let timeout_classifies = deadline_expired
+            && cancel.as_ref().is_none_or(|cancel| {
+                match (cancel.requested_at, timeout_deadline) {
+                    (Some(cancelled_at), Some(deadline)) => cancelled_at > deadline,
+                    // Old cancellation artifacts predate time limits and
+                    // retain cancellation precedence for compatibility.
+                    _ => false,
+                }
+            });
+        if deadline_expired && !group_empty {
+            if timeout_classifies && !timed_out {
+                timed_out = true;
+                log_line(
+                    dir,
+                    &format!(
+                        "time limit of {} ms exceeded; delivering SIGTERM to group {pgid}",
+                        command.time_limit_ms.expect("deadline requires a time limit")
+                    ),
+                );
+            }
             if !term_sent {
-                log_line(dir, &format!("delivering SIGTERM to group {pgid}"));
                 signal_group(pgid, libc::SIGTERM);
                 term_sent = true;
+            }
+            // Unlike a normal cancellation, a time limit is a hard bound:
+            // always escalate if the process group ignores SIGTERM.
+            if kill_at.is_none() && !kill_sent {
+                kill_at = Some(Instant::now() + grace);
+            }
+        }
+        if let Some(cancel) = cancel {
+            if !timed_out {
                 if exit_status.is_none() {
                     cancelled_before_exit = true;
                 } else {
                     cancel_too_late = true;
                 }
+            }
+            if !term_sent {
+                log_line(dir, &format!("delivering SIGTERM to group {pgid}"));
+                signal_group(pgid, libc::SIGTERM);
+                term_sent = true;
             }
             if cancel.force && kill_at.is_none() && !kill_sent {
                 kill_at = Some(Instant::now() + grace);
@@ -214,18 +273,6 @@ fn run(dir: &Path) -> anyhow::Result<()> {
             kill_sent = true;
             kill_at = None;
         }
-        // The lease is not releasable until the complete process group is
-        // gone, including reparented descendants the runner cannot waitpid.
-        // Two consecutive empty scans close the window where a member forks
-        // and exits between /proc directory reads.
-        if exit_status.is_some() && identity::group_empty_except(pgid, child_pid) {
-            empty_scans += 1;
-            if empty_scans >= 2 {
-                break;
-            }
-        } else {
-            empty_scans = 0;
-        }
         std::thread::sleep(poll);
     }
 
@@ -236,7 +283,17 @@ fn run(dir: &Path) -> anyhow::Result<()> {
     }
     drop(child);
     let status = exit_status.expect("loop exits only after leader exit");
-    let (outcome, exit_code, term_signal, message) = if cancelled_before_exit {
+    let (outcome, exit_code, term_signal, message) = if timed_out {
+        (
+            ResultOutcome::TimedOut,
+            status.code(),
+            status.signal(),
+            Some(format!(
+                "time limit of {} ms exceeded",
+                command.time_limit_ms.expect("timed out requires a time limit")
+            )),
+        )
+    } else if cancelled_before_exit {
         (
             ResultOutcome::Cancelled,
             status.code(),

@@ -222,6 +222,11 @@ struct SubmitArgs {
     /// Delay before an automatic retry (e.g. "30s", "5m").
     #[arg(long, value_parser = humantime::parse_duration)]
     retry_delay: Option<Duration>,
+    /// Stop each attempt after this much wall-clock time (e.g. "30m", "2h").
+    /// Time spent waiting in the queue is excluded; command startup and
+    /// compilation are included.
+    #[arg(long, value_parser = humantime::parse_duration)]
+    time_limit: Option<Duration>,
     /// Explicit KEY=VALUE environment entry (repeatable).
     #[arg(long = "env")]
     env: Vec<String>,
@@ -430,6 +435,16 @@ fn submit(paths: &Paths, args: SubmitArgs, key: String) -> Result<()> {
             .map(|base| base.to_string_lossy().into_owned())
             .unwrap_or_else(|| args.command[0].clone()),
     };
+    let time_limit_ms = args
+        .time_limit
+        .map(|limit| {
+            let millis = u64::try_from(limit.as_millis()).context("--time-limit is too large")?;
+            if millis == 0 {
+                bail!("--time-limit must be at least 1ms");
+            }
+            Ok(millis)
+        })
+        .transpose()?;
     let params = SubmitParams {
         name,
         cwd: cwd.display().to_string(),
@@ -439,6 +454,7 @@ fn submit(paths: &Paths, args: SubmitArgs, key: String) -> Result<()> {
         priority: args.priority,
         max_attempts: args.max_attempts,
         retry_delay_ms: args.retry_delay.map(|delay| delay.as_millis() as u64).unwrap_or(0),
+        time_limit_ms,
     };
     let reply = send(paths, Op::Submit(params), Some(key))?;
     let Reply::Submitted { job } = reply else { bail!(client::unexpected("submitted job")) };
@@ -917,6 +933,12 @@ fn print_job_detail(job: &JobView) {
     println!("  cwd:              {}", job.cwd);
     println!("  command:          {}", shell_join(&job.args));
     println!("  attempts:         {}/{}", job.attempt_count, job.max_attempts);
+    if let Some(limit) = job.time_limit_ms {
+        println!(
+            "  time limit:       {} per attempt",
+            humantime::format_duration(Duration::from_millis(limit))
+        );
+    }
     for attempt in &job.attempts {
         let outcome = match (attempt.exit_code, attempt.term_signal) {
             (Some(code), _) => format!(" exit {code}"),
@@ -1252,6 +1274,7 @@ mod tests {
             args: vec!["true".into()],
             max_attempts: 1,
             retry_delay_ms: 0,
+            time_limit_ms: None,
             retry_not_before: None,
             attempt_count: finished_at.is_some() as i64,
             created_at: id,
@@ -1283,6 +1306,18 @@ mod tests {
             panic!("expected submit command")
         };
         assert_eq!(args.priority, -1);
+    }
+
+    #[test]
+    fn submit_parses_a_wall_clock_time_limit() {
+        let cli = Cli::try_parse_from([
+            "mlq", "submit", "--time-limit", "1h 30m", "--", "true",
+        ])
+        .unwrap();
+        let Command::Submit(args) = cli.command else {
+            panic!("expected submit command")
+        };
+        assert_eq!(args.time_limit, Some(Duration::from_secs(90 * 60)));
     }
 
     #[test]

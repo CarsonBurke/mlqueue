@@ -146,6 +146,7 @@ pub fn job_view(
         args: job.args.clone(),
         max_attempts: job.max_attempts as u32,
         retry_delay_ms: job.retry_delay_ms as u64,
+        time_limit_ms: job.time_limit_ms.map(|value| value as u64),
         retry_not_before: job.retry_not_before,
         attempt_count: job.attempt_count,
         created_at: job.created_at,
