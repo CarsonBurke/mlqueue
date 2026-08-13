@@ -24,14 +24,19 @@ mlq submit --name NAME --max-parallel-runs N \
   --cwd /absolute/repository/path -- COMMAND...
 ```
 
-- Add `--time-limit DURATION` when the user wants a hard per-attempt
-  wall-clock bound. Queue wait is excluded, but command startup, compilation,
-  and descendants count toward the limit.
+- Add `--time-limit DURATION` when a hard per-attempt wall-clock bound is
+  operationally reasonable. Choose a defensible, generous duration from
+  workload evidence; queue wait is excluded, but command startup, compilation,
+  and descendants count toward the limit. Prefer a limit when an overlong run
+  likely indicates a hang or would waste shared resources. Leave the job
+  unlimited when valid runtimes are too variable to bound safely.
 
 - Enqueue independent jobs you can start now. For sequential or conditional
   follow-ups, `mlq wait JOB`, inspect the outcome (and metrics if needed), then
-  submit the next job. Treat submission alone as incomplete unless the user
-  explicitly requests detached or fire-and-forget execution.
+  submit the next job. Treat submission alone as complete only when successful
+  enqueueing is itself the requested outcome; otherwise monitor the job and
+  continue the task from its result.
+- Don't waste tokens constantly polling.
 - Pass required environment explicitly. Values supplied through `--env` are
   stored as plaintext; make workloads read secrets from credential files.
 - Change a queued or running job with
@@ -43,4 +48,5 @@ mlq submit --name NAME --max-parallel-runs N \
   jump the queue for your own work.
 - Use `mlq status`, `show`, and `logs` to observe work, and `cancel` or
   `retry` to control it. Report the submitted job ID, chosen parallel limit,
-  and any nonzero priority.
+  chosen time limit (or the decision to leave it unlimited), and any nonzero
+  priority.
