@@ -103,15 +103,33 @@ value safe next to *arbitrary* other managed jobs (`1` when type-dependent).
 
 ### Queue rank
 
-Eligible jobs (not held, retry delay elapsed) are ordered by:
+Eligible jobs (dependencies satisfied, not held, retry delay elapsed) are
+ordered by:
 
 1. **priority** descending  
-2. **submission sequence** ascending (job id / FIFO)
+2. **readiness sequence** ascending (FIFO from when the job became runnable)
 
 Priority never preempts an active lease. Strict priority can starve lower
 priorities under sustained higher-priority arrivals.
 
-### Protection and backfill (semantics v3)
+### Dependency readiness
+
+Submission may attach immutable backward edges to existing jobs. Repeated
+conditions are ANDed:
+
+- `succeeded`: the parent must reach `succeeded`; any other terminal outcome
+  permanently skips the child.
+- `terminal`: any terminal parent outcome satisfies the edge, for cleanup and
+  unconditional follow-up work.
+
+Every edge records its first observed terminal parent outcome. Resolution is
+monotonic: manually retrying a failed or lost parent does not revive skipped
+children or retract already-ready terminal follow-ups. Automatic attempts do
+not terminalize the parent between retries, so children wait for the final
+outcome. A fixed-point transaction cascades skips and assigns readiness order
+before admission observes the new state.
+
+### Protection and backfill (semantics v4)
 
 When the highest-ranked eligible job cannot start only because of active
 limits, it becomes the **protected** job. One global reservation is persisted.
@@ -120,7 +138,7 @@ limits, it becomes the **protected** job. One global reservation is persisted.
    (`prepared` / `authorized` / `running`), equal-priority eligible jobs may
    backfill open slots **once each**. Lower priorities cannot.
 2. **Freeze** — when the last initial blocker stops advancing, pin
-   `max(job sequence)` as the backfill cutoff exactly once.
+   `max(readiness sequence)` as the backfill cutoff exactly once.
 3. **Frozen frontier** — only equal-priority, unconsumed jobs at or before the
    cutoff may still bypass; later submissions wait.
 4. **Protected first** — whenever the formula allows the protected job, it
@@ -163,12 +181,45 @@ operator migrates or invalidates the reservation (`admission_blocked`).
 - Unix stream socket, big-endian `u32` length-prefixed JSON
 - Hard frame limit checked before allocation
 - Peer UID must match the daemon
-- Protocol version is exact-match (currently **6**)
+- Protocol version is exact-match (currently **8**)
 - Mutations require a durable **idempotency key**; identical retry returns the
   original result; same key + different payload → conflict
 
 Log bytes are not streamed through the daemon. `mlq logs` asks for paths and
 reads files directly (same user, same machine).
+
+### Streaming subscriptions
+
+`{"op":{"type":"subscribe"}}` is a read op that changes the *shape* of the
+connection, not the framing: after one subscribe request, that connection stops
+being request/response and becomes a one-way stream of `status` replies.
+
+- Frame 1 is the current queue snapshot, echoing the subscribe `request_id`;
+  every later frame is another complete snapshot with the same `request_id`.
+  Consumers never replay events to reconstruct state.
+- The coordinator publishes the committed event id on a `tokio::sync::watch`
+  channel once per handled message — after the transaction closed, before the
+  reply leaves for the socket. Every committed change appends an event, so that
+  cursor is a single choke point covering mutations, reconciliation and
+  scheduling passes, and no lock is ever held across a subscriber's socket I/O.
+  The one snapshot field derived outside the event log is `admissionBlocked`
+  (in-memory, set by a scheduling pass), so the coordinator compares a mirror of
+  it alongside the cursor; any future field derived outside the log needs the
+  same treatment.
+- Coalescing is inherent: `watch` keeps only the newest revision, so a burst
+  (or a slow reader) collapses into one refresh instead of a queue of frames.
+  A refresh whose snapshot is byte-identical to the last one sent is dropped.
+- The idle read timeout does not apply to a subscription — silence is the normal
+  state of a quiet queue. Two bounds replace it: streams may occupy at most a
+  quarter of `max_connections` (an excess subscriber is refused with
+  `too_many_subscriptions` instead of starving request/response clients), and a
+  frame write that stalls for the idle timeout ends the connection, so a peer
+  that stops reading cannot hold its slot forever.
+- The stream ends on client EOF (or any further bytes from the client, which
+  would desynchronise it) and on daemon shutdown, which drops the coordinator's
+  sender.
+- Purely additive: no new reply type, no view change, so `PROTOCOL_VERSION`
+  stays 8. An older daemon rejects `subscribe` as a malformed request.
 
 ## Filesystem layout
 
@@ -196,15 +247,16 @@ runtime, so a recreated `$XDG_RUNTIME_DIR` cannot create a second lock.
 SQLite: foreign keys, WAL, `synchronous=FULL`, busy timeout, embedded
 migrations, one serialized writer.
 
-The v3 migration removes dependency edges. A queued or held job whose legacy
-prerequisites were not yet satisfied is cancelled rather than allowed to run
-out of order, with a migration-time terminal timestamp and audit event;
-already-terminal `skipped` records remain readable as historical state, but
-new versions never create that state.
+The v3 migration removed the original dependency edges. A queued or held job
+whose legacy prerequisites were unresolved was cancelled rather than allowed
+to run out of order. Those deleted edges cannot be reconstructed. Migration v5
+restores dependencies for new submissions with latched outcomes and a durable
+readiness sequence; historical cancelled and skipped records remain truthful.
 
 | Table | Role |
 |---|---|
-| `jobs` | Command, cwd, env, state, concurrency/priority, retries, optional time limit, timestamps |
+| `jobs` | Command, cwd, env, state, concurrency/priority, readiness order, retries, optional time limit, timestamps |
+| `dependencies` | Immutable parent conditions with monotonic observed-outcome resolution |
 | `attempts` | Launch token, state, copied limit, runner/command identity, exit |
 | `run_leases` | One active lease per attempt; source of truth for the formula |
 | `scheduler_reservation` | Protected job, cutoff, initial blockers, semantics version |
@@ -212,14 +264,17 @@ new versions never create that state.
 | `operations` | Idempotency keys, request hash, stored response / tombstone |
 | `events` | Append-only audit log |
 
-Job IDs are `AUTOINCREMENT` rowids and double as submission sequence. Cutoff
-reads `sqlite_sequence` so retention deletes cannot lower the frontier.
+Job IDs are `AUTOINCREMENT` rowids. Scheduling uses a separate durable
+readiness sequence, so pre-enqueued dependency waiters do not reserve old FIFO
+positions. Its monotonic counter also prevents retention from lowering a
+frozen frontier.
 
 ## Job and attempt states
 
 ```text
 Job:
   held ⇄ queued → starting → running → succeeded | failed | cancelled | lost
+  queued | held → skipped (an observed success prerequisite became impossible)
   starting | running → needs_attention → lost | cancelled
 
 Attempt (persisted):

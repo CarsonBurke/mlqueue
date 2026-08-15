@@ -45,6 +45,12 @@ impl TestQueue {
     }
 
     fn with_runner_poll_ms(runner_poll_ms: u64) -> Self {
+        Self::with_config(runner_poll_ms, "")
+    }
+
+    /// `extra` appends config keys for one test; TOML rejects duplicates, so
+    /// they must not already be set below.
+    fn with_config(runner_poll_ms: u64, extra: &str) -> Self {
         // Keep the tempdir shallow: the Unix socket path must stay under the
         // 108-byte sockaddr_un limit regardless of TMPDIR.
         let dir = tempfile::Builder::new().prefix("mlq-e2e").tempdir_in("/tmp").unwrap();
@@ -55,13 +61,19 @@ impl TestQueue {
                  tick_interval_ms = 40\n\
                  runner_poll_ms = {runner_poll_ms}\n\
                  cancel_grace_ms = 800\n\
-                 runner_identity_grace_ms = 5000\n"
+                 runner_identity_grace_ms = 5000\n\
+                 idle_timeout_ms = 200\n\
+                 {extra}"
             ),
         )
         .unwrap();
         let mut queue = Self { dir, daemon: None };
         queue.start_daemon();
         queue
+    }
+
+    fn socket(&self) -> PathBuf {
+        self.dir.path().join("runtime/mlqd.sock")
     }
 
     fn state_dir(&self) -> PathBuf {
@@ -93,6 +105,13 @@ impl TestQueue {
     fn kill_daemon(&mut self) {
         let mut child = self.daemon.take().expect("daemon running");
         child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    /// Graceful shutdown: SIGTERM, then wait for the daemon to exit.
+    fn stop_daemon(&mut self) {
+        let mut child = self.daemon.take().expect("daemon running");
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
         child.wait().unwrap();
     }
 
@@ -145,6 +164,26 @@ impl TestQueue {
     fn status(&self) -> serde_json::Value {
         self.cli_json(&["status", "--json"])
     }
+
+    /// Start `mlq subscribe` and read its NDJSON stream on a helper thread, so
+    /// a test can wait for the next snapshot with a deadline.
+    fn subscribe(&self) -> Subscriber {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_mlq"));
+        self.apply_env(&mut cmd);
+        cmd.arg("subscribe").stdout(Stdio::piped()).stderr(Stdio::null());
+        let mut child = cmd.spawn().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (tx, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(stdout).lines() {
+                if tx.send(line.unwrap()).is_err() {
+                    return;
+                }
+            }
+        });
+        Subscriber { child: KillOnDrop(Some(child)), lines }
+    }
 }
 
 impl Drop for TestQueue {
@@ -153,6 +192,207 @@ impl Drop for TestQueue {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+}
+
+/// A live `mlq subscribe` process plus its decoded snapshot stream.
+struct Subscriber {
+    child: KillOnDrop,
+    lines: std::sync::mpsc::Receiver<String>,
+}
+
+impl Subscriber {
+    fn next_snapshot(&self, timeout: Duration) -> serde_json::Value {
+        let line = self.lines.recv_timeout(timeout).expect("a snapshot before the deadline");
+        serde_json::from_str(&line).expect("every snapshot line is valid JSON")
+    }
+
+    /// Read frames until one satisfies `matches`; the frames skipped on the way
+    /// are reported if the deadline passes first.
+    fn wait_snapshot(
+        &self,
+        what: &str,
+        timeout: Duration,
+        mut matches: impl FnMut(&serde_json::Value) -> bool,
+    ) -> serde_json::Value {
+        let deadline = Instant::now() + timeout;
+        let mut skipped = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let line = self
+                .lines
+                .recv_timeout(remaining)
+                .unwrap_or_else(|err| panic!("no snapshot showed {what} ({err}); saw {skipped:#?}"));
+            let snapshot: serde_json::Value =
+                serde_json::from_str(&line).expect("every snapshot line is valid JSON");
+            if matches(&snapshot) {
+                return snapshot;
+            }
+            skipped.push(snapshot);
+        }
+    }
+
+    /// An unchanged queue must produce no frames while keeping the stream open.
+    fn expect_silence(&self, within: Duration) {
+        use std::sync::mpsc::RecvTimeoutError;
+        match self.lines.recv_timeout(within) {
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => panic!("the subscription was closed while idle"),
+            Ok(line) => panic!("unexpected snapshot on an unchanged queue: {line}"),
+        }
+    }
+
+    /// The daemon shutting down must end the stream and exit `mlq` cleanly.
+    fn expect_clean_end(&mut self, timeout: Duration) {
+        use std::sync::mpsc::RecvTimeoutError;
+        let deadline = Instant::now() + timeout;
+        // Drain any final snapshot still in flight; `Disconnected` is EOF.
+        while let Ok(_) | Err(RecvTimeoutError::Timeout) =
+            self.lines.recv_timeout(Duration::from_millis(50))
+        {
+            assert!(Instant::now() < deadline, "the subscription did not end");
+        }
+        let child = self.child.0.as_mut().expect("subscriber running");
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "mlq subscribe did not exit");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(status.code(), Some(0), "a clean daemon shutdown is not a client error");
+    }
+}
+
+#[test]
+fn subscribe_streams_snapshots_outlives_idle_and_ends_on_shutdown() {
+    let mut q = TestQueue::new();
+    let mut subscriber = q.subscribe();
+
+    // One complete snapshot arrives immediately, before anything changes.
+    let initial = subscriber.next_snapshot(Duration::from_secs(10));
+    assert!(initial["jobs"].as_array().unwrap().is_empty(), "{initial}");
+    assert_eq!(initial["activeLeases"], 0);
+    assert_eq!(initial["admissionBlocked"], false);
+
+    // Idle for longer than the configured idle timeout (200ms, floored to 1s by
+    // the daemon): an unchanged queue must stay silent and stay connected.
+    subscriber.expect_silence(Duration::from_millis(1_500));
+
+    // Work submitted on another connection is pushed to this one, and a
+    // runner-driven transition arrives without any polling.
+    let blocker = q.submit(&["--name", "blocker"], &["sleep", "30"]);
+    let running =
+        subscriber.wait_snapshot("the blocker running", Duration::from_secs(10), |snapshot| {
+            job_in(snapshot, blocker)["state"] == "running"
+        });
+    assert_eq!(running["activeLeases"], 1, "{running}");
+    assert_eq!(running["effectiveLimit"], 1, "{running}");
+
+    // Client-driven transitions arrive in order, each as a whole snapshot.
+    let waiting = q.submit(&["--name", "waiting"], &["sh", "-c", "true"]);
+    subscriber.wait_snapshot("the second job queued", Duration::from_secs(10), |snapshot| {
+        job_in(snapshot, waiting)["state"] == "queued"
+    });
+    q.cli(&["hold", &waiting.to_string()]);
+    subscriber.wait_snapshot("the job held", Duration::from_secs(10), |snapshot| {
+        job_in(snapshot, waiting)["state"] == "held"
+    });
+    q.cli(&["release", &waiting.to_string()]);
+    subscriber.wait_snapshot("the job released", Duration::from_secs(10), |snapshot| {
+        job_in(snapshot, waiting)["state"] == "queued"
+    });
+
+    // Freeing the lease lets the queued job run through to its outcome.
+    q.cli(&["cancel", &blocker.to_string()]);
+    let done =
+        subscriber.wait_snapshot("the job succeeding", Duration::from_secs(20), |snapshot| {
+            job_in(snapshot, waiting)["state"] == "succeeded"
+        });
+    assert_eq!(job_in(&done, blocker)["state"], "cancelled", "{done}");
+
+    // Shutting the daemon down closes the stream instead of hanging.
+    q.stop_daemon();
+    subscriber.expect_clean_end(Duration::from_secs(10));
+}
+
+/// The job with `id` in a status snapshot, or `null` when it is absent.
+fn job_in(snapshot: &serde_json::Value, id: i64) -> &serde_json::Value {
+    snapshot["jobs"]
+        .as_array()
+        .expect("snapshots carry a jobs array")
+        .iter()
+        .find(|job| job["id"] == id)
+        .unwrap_or(&serde_json::Value::Null)
+}
+
+/// The exact bytes a non-Rust consumer sends to open a subscription.
+const RAW_SUBSCRIBE: &[u8] =
+    br#"{"protocol_version":8,"request_id":"raw-1","op":{"type":"subscribe"}}"#;
+
+fn raw_subscribe(socket: &std::path::Path) -> (std::os::unix::net::UnixStream, serde_json::Value) {
+    try_raw_subscribe(socket).expect("the daemon answered the subscribe request")
+}
+
+/// `None` when the daemon closed the connection without answering, which is what
+/// being over the *connection* budget looks like.
+fn try_raw_subscribe(
+    socket: &std::path::Path,
+) -> Option<(std::os::unix::net::UnixStream, serde_json::Value)> {
+    use mlqueue::protocol::{DEFAULT_MAX_FRAME_BYTES, read_frame_sync, write_frame_sync};
+
+    let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    write_frame_sync(&mut stream, RAW_SUBSCRIBE, DEFAULT_MAX_FRAME_BYTES).ok()?;
+    let frame = read_frame_sync(&mut stream, DEFAULT_MAX_FRAME_BYTES).ok()??;
+    let response = serde_json::from_slice(&frame).expect("frames carry JSON responses");
+    Some((stream, response))
+}
+
+fn read_response(stream: &mut std::os::unix::net::UnixStream) -> serde_json::Value {
+    use mlqueue::protocol::{DEFAULT_MAX_FRAME_BYTES, read_frame_sync};
+
+    let frame = read_frame_sync(stream, DEFAULT_MAX_FRAME_BYTES)
+        .expect("a readable frame")
+        .expect("the daemon kept the stream open");
+    serde_json::from_slice(&frame).expect("frames carry JSON responses")
+}
+
+#[test]
+fn raw_subscribe_echoes_the_request_id_and_budgets_its_slot() {
+    // One stream slot (a quarter of the connection budget, at least one), so the
+    // refusal and the release of a slot are both deterministic.
+    let q = TestQueue::with_config(20, "max_connections = 4\n");
+
+    let (mut first_stream, initial) = raw_subscribe(&q.socket());
+    assert_eq!(initial["request_id"], "raw-1", "the subscribe request id is echoed");
+    assert_eq!(initial["reply"]["type"], "status", "{initial}");
+    assert!(initial["error"].is_null(), "{initial}");
+
+    let job = q.submit(&["--name", "raw"], &["sh", "-c", "true"]);
+    let pushed = read_response(&mut first_stream);
+    assert_eq!(pushed["request_id"], "raw-1", "every frame echoes the same id");
+    assert_eq!(job_in(&pushed["reply"], job)["id"], job, "{pushed}");
+
+    // A second stream does not fit, and is told so instead of being dropped.
+    let (_refused_stream, refused) = raw_subscribe(&q.socket());
+    assert_eq!(refused["error"]["code"], "too_many_subscriptions", "{refused}");
+    assert!(refused["reply"].is_null(), "{refused}");
+    // Ordinary request/response clients still have headroom.
+    assert!(q.try_cli(&["daemon", "status"]).status.success());
+
+    // Disconnecting frees the slot again.
+    drop(first_stream);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some((_stream, response)) = try_raw_subscribe(&q.socket())
+            && response["error"].is_null()
+        {
+            assert_eq!(response["reply"]["type"], "status", "{response}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "the subscription slot was never released");
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -889,6 +1129,107 @@ fn retry_policy_reattempts_then_fails() {
     q.cli(&["retry", &job.to_string()]);
     q.wait_state(job, "failed", Duration::from_secs(15));
     assert_eq!(q.job(job)["attemptCount"], 3);
+}
+
+#[test]
+fn failed_dependencies_cascade_skips_and_run_terminal_cleanup() {
+    let q = TestQueue::new();
+    let parent = q.submit(
+        &["--name", "parent", "--max-attempts", "2", "--retry-delay", "800ms"],
+        &["sh", "-c", "exit 3"],
+    );
+    let child = q.submit(
+        &["--name", "child", "--after-success", &parent.to_string()],
+        &["sh", "-c", "true"],
+    );
+    let grandchild = q.submit(
+        &["--name", "grandchild", "--after-success", &child.to_string()],
+        &["sh", "-c", "true"],
+    );
+    let cleanup = q.submit(
+        &["--name", "cleanup", "--after-terminal", &parent.to_string()],
+        &["sh", "-c", "true"],
+    );
+
+    // The parent is not terminal between automatic attempts, so neither
+    // dependency condition resolves during the retry window.
+    wait_for("parent retry to be scheduled", Duration::from_secs(10), || {
+        let view = q.job(parent);
+        view["state"] == "queued" && view["attemptCount"] == 1
+    });
+    assert_eq!(q.job_state(child), "queued");
+    assert!(
+        q.job(child)["eligibility"]
+            .as_str()
+            .unwrap()
+            .starts_with("waiting_for_dependencies")
+    );
+    assert_eq!(q.job_state(cleanup), "queued");
+
+    q.wait_state(parent, "failed", Duration::from_secs(15));
+    q.wait_state(child, "skipped", Duration::from_secs(10));
+    q.wait_state(grandchild, "skipped", Duration::from_secs(10));
+    q.wait_state(cleanup, "succeeded", Duration::from_secs(10));
+    assert_eq!(
+        q.try_cli(&["wait", &child.to_string()]).status.code(),
+        Some(1),
+        "waiting on a skipped job returns a stable generic failure"
+    );
+
+    let child_view = q.job(child);
+    assert_eq!(child_view["dependencies"][0]["condition"], "succeeded");
+    assert_eq!(child_view["dependencies"][0]["resolution"], "violated");
+    assert_eq!(child_view["dependencies"][0]["parentOutcome"], "failed");
+    let cleanup_view = q.job(cleanup);
+    assert_eq!(cleanup_view["dependencies"][0]["condition"], "terminal");
+    assert_eq!(cleanup_view["dependencies"][0]["resolution"], "satisfied");
+
+    // Retrying the parent cannot change latched descendant outcomes.
+    q.cli(&["retry", &parent.to_string()]);
+    q.wait_state(parent, "failed", Duration::from_secs(15));
+    assert_eq!(q.job_state(child), "skipped");
+    assert_eq!(q.job_state(cleanup), "succeeded");
+}
+
+#[test]
+fn successful_dependencies_persist_across_daemon_restart() {
+    let mut q = TestQueue::new();
+    let parent = q.submit(&["--name", "parent"], &["sh", "-c", "sleep 1; true"]);
+    let child = q.submit(
+        &["--name", "child", "--after-success", &parent.to_string()],
+        &["sh", "-c", "true"],
+    );
+    assert!(
+        q.job(child)["eligibility"]
+            .as_str()
+            .unwrap()
+            .starts_with("waiting_for_dependencies")
+    );
+
+    q.kill_daemon();
+    q.start_daemon();
+    q.wait_state(parent, "succeeded", Duration::from_secs(15));
+    q.wait_state(child, "succeeded", Duration::from_secs(10));
+}
+
+#[test]
+fn dependency_submission_rejects_a_missing_parent_atomically() {
+    let q = TestQueue::new();
+    let before = q.status()["jobs"].as_array().unwrap().len();
+    let output = q.try_cli(&[
+        "submit",
+        "--after-success",
+        "999999",
+        "--cwd",
+        q.dir.path().to_str().unwrap(),
+        "--",
+        "sh",
+        "-c",
+        "true",
+    ]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not_found"));
+    assert_eq!(q.status()["jobs"].as_array().unwrap().len(), before);
 }
 
 #[test]

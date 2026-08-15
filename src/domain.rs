@@ -22,7 +22,10 @@ pub type AttemptId = i64;
 ///   sentinel and is pinned once, when the initial blockers stop advancing.
 /// - 3: signed strict priority. Higher-priority eligible jobs supersede lower
 ///   protected jobs, and only equal-priority jobs may backfill a reservation.
-pub const SCHEDULER_SEMANTICS_VERSION: i64 = 3;
+/// - 4: FIFO and frozen backfill cutoffs use durable readiness order rather
+///   than submission order. Dependency-delayed jobs join the queue only once
+///   their prerequisites resolve successfully.
+pub const SCHEDULER_SEMANTICS_VERSION: i64 = 4;
 
 pub fn now_ms() -> i64 {
     SystemTime::now()
@@ -129,6 +132,16 @@ str_enum!(AttemptState {
     Failed => "failed",
     Cancelled => "cancelled",
     Lost => "lost",
+});
+
+str_enum!(DependencyCondition {
+    Succeeded => "succeeded",
+    Terminal => "terminal",
+});
+
+str_enum!(DependencyResolution {
+    Satisfied => "satisfied",
+    Violated => "violated",
 });
 
 impl AttemptState {

@@ -10,7 +10,8 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::domain::{
-    AttemptId, AttemptState, JobId, JobState, SCHEDULER_SEMANTICS_VERSION, now_ms,
+    AttemptId, AttemptState, DependencyCondition, DependencyResolution, JobId, JobState,
+    SCHEDULER_SEMANTICS_VERSION, now_ms,
 };
 use crate::protocol::SubmitParams;
 use crate::scheduler::{ActiveLease, Candidate};
@@ -174,6 +175,53 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE attempts ADD COLUMN command_started_at INTEGER;
     ALTER TABLE attempts ADD COLUMN timed_out_at INTEGER;
     "#,
+    // v5: restore immutable dependency edges with latched outcomes. Readiness
+    // gets its own monotonic sequence so a dependency-delayed job joins FIFO
+    // when it becomes runnable instead of reserving its submission position.
+    r#"
+    ALTER TABLE jobs ADD COLUMN ready_seq INTEGER;
+    CREATE TABLE scheduler_ready_sequence (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        value INTEGER NOT NULL CHECK (value >= 0)
+    );
+    INSERT INTO scheduler_ready_sequence (singleton, value)
+    SELECT 1, COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'jobs'), 0);
+    UPDATE jobs
+       SET ready_seq = id
+     WHERE state NOT IN ('queued', 'held')
+        OR retry_not_before IS NULL
+        OR retry_not_before <= CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER);
+    CREATE UNIQUE INDEX jobs_ready_sequence ON jobs(ready_seq) WHERE ready_seq IS NOT NULL;
+    DROP INDEX IF EXISTS jobs_state_priority_sequence;
+    CREATE INDEX jobs_state_priority_ready
+        ON jobs(state, priority DESC, ready_seq ASC);
+
+    CREATE TABLE dependencies (
+        parent_id INTEGER NOT NULL REFERENCES jobs(id),
+        child_id INTEGER NOT NULL REFERENCES jobs(id),
+        condition TEXT NOT NULL CHECK (condition IN ('succeeded', 'terminal')),
+        resolution TEXT CHECK (resolution IN ('satisfied', 'violated')),
+        parent_outcome TEXT CHECK (
+            parent_outcome IS NULL OR parent_outcome IN
+                ('succeeded','failed','cancelled','lost','skipped')
+        ),
+        resolved_at INTEGER,
+        PRIMARY KEY (parent_id, child_id),
+        CHECK (parent_id < child_id),
+        CHECK (
+            (resolution IS NULL AND parent_outcome IS NULL AND resolved_at IS NULL)
+            OR
+            (resolution IS NOT NULL AND parent_outcome IS NOT NULL AND resolved_at IS NOT NULL)
+        )
+    ) WITHOUT ROWID;
+    CREATE INDEX dependencies_child ON dependencies(child_id);
+    CREATE INDEX dependencies_unresolved_parent
+        ON dependencies(parent_id) WHERE resolution IS NULL;
+
+    UPDATE scheduler_reservation
+       SET semantics_version = 4
+     WHERE status = 'active' AND semantics_version = 3;
+    "#,
 ];
 
 pub fn open(path: &Path) -> Result<Connection> {
@@ -228,11 +276,23 @@ pub struct JobRow {
     pub retry_delay_ms: i64,
     pub time_limit_ms: Option<i64>,
     pub retry_not_before: Option<i64>,
+    pub ready_seq: Option<i64>,
     pub attempt_count: i64,
     pub state_reason: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     pub finished_at: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DependencyRow {
+    pub parent_id: JobId,
+    pub child_id: JobId,
+    pub condition: DependencyCondition,
+    pub parent_state: JobState,
+    pub resolution: Option<DependencyResolution>,
+    pub parent_outcome: Option<JobState>,
+    pub resolved_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -286,8 +346,8 @@ pub struct EventRow {
 }
 
 const JOB_COLUMNS: &str = "id, name, state, cwd, args, env, max_parallel_runs, priority, \
-     max_attempts, retry_delay_ms, time_limit_ms, retry_not_before, attempt_count, state_reason, \
-     created_at, updated_at, finished_at";
+     max_attempts, retry_delay_ms, time_limit_ms, retry_not_before, ready_seq, attempt_count, \
+     state_reason, created_at, updated_at, finished_at";
 
 fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRow> {
     let state: String = row.get(2)?;
@@ -306,11 +366,12 @@ fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRow> {
         retry_delay_ms: row.get(9)?,
         time_limit_ms: row.get(10)?,
         retry_not_before: row.get(11)?,
-        attempt_count: row.get(12)?,
-        state_reason: row.get(13)?,
-        created_at: row.get(14)?,
-        updated_at: row.get(15)?,
-        finished_at: row.get(16)?,
+        ready_seq: row.get(12)?,
+        attempt_count: row.get(13)?,
+        state_reason: row.get(14)?,
+        created_at: row.get(15)?,
+        updated_at: row.get(16)?,
+        finished_at: row.get(17)?,
     })
 }
 
@@ -372,7 +433,31 @@ pub fn insert_job(conn: &Connection, params: &SubmitParams, now: i64) -> Result<
             now,
         ],
     )?;
-    Ok(conn.last_insert_rowid())
+    let job_id = conn.last_insert_rowid();
+    // A success condition is stricter than terminal, so duplicate declarations
+    // collapse deterministically without weakening the prerequisite.
+    let mut dependencies = BTreeMap::new();
+    for dependency in &params.dependencies {
+        dependencies
+            .entry(dependency.job)
+            .and_modify(|condition| {
+                if dependency.condition == DependencyCondition::Succeeded {
+                    *condition = DependencyCondition::Succeeded;
+                }
+            })
+            .or_insert(dependency.condition);
+    }
+    let dependency_free = dependencies.is_empty();
+    for (parent, condition) in dependencies {
+        conn.execute(
+            "INSERT INTO dependencies (parent_id, child_id, condition) VALUES (?1, ?2, ?3)",
+            params![parent, job_id, condition.as_str()],
+        )?;
+    }
+    if dependency_free {
+        assign_next_ready_seq(conn, job_id, now)?;
+    }
+    Ok(job_id)
 }
 
 pub fn job_row(conn: &Connection, id: JobId) -> Result<Option<JobRow>> {
@@ -423,6 +508,14 @@ pub fn set_job_retry_not_before(conn: &Connection, id: JobId, at: Option<i64>, n
     conn.execute(
         "UPDATE jobs SET retry_not_before = ?2, updated_at = ?3 WHERE id = ?1",
         params![id, at, now],
+    )?;
+    Ok(())
+}
+
+pub fn clear_job_readiness(conn: &Connection, id: JobId, now: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE jobs SET ready_seq = NULL, updated_at = ?2 WHERE id = ?1",
+        params![id, now],
     )?;
     Ok(())
 }
@@ -496,6 +589,27 @@ pub fn max_job_seq(conn: &Connection) -> Result<i64> {
         .unwrap_or(0))
 }
 
+pub fn max_ready_seq(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT value FROM scheduler_ready_sequence WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+fn assign_next_ready_seq(conn: &Connection, job: JobId, now: i64) -> Result<i64> {
+    conn.execute(
+        "UPDATE scheduler_ready_sequence SET value = value + 1 WHERE singleton = 1",
+        [],
+    )?;
+    let seq = max_ready_seq(conn)?;
+    conn.execute(
+        "UPDATE jobs SET ready_seq = ?2, updated_at = ?3 WHERE id = ?1 AND ready_seq IS NULL",
+        params![job, seq, now],
+    )?;
+    Ok(seq)
+}
+
 pub fn count_jobs_in_state(conn: &Connection, state: JobState) -> Result<u32> {
     Ok(conn.query_row(
         "SELECT COUNT(*) FROM jobs WHERE state = ?1",
@@ -519,21 +633,171 @@ pub fn bounded_job_names_in_state(
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+// ---------------------------------------------------------------------------
+// Dependencies and readiness
+// ---------------------------------------------------------------------------
+
+pub fn dependencies_of(conn: &Connection, child: JobId) -> Result<Vec<DependencyRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT d.parent_id, d.child_id, d.condition, p.state, d.resolution,
+                d.parent_outcome, d.resolved_at
+           FROM dependencies d JOIN jobs p ON p.id = d.parent_id
+          WHERE d.child_id = ?1 ORDER BY d.parent_id",
+    )?;
+    let rows = stmt.query_map([child], |row| {
+        let condition: String = row.get(2)?;
+        let parent_state: String = row.get(3)?;
+        let resolution: Option<String> = row.get(4)?;
+        let parent_outcome: Option<String> = row.get(5)?;
+        Ok(DependencyRow {
+            parent_id: row.get(0)?,
+            child_id: row.get(1)?,
+            condition: condition.parse().expect("valid dependency condition in database"),
+            parent_state: parent_state.parse().expect("valid parent state in database"),
+            resolution: resolution
+                .map(|value| value.parse().expect("valid dependency resolution in database")),
+            parent_outcome: parent_outcome
+                .map(|value| value.parse().expect("valid parent outcome in database")),
+            resolved_at: row.get(6)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+pub fn unresolved_dependency_parents(conn: &Connection, child: JobId) -> Result<Vec<JobId>> {
+    let mut stmt = conn.prepare(
+        "SELECT parent_id FROM dependencies
+          WHERE child_id = ?1 AND resolution IS NULL ORDER BY parent_id",
+    )?;
+    let rows = stmt.query_map([child], |row| row.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Latch terminal parent outcomes, cascade impossible success requirements,
+/// and assign FIFO positions to jobs that have become runnable. Resolved
+/// edges never reopen, including when a parent is manually retried later.
+pub fn advance_dependency_graph(conn: &Connection, now: i64) -> Result<()> {
+    loop {
+        let unresolved = {
+            let mut stmt = conn.prepare(
+                "SELECT d.parent_id, d.child_id, d.condition, p.state
+                   FROM dependencies d
+                   JOIN jobs p ON p.id = d.parent_id
+                  WHERE d.resolution IS NULL
+                    AND p.state IN ('succeeded','failed','cancelled','lost','skipped')
+                  ORDER BY d.parent_id, d.child_id",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let condition: String = row.get(2)?;
+                let outcome: String = row.get(3)?;
+                Ok((
+                    row.get::<_, JobId>(0)?,
+                    row.get::<_, JobId>(1)?,
+                    condition
+                        .parse::<DependencyCondition>()
+                        .expect("valid dependency condition in database"),
+                    outcome.parse::<JobState>().expect("valid job state in database"),
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (parent, child, condition, outcome) in unresolved {
+            let resolution = if condition == DependencyCondition::Terminal
+                || outcome == JobState::Succeeded
+            {
+                DependencyResolution::Satisfied
+            } else {
+                DependencyResolution::Violated
+            };
+            conn.execute(
+                "UPDATE dependencies
+                    SET resolution = ?3, parent_outcome = ?4, resolved_at = ?5
+                  WHERE parent_id = ?1 AND child_id = ?2 AND resolution IS NULL",
+                params![parent, child, resolution.as_str(), outcome.as_str(), now],
+            )?;
+        }
+
+        let violated = {
+            let mut stmt = conn.prepare(
+                "SELECT d.child_id, d.parent_id
+                   FROM dependencies d
+                   JOIN jobs child ON child.id = d.child_id
+                  WHERE d.resolution = 'violated'
+                    AND child.state IN ('queued','held')
+                  ORDER BY d.child_id, d.parent_id",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, JobId>(0)?, row.get::<_, JobId>(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if violated.is_empty() {
+            break;
+        }
+        let mut by_child: BTreeMap<JobId, Vec<JobId>> = BTreeMap::new();
+        for (child, parent) in violated {
+            by_child.entry(child).or_default().push(parent);
+        }
+        for (child, parents) in by_child {
+            let reason = format!("prerequisite jobs {parents:?} did not satisfy required outcomes");
+            update_job_state(conn, child, JobState::Skipped, Some(&reason), now)?;
+            clear_job_readiness(conn, child, now)?;
+            append_event(
+                conn,
+                Some(child),
+                None,
+                "job_skipped",
+                "daemon",
+                Some(&serde_json::json!({ "failedPrerequisites": parents }).to_string()),
+            )?;
+        }
+    }
+
+    let ready = {
+        let mut stmt = conn.prepare(
+            "SELECT j.id FROM jobs j
+              WHERE j.state IN ('queued','held')
+                AND j.ready_seq IS NULL
+                AND (j.retry_not_before IS NULL OR j.retry_not_before <= ?1)
+                AND NOT EXISTS (
+                    SELECT 1 FROM dependencies d
+                     WHERE d.child_id = j.id
+                       AND (d.resolution IS NULL OR d.resolution = 'violated')
+                )
+              ORDER BY j.id",
+        )?;
+        let rows = stmt.query_map([now], |row| row.get::<_, JobId>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for job in ready {
+        let ready_seq = assign_next_ready_seq(conn, job, now)?;
+        append_event(
+            conn,
+            Some(job),
+            None,
+            "job_ready",
+            "daemon",
+            Some(&serde_json::json!({ "readySequence": ready_seq }).to_string()),
+        )?;
+    }
+    Ok(())
+}
+
 /// Priority/FIFO-ordered jobs eligible for admission right now.
 pub fn eligible_candidates(conn: &Connection, now: i64) -> Result<Vec<Candidate>> {
     let mut stmt = conn.prepare(
-        "SELECT j.id, j.max_parallel_runs, j.priority FROM jobs j
+        "SELECT j.id, j.ready_seq, j.max_parallel_runs, j.priority FROM jobs j
          WHERE j.state = 'queued'
+           AND j.ready_seq IS NOT NULL
            AND (j.retry_not_before IS NULL OR j.retry_not_before <= ?1)
-         ORDER BY j.priority DESC, j.id ASC",
+         ORDER BY j.priority DESC, j.ready_seq ASC",
     )?;
     let rows = stmt.query_map([now], |row| {
-        let id: JobId = row.get(0)?;
         Ok(Candidate {
-            job_id: id,
-            seq: id,
-            limit: row.get(1)?,
-            priority: row.get(2)?,
+            job_id: row.get(0)?,
+            ready_seq: row.get(1)?,
+            limit: row.get(2)?,
+            priority: row.get(3)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -850,13 +1114,18 @@ pub fn backfill_frontier(conn: &Connection, res: &ReservationRow) -> Result<Back
         // v1 froze the cutoff at creation; a permanently frozen frontier at
         // the stored cutoff remains its exact meaning.
         1 => Ok(BackfillFrontier::Frozen(res.cutoff_seq)),
-        2 | SCHEDULER_SEMANTICS_VERSION => {
+        2 | 3 | SCHEDULER_SEMANTICS_VERSION => {
             if res.cutoff_seq != RESERVATION_CUTOFF_UNFROZEN {
                 Ok(BackfillFrontier::Frozen(res.cutoff_seq))
             } else if any_blockers_advancing(conn, &res.initial_blockers)? {
                 Ok(BackfillFrontier::OpenWindow)
             } else {
-                Ok(BackfillFrontier::FreezePending(max_job_seq(conn)?))
+                let cutoff = if res.semantics_version == SCHEDULER_SEMANTICS_VERSION {
+                    max_ready_seq(conn)?
+                } else {
+                    max_job_seq(conn)?
+                };
+                Ok(BackfillFrontier::FreezePending(cutoff))
             }
         }
         version => Ok(BackfillFrontier::Unsupported(version)),
@@ -998,6 +1267,7 @@ pub fn append_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::DependencySpec;
     use std::collections::BTreeMap;
 
     fn submit_params(name: &str, limit: u32) -> SubmitParams {
@@ -1011,6 +1281,7 @@ mod tests {
             max_attempts: 1,
             retry_delay_ms: 0,
             time_limit_ms: None,
+            dependencies: vec![],
         }
     }
 
@@ -1071,6 +1342,51 @@ mod tests {
 
         migrate(&conn).unwrap();
         assert_eq!(job_row(&conn, 1).unwrap().unwrap().time_limit_ms, None);
+    }
+
+    #[test]
+    fn v4_migration_does_not_put_delayed_retries_before_a_frozen_frontier() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        for migration in &MIGRATIONS[..4] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 4).unwrap();
+        let retry_at = now_ms() + 60_000;
+        conn.execute(
+            "INSERT INTO jobs (
+                id, name, state, cwd, args, env, max_parallel_runs, priority,
+                max_attempts, retry_delay_ms, retry_not_before, attempt_count,
+                created_at, updated_at
+             ) VALUES (1, 'protected', 'queued', '/tmp', '[\"true\"]', '{}', 1, 0,
+                       1, 0, NULL, 0, 1, 1),
+                      (2, 'delayed-retry', 'queued', '/tmp', '[\"true\"]', '{}', 3, 0,
+                       2, 60000, ?1, 1, 2, 2)",
+            [retry_at],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO scheduler_reservation (
+                job_id, cutoff_seq, semantics_version, status, initial_blockers, created_at
+             ) VALUES (1, 2, 3, 'active', '[]', 3)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        assert_eq!(job_row(&conn, 1).unwrap().unwrap().ready_seq, Some(1));
+        assert_eq!(job_row(&conn, 2).unwrap().unwrap().ready_seq, None);
+        let reservation = active_reservation(&conn).unwrap().unwrap();
+        assert_eq!(reservation.semantics_version, SCHEDULER_SEMANTICS_VERSION);
+        assert_eq!(reservation.cutoff_seq, 2);
+
+        advance_dependency_graph(&conn, retry_at - 1).unwrap();
+        assert_eq!(job_row(&conn, 2).unwrap().unwrap().ready_seq, None);
+        advance_dependency_graph(&conn, retry_at).unwrap();
+        assert!(
+            job_row(&conn, 2).unwrap().unwrap().ready_seq.unwrap() > reservation.cutoff_seq,
+            "a retry becoming ready after migration must not bypass the frozen frontier"
+        );
     }
 
     #[test]
@@ -1175,7 +1491,11 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(!dependencies_exist);
+        assert!(dependencies_exist, "the restored schema recreates an empty edge table");
+        let restored_edges: i64 = conn
+            .query_row("SELECT COUNT(*) FROM dependencies", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(restored_edges, 0, "removed legacy edges cannot be reconstructed");
         let migration_events: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM events WHERE type = 'job_cancelled' AND actor = 'migration'",
@@ -1213,6 +1533,81 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 0, 0, -1]
         );
+    }
+
+    #[test]
+    fn dependencies_latch_outcomes_cascade_skips_and_assign_readiness_order() {
+        let conn = open_in_memory().unwrap();
+        let parent = insert_job(&conn, &submit_params("parent", 1), 1000).unwrap();
+
+        let mut child_params = submit_params("child", 1);
+        child_params.dependencies = vec![DependencySpec {
+            job: parent,
+            condition: DependencyCondition::Succeeded,
+        }];
+        let child = insert_job(&conn, &child_params, 1001).unwrap();
+
+        let mut grandchild_params = submit_params("grandchild", 1);
+        grandchild_params.dependencies = vec![DependencySpec {
+            job: child,
+            condition: DependencyCondition::Succeeded,
+        }];
+        let grandchild = insert_job(&conn, &grandchild_params, 1002).unwrap();
+
+        let mut cleanup_params = submit_params("cleanup", 1);
+        cleanup_params.dependencies = vec![DependencySpec {
+            job: parent,
+            condition: DependencyCondition::Terminal,
+        }];
+        let cleanup = insert_job(&conn, &cleanup_params, 1003).unwrap();
+        let independent = insert_job(&conn, &submit_params("independent", 1), 1004).unwrap();
+
+        assert!(job_row(&conn, child).unwrap().unwrap().ready_seq.is_none());
+        assert!(job_row(&conn, cleanup).unwrap().unwrap().ready_seq.is_none());
+        update_job_state(&conn, parent, JobState::Failed, Some("test failure"), 2000).unwrap();
+        advance_dependency_graph(&conn, 2000).unwrap();
+
+        assert_eq!(job_row(&conn, child).unwrap().unwrap().state, JobState::Skipped);
+        assert_eq!(job_row(&conn, grandchild).unwrap().unwrap().state, JobState::Skipped);
+        let cleanup_row = job_row(&conn, cleanup).unwrap().unwrap();
+        assert_eq!(cleanup_row.state, JobState::Queued);
+        assert!(
+            cleanup_row.ready_seq.unwrap()
+                > job_row(&conn, independent).unwrap().unwrap().ready_seq.unwrap(),
+            "dependency-delayed work joins FIFO when it becomes ready"
+        );
+
+        let child_edge = dependencies_of(&conn, child).unwrap().pop().unwrap();
+        assert_eq!(child_edge.resolution, Some(DependencyResolution::Violated));
+        assert_eq!(child_edge.parent_outcome, Some(JobState::Failed));
+        let cleanup_edge = dependencies_of(&conn, cleanup).unwrap().pop().unwrap();
+        assert_eq!(cleanup_edge.resolution, Some(DependencyResolution::Satisfied));
+
+        // Manual retry is non-monotonic job state, but observed dependency
+        // outcomes are immutable: descendants neither revive nor retract.
+        update_job_state(&conn, parent, JobState::Queued, None, 3000).unwrap();
+        advance_dependency_graph(&conn, 3000).unwrap();
+        assert_eq!(job_row(&conn, child).unwrap().unwrap().state, JobState::Skipped);
+        assert_eq!(
+            dependencies_of(&conn, cleanup).unwrap()[0].resolution,
+            Some(DependencyResolution::Satisfied)
+        );
+    }
+
+    #[test]
+    fn duplicate_dependency_declarations_keep_succeeded_condition() {
+        let conn = open_in_memory().unwrap();
+        let parent = insert_job(&conn, &submit_params("parent", 1), 1000).unwrap();
+        let mut child = submit_params("child", 1);
+        child.dependencies = vec![
+            DependencySpec { job: parent, condition: DependencyCondition::Terminal },
+            DependencySpec { job: parent, condition: DependencyCondition::Succeeded },
+            DependencySpec { job: parent, condition: DependencyCondition::Terminal },
+        ];
+        let child = insert_job(&conn, &child, 1001).unwrap();
+        let dependencies = dependencies_of(&conn, child).unwrap();
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].condition, DependencyCondition::Succeeded);
     }
 
     #[test]

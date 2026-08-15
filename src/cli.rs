@@ -11,10 +11,11 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
 use crate::client::{self, ClientError};
-use crate::domain::{AttemptState, JobId, JobState};
+use crate::domain::{AttemptState, DependencyCondition, JobId, JobState};
 use crate::paths::Paths;
 use crate::protocol::{
-    EventView, JobView, LogPathsView, Op, Reply, ResolveAs, StatusView, SubmitParams,
+    DependencySpec, EventView, JobView, LogPathsView, Op, Reply, ResolveAs, StatusView,
+    SubmitParams,
 };
 
 /// Environment variables captured by default at submission. Everything else
@@ -58,6 +59,9 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Stream queue snapshots as newline-delimited JSON (one complete snapshot
+    /// per line, flushed immediately) for programmatic consumers.
+    Subscribe,
     /// Announce queue transitions through the local `tts` command.
     FollowTts {
         /// Override the backend selected by the local `tts` configuration.
@@ -227,6 +231,12 @@ struct SubmitArgs {
     /// compilation are included.
     #[arg(long, value_parser = humantime::parse_duration)]
     time_limit: Option<Duration>,
+    /// Start only after this job terminally succeeds (repeatable).
+    #[arg(long = "after-success")]
+    after_success: Vec<JobId>,
+    /// Start after this job reaches any terminal outcome (repeatable).
+    #[arg(long = "after-terminal", alias = "after-completion")]
+    after_terminal: Vec<JobId>,
     /// Explicit KEY=VALUE environment entry (repeatable).
     #[arg(long = "env")]
     env: Vec<String>,
@@ -250,6 +260,7 @@ pub fn main() -> Result<()> {
     match cli.command {
         Command::Submit(args) => submit(&paths, args, key),
         Command::Status { watch, finished, json } => status(&paths, watch, finished, json),
+        Command::Subscribe => subscribe(&paths),
         Command::FollowTts { tts_backend } => follow_tts(&paths, tts_backend.as_deref()),
         Command::Show { job, json } => {
             let reply = send(&paths, Op::Show { job }, None)?;
@@ -455,6 +466,15 @@ fn submit(paths: &Paths, args: SubmitArgs, key: String) -> Result<()> {
         max_attempts: args.max_attempts,
         retry_delay_ms: args.retry_delay.map(|delay| delay.as_millis() as u64).unwrap_or(0),
         time_limit_ms,
+        dependencies: args
+            .after_terminal
+            .into_iter()
+            .map(|job| DependencySpec { job, condition: DependencyCondition::Terminal })
+            .chain(args.after_success.into_iter().map(|job| DependencySpec {
+                job,
+                condition: DependencyCondition::Succeeded,
+            }))
+            .collect(),
     };
     let reply = send(paths, Op::Submit(params), Some(key))?;
     let Reply::Submitted { job } = reply else { bail!(client::unexpected("submitted job")) };
@@ -492,6 +512,24 @@ fn status(paths: &Paths, watch: bool, finished: bool, json: bool) -> Result<()> 
             return Ok(());
         }
         std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// Machine-facing stream: one compact JSON snapshot per line, no rendering and
+/// no colours, ending with exit 0 when the daemon shuts down cleanly.
+fn subscribe(paths: &Paths) -> Result<()> {
+    let mut out = std::io::stdout().lock();
+    let result = client::subscribe(paths, |view| {
+        serde_json::to_writer(&mut out, &view)?;
+        out.write_all(b"\n")?;
+        // A consumer must see each snapshot as it happens, not per block.
+        out.flush()?;
+        Ok(())
+    });
+    match result {
+        Ok(()) => Ok(()),
+        Err(ClientError::Daemon(body)) => bail!("{}: {}", body.code, body.message),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -620,6 +658,10 @@ fn follow_tts_announcement(events: &[EventView]) -> Option<String> {
             }
             "job_lost" => {
                 outcomes.push(format!("{} was lost", name()));
+                started.remove(&event.job);
+            }
+            "job_skipped" => {
+                outcomes.push(format!("{} was skipped", name()));
                 started.remove(&event.job);
             }
             "retry_scheduled" => {
@@ -794,7 +836,7 @@ fn render_status(view: &StatusView, finished_only: bool) -> String {
     if let Some(res) = &view.reservation {
         let frontier = match res.backfill_cutoff {
             _ if res.backfill_window_open => "backfill window open".to_string(),
-            Some(cutoff) => format!("backfill cutoff at job {cutoff}"),
+            Some(cutoff) => format!("backfill readiness cutoff {cutoff}"),
             None => "backfill frontier unavailable".to_string(),
         };
         writeln!(
@@ -861,9 +903,23 @@ fn status_sections(
         };
         (rank, job.id)
     });
-    queued.sort_by_key(|job| (Reverse(job.priority), job.id));
+    queued.sort_by_key(|job| {
+        (
+            job.ready_sequence.is_none(),
+            Reverse(job.priority),
+            job.ready_sequence.unwrap_or(i64::MAX),
+            job.id,
+        )
+    });
     queued.truncate(STATUS_QUEUE_LIMIT);
-    held.sort_by_key(|job| (Reverse(job.priority), job.id));
+    held.sort_by_key(|job| {
+        (
+            job.ready_sequence.is_none(),
+            Reverse(job.priority),
+            job.ready_sequence.unwrap_or(i64::MAX),
+            job.id,
+        )
+    });
     held.truncate(STATUS_HELD_LIMIT);
     finished.sort_by_key(|job| Reverse((job.finished_at, job.id)));
     finished.truncate(STATUS_FINISHED_LIMIT);
@@ -933,6 +989,25 @@ fn print_job_detail(job: &JobView) {
     println!("  cwd:              {}", job.cwd);
     println!("  command:          {}", shell_join(&job.args));
     println!("  attempts:         {}/{}", job.attempt_count, job.max_attempts);
+    for dependency in &job.dependencies {
+        let outcome = match (&dependency.resolution, &dependency.parent_outcome) {
+            (Some(resolution), Some(parent_outcome)) => {
+                if dependency.parent_state == *parent_outcome {
+                    format!("{resolution}; parent {parent_outcome}")
+                } else {
+                    format!(
+                        "{resolution}; observed {parent_outcome}, now {}",
+                        dependency.parent_state
+                    )
+                }
+            }
+            _ => format!("waiting; parent {}", dependency.parent_state),
+        };
+        println!(
+            "  depends on:       job {} ({}, {outcome})",
+            dependency.parent, dependency.condition
+        );
+    }
     if let Some(limit) = job.time_limit_ms {
         println!(
             "  time limit:       {} per attempt",
@@ -1276,10 +1351,12 @@ mod tests {
             retry_delay_ms: 0,
             time_limit_ms: None,
             retry_not_before: None,
+            ready_sequence: Some(id),
             attempt_count: finished_at.is_some() as i64,
             created_at: id,
             updated_at: finished_at.unwrap_or(id),
             finished_at,
+            dependencies: vec![],
             attempts: vec![],
             cancel_requested: None,
         }
@@ -1318,6 +1395,28 @@ mod tests {
             panic!("expected submit command")
         };
         assert_eq!(args.time_limit, Some(Duration::from_secs(90 * 60)));
+    }
+
+    #[test]
+    fn submit_parses_dependency_conditions_and_legacy_completion_alias() {
+        let cli = Cli::try_parse_from([
+            "mlq",
+            "submit",
+            "--after-success",
+            "4",
+            "--after-terminal",
+            "5",
+            "--after-completion",
+            "6",
+            "--",
+            "true",
+        ])
+        .unwrap();
+        let Command::Submit(args) = cli.command else {
+            panic!("expected submit command")
+        };
+        assert_eq!(args.after_success, vec![4]);
+        assert_eq!(args.after_terminal, vec![5, 6]);
     }
 
     #[test]

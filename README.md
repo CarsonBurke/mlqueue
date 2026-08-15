@@ -39,6 +39,9 @@ mlq submit --name cleanrl --max-parallel-runs 3 -- python train.py
 # prefer this job over default-priority queue work (does not preempt runners)
 mlq submit --name urgent --priority 1 --max-parallel-runs 1 -- python eval.py
 
+# durable smoke gate: if smoke submission returns job 12
+mlq submit --name train --after-success 12 -- python train.py
+
 # bound each attempt to two hours (queue wait is not counted)
 mlq submit --name bounded --time-limit 2h -- cargo run --release --bin train
 
@@ -115,6 +118,7 @@ mlq set-priority 12 2     # retune queued or held job only
 | `submit` | Enqueue a command (`--` then argv) |
 | `status` | Live queue (leases, protection, reasons) |
 | `status -f` | Most recent finished runs only |
+| `subscribe` | Stream queue snapshots as NDJSON (no polling) |
 | `show JOB` | Full job detail and attempts |
 | `logs JOB` | Stdout/stderr; `--follow` exits with attempt outcome |
 | `wait JOB` | Block until terminal (`--timeout`, exit codes below) |
@@ -133,7 +137,8 @@ Common flags:
 - `--idempotency-key KEY` on mutations (auto-generated if omitted; safe to
   retry an identical request)
 - Submit: `--name`, `--cwd`, `--env KEY=VAL`, `--inherit-env VAR`,
-  `--max-attempts`, `--retry-delay`, `--time-limit`
+  `--max-attempts`, `--retry-delay`, `--time-limit`, `--after-success JOB`,
+  `--after-terminal JOB`
 
 `submit --time-limit DURATION` is a per-attempt wall-clock limit. It starts
 when the runner spawns the command, so queue wait is excluded, while command
@@ -151,7 +156,29 @@ As with any failed attempt, a separate user cancellation suppresses retries.
 | Success | `0` |
 | Command failed | command’s exit code |
 | Killed by signal | `128 + signal` |
+| Skipped, lost, cancelled, or failed before launch | `1` |
 | `--timeout` expired | `124` |
+
+### `subscribe` for programmatic consumers
+
+```bash
+mlq subscribe | while IFS= read -r snapshot; do ...; done
+```
+
+`subscribe` keeps one connection to `mlqd` open and prints **one compact JSON
+queue snapshot per line** (NDJSON, flushed immediately): the current state right
+away, then a new line whenever the queue changes — submission, state transition,
+lease change, priority or limit change. Each line is the daemon's raw `status`
+payload, which (unlike `mlq status --json`) still carries recently finished jobs.
+Consumers never replay events; bursts are coalesced into the newest snapshot
+instead of a backlog, and a refresh identical to the previous line is skipped.
+
+No rendering, no colours, no polling. It exits `0` when the daemon shuts down
+and non-zero with a message on stderr if the daemon cannot be reached, so a
+supervisor can restart it. Streams are budgeted at a quarter of
+`max_connections`, so an excess subscriber is refused with
+`too_many_subscriptions` rather than starving `submit`/`status`.
+`mlq status --watch` remains the human, redrawing view.
 
 ### Changing a live limit
 
@@ -173,8 +200,10 @@ mlq submit \
 - Always set `--max-parallel-runs` explicitly (`1` for exclusive / unknown /
   multi-GPU / benchmarks).
 - Omit `--priority` unless queue precedence is intentional.
-- Enqueue independent work, then `mlq wait` before conditional follow-ups.
-  Metric or success-gated pipelines belong in the submitter, not the daemon.
+- Use `--after-success JOB` for durable prerequisite gates and
+  `--after-terminal JOB` for cleanup after any terminal outcome. Repeated
+  dependency flags are ANDed. Metric-gated or output-derived pipelines still
+  belong in the submitter.
 - Secrets: prefer files over `--env` (env is stored in SQLite as plaintext).
 
 A ready-made agent skill ships in [`skills/queue-ml-jobs/`](skills/queue-ml-jobs/).
@@ -201,5 +230,6 @@ cargo install --path . --force && mlq daemon install   # rebuild + restart unit
 ```
 
 The e2e suite (`tests/e2e.rs`) covers the concurrency formula, signed priority
-ordering, windowed-then-frozen backfill, live limit updates, cancellation,
-wall-clock limits, retries, idempotency replay/conflict, and daemon-crash recovery.
+ordering, windowed-then-frozen backfill, dependency gates and skip cascades,
+live limit updates, cancellation, wall-clock limits, retries, idempotency
+replay/conflict, and daemon-crash recovery.

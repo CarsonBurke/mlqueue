@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::domain::{AttemptId, JobId};
+use crate::domain::{AttemptId, DependencyCondition, DependencyResolution, JobId};
 
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 pub const DEFAULT_MAX_FRAME_BYTES: u32 = 1 << 20;
 
 fn is_zero(value: &i64) -> bool {
@@ -29,6 +29,8 @@ pub mod error_codes {
     pub const INVALID_ARGUMENT: &str = "invalid_argument";
     pub const UNSAFE_RESOLUTION: &str = "unsafe_resolution";
     pub const ADMISSION_BLOCKED: &str = "admission_blocked";
+    /// The daemon's subscription slots are all in use; the stream was refused.
+    pub const TOO_MANY_SUBSCRIPTIONS: &str = "too_many_subscriptions";
     pub const INTERNAL: &str = "internal";
 }
 
@@ -47,6 +49,9 @@ pub struct Request {
 pub enum Op {
     Submit(SubmitParams),
     Status,
+    /// Turns the connection into a stream of `Status` snapshots (see
+    /// ARCHITECTURE.md); the reply payload is identical to `Status`.
+    Subscribe,
     FollowTtsSnapshot,
     Events { after: i64, limit: u32 },
     Show { job: JobId },
@@ -81,6 +86,7 @@ impl Op {
         match self {
             Op::Submit(_) => "submit",
             Op::Status => "status",
+            Op::Subscribe => "subscribe",
             Op::FollowTtsSnapshot => "follow_tts_snapshot",
             Op::Events { .. } => "events",
             Op::Show { .. } => "show",
@@ -101,19 +107,53 @@ impl Op {
     /// field order is deterministic and `env` is a BTreeMap, so equal payloads
     /// serialize identically.
     pub fn request_hash(&self) -> String {
-        let canonical = serde_json::to_vec(self).expect("op serializes");
+        let mut canonical_op = self.clone();
+        if let Self::Submit(params) = &mut canonical_op {
+            params.dependencies.sort_by_key(|dependency| {
+                (
+                    dependency.job,
+                    match dependency.condition {
+                        DependencyCondition::Succeeded => 0,
+                        DependencyCondition::Terminal => 1,
+                    },
+                )
+            });
+            params.dependencies.dedup();
+            let succeeded: std::collections::BTreeSet<_> = params
+                .dependencies
+                .iter()
+                .filter(|dependency| dependency.condition == DependencyCondition::Succeeded)
+                .map(|dependency| dependency.job)
+                .collect();
+            params.dependencies.retain(|dependency| {
+                dependency.condition == DependencyCondition::Succeeded
+                    || !succeeded.contains(&dependency.job)
+            });
+        }
+        let canonical = serde_json::to_vec(&canonical_op).expect("op serializes");
         hex::encode(Sha256::digest(&canonical))
     }
 
-    /// Protocol v5 serialized empty dependency arrays on every ordinary
-    /// submit. Accept that exact legacy hash for replay after upgrading to v6;
-    /// submissions that actually declared dependencies cannot be represented
-    /// by v6 and therefore correctly remain conflicts.
+    /// Reconstruct the protocol-v5 submit hash for idempotent replay across
+    /// the removal and restoration of dependencies. A replay only returns the
+    /// original stored response; it never recreates migration-deleted edges.
     pub(crate) fn legacy_v5_request_hash(&self) -> Option<String> {
         let Self::Submit(params) = self else { return None };
         if params.time_limit_ms.is_some() {
             return None;
         }
+        let after_success: Vec<_> = params
+            .dependencies
+            .iter()
+            .filter(|dependency| dependency.condition == DependencyCondition::Succeeded)
+            .map(|dependency| dependency.job)
+            .collect();
+        let after_completion: Vec<_> = params
+            .dependencies
+            .iter()
+            .filter(|dependency| dependency.condition == DependencyCondition::Terminal)
+            .map(|dependency| dependency.job)
+            .collect();
         let legacy = LegacyV5Op::Submit(LegacyV5SubmitParams {
             name: &params.name,
             cwd: &params.cwd,
@@ -123,8 +163,8 @@ impl Op {
             priority: params.priority,
             max_attempts: params.max_attempts,
             retry_delay_ms: params.retry_delay_ms,
-            after_success: &[],
-            after_completion: &[],
+            after_success: &after_success,
+            after_completion: &after_completion,
         });
         let canonical = serde_json::to_vec(&legacy).expect("legacy op serializes");
         Some(hex::encode(Sha256::digest(&canonical)))
@@ -172,6 +212,16 @@ pub struct SubmitParams {
     /// Per-attempt wall-clock limit measured from command spawn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_limit_ms: Option<u64>,
+    /// Immutable prerequisite edges. All conditions are ANDed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<DependencySpec>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DependencySpec {
+    pub job: JobId,
+    pub condition: DependencyCondition,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -232,14 +282,54 @@ pub struct JobView {
     pub time_limit_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_not_before: Option<i64>,
+    /// Durable FIFO position assigned when all prerequisites and retry delay
+    /// are satisfied. Absent while the job is not ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_sequence: Option<i64>,
     pub attempt_count: i64,
     pub created_at: i64,
     pub updated_at: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<i64>,
+    /// Included by `show`; compact status responses rely on `eligibility`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<DependencyView>,
     pub attempts: Vec<AttemptView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cancel_requested: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DependencyView {
+    pub parent: JobId,
+    #[serde(alias = "requirement", deserialize_with = "deserialize_dependency_condition")]
+    pub condition: DependencyCondition,
+    /// Empty only when replaying a protocol-v5 response stored before current
+    /// parent-state visibility existed.
+    #[serde(default)]
+    pub parent_state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<DependencyResolution>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_outcome: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<i64>,
+}
+
+fn deserialize_dependency_condition<'de, D>(deserializer: D) -> Result<DependencyCondition, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    match value.as_str() {
+        "succeeded" | "success" => Ok(DependencyCondition::Succeeded),
+        "terminal" | "completion" => Ok(DependencyCondition::Terminal),
+        _ => Err(serde::de::Error::unknown_variant(
+            &value,
+            &["succeeded", "terminal"],
+        )),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -445,11 +535,33 @@ mod tests {
                 max_attempts: 1,
                 retry_delay_ms: 0,
                 time_limit_ms: None,
+                dependencies: vec![],
             })
         };
         assert_eq!(mk(1, 0).request_hash(), mk(1, 0).request_hash());
         assert_ne!(mk(1, 0).request_hash(), mk(2, 0).request_hash());
         assert_ne!(mk(1, 0).request_hash(), mk(1, -1).request_hash());
+
+        let mut dependency_order_a = match mk(1, 0) {
+            Op::Submit(params) => params,
+            _ => unreachable!(),
+        };
+        dependency_order_a.dependencies = vec![
+            DependencySpec { job: 9, condition: DependencyCondition::Terminal },
+            DependencySpec { job: 4, condition: DependencyCondition::Succeeded },
+            DependencySpec { job: 9, condition: DependencyCondition::Succeeded },
+        ];
+        let mut dependency_order_b = dependency_order_a.clone();
+        dependency_order_b.dependencies = vec![
+            DependencySpec { job: 9, condition: DependencyCondition::Succeeded },
+            DependencySpec { job: 4, condition: DependencyCondition::Succeeded },
+            DependencySpec { job: 9, condition: DependencyCondition::Succeeded },
+        ];
+        assert_eq!(
+            Op::Submit(dependency_order_a).request_hash(),
+            Op::Submit(dependency_order_b).request_hash(),
+            "flag order, duplicates, and weaker overlap are semantically identical"
+        );
 
         let mut limited_params = match mk(1, 0) {
             Op::Submit(params) => params,
@@ -480,6 +592,27 @@ mod tests {
         assert_ne!(current.request_hash(), legacy_hash);
         assert!(Op::Status.legacy_v5_request_hash().is_none());
 
+        let mut legacy_dependency_params = match mk(1, 0) {
+            Op::Submit(params) => params,
+            _ => unreachable!(),
+        };
+        legacy_dependency_params.dependencies = vec![DependencySpec {
+            job: 42,
+            condition: DependencyCondition::Succeeded,
+        }];
+        let legacy_dependency_json = concat!(
+            r#"{"type":"submit","name":"x","cwd":"/tmp","args":["true"],"env":{},"maxParallelRuns":1,"maxAttempts":1,"retryDelayMs":0,"#,
+            r#""afterSuccess":[42],"afterCompletion":[]}"#
+        );
+        let legacy_dependency_hash =
+            hex::encode(Sha256::digest(legacy_dependency_json.as_bytes()));
+        assert_eq!(
+            Op::Submit(legacy_dependency_params)
+                .legacy_v5_request_hash()
+                .as_deref(),
+            Some(legacy_dependency_hash.as_str())
+        );
+
         let removed_dependency = concat!(
             r#"{"type":"submit","name":"x","cwd":"/tmp","args":["true"],"env":{},"maxParallelRuns":1,"maxAttempts":1,"retryDelayMs":0,"#,
             r#""afterSuccess":[42]}"#
@@ -488,6 +621,51 @@ mod tests {
             serde_json::from_str::<Op>(removed_dependency).is_err(),
             "removed dependency keys must not be silently discarded"
         );
+    }
+
+    #[test]
+    fn subscribe_is_a_read_op_on_the_current_protocol_version() {
+        // The exact bytes a streaming consumer sends; `subscribe` is additive,
+        // so the version stays 8.
+        let wire = r#"{"protocol_version":8,"request_id":"r1","op":{"type":"subscribe"}}"#;
+        let request: Request = serde_json::from_str(wire).unwrap();
+        assert_eq!(request.protocol_version, PROTOCOL_VERSION);
+        assert!(matches!(request.op, Op::Subscribe));
+        assert_eq!(request.op.kind(), "subscribe");
+        assert!(!request.op.is_mutation(), "a subscription never writes");
+        assert!(request.idempotency_key.is_none());
+        assert_eq!(
+            serde_json::to_string(&request.op).unwrap(),
+            r#"{"type":"subscribe"}"#
+        );
+        // Nothing to canonicalize, but the hash must still be derivable and
+        // distinct from the other read ops.
+        assert_ne!(Op::Subscribe.request_hash(), Op::Status.request_hash());
+        assert!(Op::Subscribe.legacy_v5_request_hash().is_none());
+    }
+
+    #[test]
+    fn legacy_dependency_views_in_stored_replies_remain_deserializable() {
+        let encoded = r#"{
+            "type":"job",
+            "job":{
+                "id":2,"name":"child","state":"queued","maxParallelRuns":1,
+                "priority":0,"cwd":"/tmp","args":["true"],"maxAttempts":1,
+                "retryDelayMs":0,"attemptCount":0,"createdAt":1,"updatedAt":1,
+                "dependencies":[
+                    {"parent":1,"requirement":"success","satisfied":true},
+                    {"parent":3,"requirement":"completion","satisfied":false}
+                ],
+                "attempts":[]
+            }
+        }"#;
+        let Reply::Job { job } = serde_json::from_str::<Reply>(encoded).unwrap() else {
+            panic!("expected job reply")
+        };
+        assert_eq!(job.dependencies.len(), 2);
+        assert_eq!(job.dependencies[0].condition, DependencyCondition::Succeeded);
+        assert_eq!(job.dependencies[1].condition, DependencyCondition::Terminal);
+        assert!(job.dependencies.iter().all(|dependency| dependency.parent_state.is_empty()));
     }
 
     #[test]

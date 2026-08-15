@@ -9,8 +9,8 @@ use crate::db::{self, AttemptRow, EventRow, JobRow, ReservationRow};
 use crate::domain::{JobState, now_ms};
 use crate::paths::Paths;
 use crate::protocol::{
-    AttemptView, EventView, FollowTtsJobView, FollowTtsSnapshotView, JobView, ReservationView,
-    StatusView,
+    AttemptView, DependencyView, EventView, FollowTtsJobView, FollowTtsSnapshotView, JobView,
+    ReservationView, StatusView,
 };
 
 const TTS_NAME_LIMIT: usize = 80;
@@ -66,6 +66,10 @@ fn eligibility_reason(
         JobState::Queued => {
             if job.retry_not_before.is_some_and(|at| at > now) {
                 Some("waiting_for_retry_delay".to_string())
+            } else if let parents = db::unresolved_dependency_parents(conn, job.id)?
+                && !parents.is_empty()
+            {
+                Some(format!("waiting_for_dependencies: jobs {parents:?}"))
             } else if let Some(res) = reservation {
                 let frontier = db::backfill_frontier(conn, res)?;
                 let protected = db::job_row(conn, res.job_id)?;
@@ -96,7 +100,7 @@ fn eligibility_reason(
                         }
                         db::BackfillFrontier::Frozen(cutoff)
                         | db::BackfillFrontier::FreezePending(cutoff) => {
-                            if job.id > cutoff {
+                            if job.ready_seq.is_none_or(|ready_seq| ready_seq > cutoff) {
                                 Some(format!("behind_backfill_cutoff: job {}", res.job_id))
                             } else {
                                 Some(format!("backfill_eligible: job {}", res.job_id))
@@ -134,6 +138,21 @@ pub fn job_view(
     let cancel_requested = db::live_attempt_for_job(conn, job.id)?
         .map(|attempt| attempt.cancel_requested)
         .filter(|&requested| requested);
+    let dependencies = if include_attempts {
+        db::dependencies_of(conn, job.id)?
+            .into_iter()
+            .map(|dependency| DependencyView {
+                parent: dependency.parent_id,
+                condition: dependency.condition,
+                parent_state: dependency.parent_state.as_str().to_string(),
+                resolution: dependency.resolution,
+                parent_outcome: dependency.parent_outcome.map(|outcome| outcome.as_str().to_string()),
+                resolved_at: dependency.resolved_at,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     Ok(JobView {
         id: job.id,
         name: job.name.clone(),
@@ -148,10 +167,12 @@ pub fn job_view(
         retry_delay_ms: job.retry_delay_ms as u64,
         time_limit_ms: job.time_limit_ms.map(|value| value as u64),
         retry_not_before: job.retry_not_before,
+        ready_sequence: job.ready_seq,
         attempt_count: job.attempt_count,
         created_at: job.created_at,
         updated_at: job.updated_at,
         finished_at: job.finished_at,
+        dependencies,
         attempts,
         cancel_requested,
     })

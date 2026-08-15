@@ -6,7 +6,9 @@ description: Queue and manage local machine-learning workloads with mlq. Use for
 # Queue local ML work
 
 - Submit managed workloads with `mlq submit`; never run them directly or bypass
-  the queue. Leave work queued when busy; restore `mlqd` when unavailable.
+  the queue.
+- You may want to follow the job with `mlq wait JOB`.
+- You may need to start `mlqd` if it fails.
 - Keep each workload and its descendants foregrounded in the runner's process
   group. Restructure commands that daemonize or call `setsid`.
 - Choose `--max-parallel-runs N` explicitly for every submission. It asserts
@@ -30,12 +32,11 @@ mlq submit --name NAME --max-parallel-runs N \
   and descendants count toward the limit. Prefer a limit when an overlong run
   likely indicates a hang or would waste shared resources. Leave the job
   unlimited when valid runtimes are too variable to bound safely.
-
-- Enqueue independent jobs you can start now. For sequential or conditional
-  follow-ups, `mlq wait JOB`, inspect the outcome (and metrics if needed), then
-  submit the next job. Treat submission alone as complete only when successful
-  enqueueing is itself the requested outcome; otherwise monitor the job and
-  continue the task from its result.
+- For sequential or conditional work, use durable queue dependencies:
+  `--after-success JOB` runs only after a successful prerequisite, while
+  `--after-terminal JOB` runs after any terminal outcome. Repeat flags for an
+  AND gate. Use `mlq wait` in the submitter for metric gates, output-derived
+  commands, or other conditions the queue cannot express.
 - Don't waste tokens constantly polling.
 - Pass required environment explicitly. Values supplied through `--env` are
   stored as plaintext; make workloads read secrets from credential files.

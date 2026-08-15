@@ -9,7 +9,7 @@ use anyhow::Context;
 
 use crate::paths::Paths;
 use crate::protocol::{
-    self, ErrorBody, Op, Reply, Request, Response, read_frame_sync, write_frame_sync,
+    self, ErrorBody, Op, Reply, Request, Response, StatusView, read_frame_sync, write_frame_sync,
 };
 
 const CLIENT_RETRIES: u32 = 3;
@@ -68,6 +68,49 @@ fn try_once(paths: &Paths, request: &Request) -> io::Result<Response> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "daemon closed connection"))?;
     serde_json::from_slice(&frame)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))
+}
+
+/// Open a snapshot subscription and hand every snapshot to `on_snapshot` until
+/// the daemon closes the stream (returning `Ok`). Unlike `request`, this never
+/// retries: a reconnect would silently skip the changes made while it was
+/// disconnected, which is the caller's decision, not the transport's.
+pub fn subscribe(
+    paths: &Paths,
+    mut on_snapshot: impl FnMut(StatusView) -> anyhow::Result<()>,
+) -> Result<(), ClientError> {
+    let unavailable = |source: io::Error| ClientError::Unavailable {
+        socket: paths.socket().display().to_string(),
+        source,
+    };
+    let request = Request {
+        protocol_version: protocol::PROTOCOL_VERSION,
+        request_id: uuid::Uuid::new_v4().to_string(),
+        idempotency_key: None,
+        op: Op::Subscribe,
+    };
+    let mut stream = UnixStream::connect(paths.socket()).map_err(unavailable)?;
+    // No read timeout: a quiet queue sends nothing for as long as it likes.
+    stream.set_write_timeout(Some(Duration::from_secs(30))).map_err(unavailable)?;
+    let bytes = serde_json::to_vec(&request).expect("subscribe request serializes");
+    write_frame_sync(&mut stream, &bytes, protocol::DEFAULT_MAX_FRAME_BYTES)
+        .map_err(unavailable)?;
+    loop {
+        let frame = match read_frame_sync(&mut stream, protocol::DEFAULT_MAX_FRAME_BYTES) {
+            Ok(Some(frame)) => frame,
+            // Clean daemon shutdown.
+            Ok(None) => return Ok(()),
+            Err(err) => return Err(unavailable(err)),
+        };
+        let response: Response = serde_json::from_slice(&frame)
+            .map_err(|err| ClientError::Other(anyhow::anyhow!("daemon sent invalid JSON: {err}")))?;
+        if let Some(error) = response.error {
+            return Err(ClientError::Daemon(error));
+        }
+        match response.reply {
+            Some(Reply::Status(view)) => on_snapshot(view).map_err(ClientError::Other)?,
+            _ => return Err(ClientError::Other(unexpected("status"))),
+        }
+    }
 }
 
 pub fn unexpected(expected: &str) -> anyhow::Error {

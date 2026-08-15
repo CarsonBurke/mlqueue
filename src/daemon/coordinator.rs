@@ -13,7 +13,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, Transaction};
 use serde_json::json;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::config::Config;
 use crate::db::{self, AttemptRow};
@@ -87,6 +87,14 @@ pub struct Coordinator {
     spawned: HashMap<AttemptId, Instant>,
     /// Orphaned attempts that already received a daemon-delivered SIGTERM.
     orphan_term_sent: HashSet<AttemptId>,
+    /// Latest committed event id, republished after every handled message so
+    /// streaming subscribers can refetch a snapshot instead of polling.
+    revisions: watch::Sender<i64>,
+    published_revision: i64,
+    /// Mirrors `admission_blocked` at the last publication: the flag is
+    /// derived in memory, so it is the one snapshot field the event log does
+    /// not already cover.
+    published_admission_blocked: bool,
 }
 
 impl Coordinator {
@@ -94,6 +102,10 @@ impl Coordinator {
         // Fail fast if /proc identity primitives are unavailable; every
         // recovery decision depends on them.
         identity::boot_id().context("reading boot id")?;
+        let published_revision = db::latest_event_id(&conn)?;
+        // Receivers are handed out by `revisions()`; the initial one is
+        // dropped because a daemon with no subscribers is the normal case.
+        let (revisions, _) = watch::channel(published_revision);
         Ok(Self {
             conn,
             config,
@@ -102,7 +114,16 @@ impl Coordinator {
             admission_blocked: None,
             spawned: HashMap::new(),
             orphan_term_sent: HashSet::new(),
+            revisions,
+            published_revision,
+            published_admission_blocked: false,
         })
+    }
+
+    /// A receiver that wakes whenever committed queue state changes. Handed
+    /// to streaming connections before the coordinator moves to its thread.
+    pub fn revisions(&self) -> watch::Receiver<i64> {
+        self.revisions.subscribe()
     }
 
     pub fn run(mut self, mut rx: mpsc::Receiver<Msg>) {
@@ -111,15 +132,48 @@ impl Coordinator {
         // prepared attempts, orphan/quarantine the rest, restore the
         // reservation before ordinary admission.
         self.tick();
+        self.publish_revision();
         while let Some(msg) = rx.blocking_recv() {
-            match msg {
-                Msg::Request { request, reply } => {
-                    let response = self.handle_request(*request);
-                    let _ = reply.send(response);
+            // Every committed change appends an event, so publishing the event
+            // cursor once per handled message — after the transaction closed,
+            // before the reply leaves for the socket — is the single choke
+            // point that covers mutations, ticks and scheduling passes alike.
+            let pending = match msg {
+                Msg::Request { request, reply } => Some((self.handle_request(*request), reply)),
+                Msg::Tick => {
+                    self.tick();
+                    None
                 }
-                Msg::Tick => self.tick(),
                 Msg::Shutdown => break,
+            };
+            self.publish_revision();
+            if let Some((response, reply)) = pending {
+                let _ = reply.send(response);
             }
+        }
+        // Dropping `self` drops the watch sender, which ends every stream.
+    }
+
+    /// Notify streaming subscribers that the snapshot they hold may be stale.
+    /// Runs on the coordinator thread with nothing locked and never blocks on
+    /// a subscriber: `watch` keeps only the newest revision, so a slow reader
+    /// coalesces instead of queueing.
+    fn publish_revision(&mut self) {
+        // `admission_blocked` is derived in memory and appends no event, so it
+        // is compared as well as the cursor; every other snapshot field moves
+        // only through a committed event.
+        let blocked = self.admission_blocked.is_some();
+        match db::latest_event_id(&self.conn) {
+            Ok(revision) => {
+                if revision != self.published_revision
+                    || blocked != self.published_admission_blocked
+                {
+                    self.published_revision = revision;
+                    self.published_admission_blocked = blocked;
+                    let _ = self.revisions.send(revision);
+                }
+            }
+            Err(err) => tracing::warn!("reading the event cursor for subscribers: {err:#}"),
         }
     }
 
@@ -127,9 +181,19 @@ impl Coordinator {
         if let Err(err) = self.reconcile_all() {
             tracing::error!("reconcile failed: {err:#}");
         }
+        if let Err(err) = self.advance_dependency_graph() {
+            tracing::error!("dependency reconciliation failed: {err:#}");
+        }
         if let Err(err) = self.schedule() {
             tracing::error!("scheduling pass failed: {err:#}");
         }
+    }
+
+    fn advance_dependency_graph(&mut self) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        db::advance_dependency_graph(&tx, now_ms())?;
+        tx.commit()?;
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -170,7 +234,11 @@ impl Coordinator {
 
     fn handle_read(&mut self, op: &Op) -> ApiResult<Reply> {
         match op {
-            Op::Status => Ok(Reply::Status(views::status_view(
+            // A subscription's every frame — the initial one and each refresh
+            // the connection requests after a revision bump — is a `Status`
+            // reply built here, so streaming never queries the database from a
+            // connection task.
+            Op::Status | Op::Subscribe => Ok(Reply::Status(views::status_view(
                 &self.conn,
                 &self.paths,
                 self.admission_blocked.is_some(),
@@ -779,6 +847,7 @@ impl Coordinator {
                                 (job.retry_delay_ms > 0).then(|| now + job.retry_delay_ms);
                             db::update_job_state(&tx, job.id, JobState::Queued, message, now)?;
                             db::set_job_retry_not_before(&tx, job.id, not_before, now)?;
+                            db::clear_job_readiness(&tx, job.id, now)?;
                             db::append_event(
                                 &tx,
                                 Some(job.id),
@@ -802,6 +871,7 @@ impl Coordinator {
                     _ => unreachable!("finalize called with non-terminal state"),
                 }
             }
+            db::advance_dependency_graph(&tx, now)?;
             tx.commit()?;
         }
         self.spawned.remove(&attempt.id);
@@ -1185,6 +1255,7 @@ fn apply_mutation(
 ) -> ApiResult<(Reply, Vec<PostAction>)> {
     match op {
         Op::Submit(params) => {
+            validate_submission_parents(tx, params)?;
             let job = db::insert_job(tx, params, now)?;
             db::append_event(
                 tx,
@@ -1202,9 +1273,10 @@ fn apply_mutation(
                     .to_string(),
                 ),
             )?;
+            db::advance_dependency_graph(tx, now)?;
             let row = db::job_row(tx, job)?.ok_or_else(|| api_not_found(job))?;
             Ok((
-                Reply::Submitted { job: views::job_view(tx, paths, &row, false)? },
+                Reply::Submitted { job: views::job_view(tx, paths, &row, true)? },
                 Vec::new(),
             ))
         }
@@ -1250,6 +1322,8 @@ fn apply_mutation(
             }
             db::update_job_state(tx, row.id, JobState::Queued, None, now)?;
             db::set_job_retry_not_before(tx, row.id, None, now)?;
+            db::clear_job_readiness(tx, row.id, now)?;
+            db::advance_dependency_graph(tx, now)?;
             db::append_event(tx, Some(row.id), None, "job_retried", "client", None)?;
             Ok((job_reply(tx, paths, *job)?, Vec::new()))
         }
@@ -1442,6 +1516,7 @@ fn apply_mutation(
                 "client",
                 None,
             )?;
+            db::advance_dependency_graph(tx, now)?;
             Ok((job_reply(tx, paths, *job)?, Vec::new()))
         }
         _ => Err(ApiError::new(error_codes::INTERNAL, "read op routed to mutation handler")),
@@ -1455,6 +1530,7 @@ fn cancel_job(tx: &Transaction<'_>, job: JobId, force: bool, now: i64) -> ApiRes
             invalidate_reservation_if_protected(tx, row.id, "protected job was cancelled", now)?;
             db::update_job_state(tx, row.id, JobState::Cancelled, Some("cancelled before start"), now)?;
             db::append_event(tx, Some(row.id), None, "job_cancelled", "client", None)?;
+            db::advance_dependency_graph(tx, now)?;
             Ok(Vec::new())
         }
         JobState::Starting | JobState::Running | JobState::NeedsAttention => {
@@ -1498,6 +1574,7 @@ fn cancel_job(tx: &Transaction<'_>, job: JobId, force: bool, now: i64) -> ApiRes
                         now,
                     )?;
                     db::append_event(tx, Some(row.id), None, "job_cancelled", "client", None)?;
+                    db::advance_dependency_graph(tx, now)?;
                     Ok(vec![PostAction::PublishCancel {
                         attempt_id: attempt.id,
                         token: attempt.launch_token.clone(),
@@ -1606,6 +1683,21 @@ fn validate_submission_fs(params: &SubmitParams) -> ApiResult<()> {
             return Err(invalid(format!(
                 "executable {executable} not found on the persisted PATH"
             )));
+        }
+    }
+    Ok(())
+}
+
+/// Parents are necessarily older jobs because edges are attached atomically
+/// to a brand-new child. That makes cycles unrepresentable without a graph
+/// traversal while still rejecting typos before insertion.
+fn validate_submission_parents(tx: &Transaction<'_>, params: &SubmitParams) -> ApiResult<()> {
+    for parent in params.dependencies.iter().map(|dependency| dependency.job) {
+        if parent <= 0 || db::job_row(tx, parent)?.is_none() {
+            return Err(ApiError::new(
+                error_codes::NOT_FOUND,
+                format!("dependency parent job {parent} does not exist"),
+            ));
         }
     }
     Ok(())

@@ -19,14 +19,14 @@ pub struct ActiveLease {
     pub limit: u32,
 }
 
-/// A job eligible to start: queued, not held, retry delay elapsed. Must be
-/// supplied in priority/FIFO order.
+/// A job eligible to start: prerequisites satisfied, queued, not held, and
+/// retry delay elapsed. Must be supplied in priority/readiness-FIFO order.
 #[derive(Debug, Clone)]
 pub struct Candidate {
     pub job_id: JobId,
-    pub seq: i64,
+    pub ready_seq: i64,
     pub limit: u32,
-    /// Higher values rank first. Sequence is the FIFO tiebreaker.
+    /// Higher values rank first. Readiness sequence is the FIFO tiebreaker.
     pub priority: i64,
 }
 
@@ -36,8 +36,8 @@ pub struct ReservationSnapshot {
     pub job_id: JobId,
     /// `None` while the backfill window is open: an initial blocker of the
     /// protected job is still advancing, so any equal-priority eligible job
-    /// may consume its single bypass regardless of submission order. `Some`
-    /// once the frontier is frozen; jobs submitted after the cutoff may then
+    /// may consume its single bypass regardless of readiness order. `Some`
+    /// once the frontier is frozen; jobs becoming ready after the cutoff may
     /// never pass. The coordinator derives this from blocker liveness and the
     /// persisted cutoff.
     pub cutoff_seq: Option<i64>,
@@ -104,7 +104,8 @@ pub fn plan_pass(
     reservation: Option<&ReservationSnapshot>,
 ) -> PassOutcome {
     debug_assert!(eligible.windows(2).all(|w| {
-        w[0].priority > w[1].priority || (w[0].priority == w[1].priority && w[0].seq < w[1].seq)
+        w[0].priority > w[1].priority
+            || (w[0].priority == w[1].priority && w[0].ready_seq < w[1].ready_seq)
     }));
 
     let mut outcome = PassOutcome::default();
@@ -187,7 +188,7 @@ pub fn plan_pass(
                 // only pre-cutoff jobs once frozen — whose single bypass is
                 // unconsumed.
                 let backfill = eligible.iter().find(|c| {
-                    r.cutoff_seq.is_none_or(|cutoff| c.seq <= cutoff)
+                    r.cutoff_seq.is_none_or(|cutoff| c.ready_seq <= cutoff)
                         && c.job_id != r.job_id
                         && c.priority == protected.priority
                         && !r.consumed.contains(&c.job_id)
@@ -259,7 +260,7 @@ mod tests {
     fn cand(job_id: JobId, limit: u32) -> Candidate {
         Candidate {
             job_id,
-            seq: job_id,
+            ready_seq: job_id,
             limit,
             priority: 0,
         }
@@ -268,7 +269,7 @@ mod tests {
     fn prioritized(job_id: JobId, limit: u32, priority: i64) -> Candidate {
         Candidate {
             job_id,
-            seq: job_id,
+            ready_seq: job_id,
             limit,
             priority,
         }
@@ -445,6 +446,27 @@ mod tests {
     }
 
     #[test]
+    fn frozen_frontier_uses_readiness_order_not_job_id() {
+        let active = leases(&[3, 3]);
+        let eligible = vec![
+            Candidate { job_id: 100, ready_seq: 1, limit: 1, priority: 0 },
+            Candidate { job_id: 200, ready_seq: 5, limit: 3, priority: 0 },
+            Candidate { job_id: 1, ready_seq: 11, limit: 3, priority: 0 },
+        ];
+        let reservation = ReservationSnapshot {
+            job_id: 100,
+            cutoff_seq: Some(10),
+            consumed: BTreeSet::new(),
+        };
+        let outcome = plan_pass(&active, &eligible, Some(&reservation));
+        assert_eq!(start_ids(&outcome), vec![200]);
+        assert!(
+            !outcome.starts.iter().any(|start| start.job_id == 1),
+            "an old job id that became ready after the freeze cannot bypass"
+        );
+    }
+
+    #[test]
     fn protected_job_starts_before_backfills_when_drained() {
         // Everything drained: the protected LLM(1) starts alone; eligible
         // CleanRL jobs must not start beside it.
@@ -527,7 +549,7 @@ mod tests {
                             let priority = rng(3) as i64 - 1;
                             queued.push(Candidate {
                                 job_id: next_seq,
-                                seq: next_seq,
+                                ready_seq: next_seq,
                                 limit,
                                 priority,
                             });
@@ -552,7 +574,7 @@ mod tests {
                 }
 
                 queued.sort_by_key(|candidate| {
-                    (std::cmp::Reverse(candidate.priority), candidate.seq)
+                    (std::cmp::Reverse(candidate.priority), candidate.ready_seq)
                 });
                 let outcome = plan_pass(&active, &queued, reservation.as_ref());
 
@@ -581,7 +603,7 @@ mod tests {
                         assert!(start.consumes_bypass() || c.job_id == r.job_id);
                         if let Some(cutoff) = r.cutoff_seq {
                             assert!(
-                                c.seq <= cutoff || c.job_id == r.job_id,
+                                c.ready_seq <= cutoff || c.job_id == r.job_id,
                                 "post-cutoff job {} bypassed protected job {}",
                                 c.job_id,
                                 r.job_id
