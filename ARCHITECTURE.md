@@ -157,24 +157,28 @@ drained for the window so they cannot hold it open forever.
 | `set-priority` | queued, held only | No preemption; invalidates reservation if the protected job’s priority changes |
 | `hold` | queued | Invalidates reservation if protected |
 | `cancel` | most states | Before start → terminal; after start → signal process group |
+| `pause` / `unpause` | always | Durable operator gate. Submissions still enqueue; running leases continue; the scheduler issues no new leases until unpause. Pause survives daemon restart. |
 
 ## Scheduling pass (outline)
 
 On each pass the coordinator:
 
 1. Reconciles leases and terminal attempts.
-2. Supersedes a protected job if a higher-priority eligible head exists.
-3. Starts the protected job if now compatible.
-4. If still reserved and blocked, considers only equal-priority unconsumed
+2. If the operator pause is set, stops there: no new attempts, no reservation
+   mutations. Running work and dependency resolution continue on other paths.
+3. Supersedes a protected job if a higher-priority eligible head exists.
+4. Starts the protected job if now compatible.
+5. If still reserved and blocked, considers only equal-priority unconsumed
    candidates (window or frozen cutoff rules).
-5. Else walks eligible jobs in priority/FIFO; protects the first incompatible
+6. Else walks eligible jobs in priority/FIFO; protects the first incompatible
    head; admits greedily against a **shadow** running set (never evaluate the
    whole batch against the same initial count).
-6. Commits attempts, leases, reservation rows, and events in one transaction
+7. Commits attempts, leases, reservation rows, and events in one transaction
    after revalidation.
 
 Unknown reservation semantics versions block ordinary admission until an
 operator migrates or invalidates the reservation (`admission_blocked`).
+
 
 ## Protocol
 
@@ -261,8 +265,10 @@ readiness sequence; historical cancelled and skipped records remain truthful.
 | `run_leases` | One active lease per attempt; source of truth for the formula |
 | `scheduler_reservation` | Protected job, cutoff, initial blockers, semantics version |
 | `scheduler_reservation_backfills` | One bypass consumption per job per reservation |
+| `scheduler_pause` | Singleton operator pause flag (migration v6) |
 | `operations` | Idempotency keys, request hash, stored response / tombstone |
 | `events` | Append-only audit log |
+
 
 Job IDs are `AUTOINCREMENT` rowids. Scheduling uses a separate durable
 readiness sequence, so pre-enqueued dependency waiters do not reserve old FIFO

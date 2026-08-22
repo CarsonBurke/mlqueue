@@ -222,6 +222,16 @@ const MIGRATIONS: &[&str] = &[
        SET semantics_version = 4
      WHERE status = 'active' AND semantics_version = 3;
     "#,
+    // v6: durable operator pause. Queued work stays queued; the scheduler
+    // issues no new run leases until unpause. Running leases are untouched.
+    r#"
+    CREATE TABLE scheduler_pause (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        paused INTEGER NOT NULL CHECK (paused IN (0, 1)),
+        updated_at INTEGER NOT NULL
+    );
+    INSERT INTO scheduler_pause (singleton, paused, updated_at) VALUES (1, 0, 0);
+    "#,
 ];
 
 pub fn open(path: &Path) -> Result<Connection> {
@@ -1189,6 +1199,29 @@ pub fn record_backfill(
 }
 
 // ---------------------------------------------------------------------------
+// Operator pause
+// ---------------------------------------------------------------------------
+
+pub fn is_paused(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT paused FROM scheduler_pause WHERE singleton = 1",
+        [],
+        |row| Ok(row.get::<_, i64>(0)? != 0),
+    )?)
+}
+
+/// Set the operator pause flag. Returns whether the stored value changed.
+pub fn set_paused(conn: &Connection, paused: bool, now: i64) -> Result<bool> {
+    let changed = conn.execute(
+        "UPDATE scheduler_pause
+            SET paused = ?1, updated_at = ?2
+          WHERE singleton = 1 AND paused != ?1",
+        rusqlite::params![i64::from(paused), now],
+    )? > 0;
+    Ok(changed)
+}
+
+// ---------------------------------------------------------------------------
 // Operations (idempotency)
 // ---------------------------------------------------------------------------
 
@@ -1397,6 +1430,19 @@ mod tests {
         assert_eq!(job_row(&conn, id).unwrap().unwrap().priority, 4);
         set_job_priority(&conn, id, -3, 1002).unwrap();
         assert_eq!(job_row(&conn, id).unwrap().unwrap().priority, -3);
+    }
+
+    #[test]
+    fn pause_flag_defaults_off_and_is_idempotent() {
+        let conn = open_in_memory().unwrap();
+        assert!(!is_paused(&conn).unwrap());
+        assert!(set_paused(&conn, true, 1).unwrap());
+        assert!(is_paused(&conn).unwrap());
+        assert!(!set_paused(&conn, true, 2).unwrap());
+        assert!(is_paused(&conn).unwrap());
+        assert!(set_paused(&conn, false, 3).unwrap());
+        assert!(!is_paused(&conn).unwrap());
+        assert!(!set_paused(&conn, false, 4).unwrap());
     }
 
     #[test]

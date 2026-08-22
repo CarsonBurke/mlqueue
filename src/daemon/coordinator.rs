@@ -299,6 +299,7 @@ impl Coordinator {
                 active_leases: db::active_leases(&self.conn)?.len() as u32,
                 queued_jobs: db::count_jobs_in_state(&self.conn, JobState::Queued)?,
                 admission_blocked: self.admission_blocked.is_some(),
+                paused: db::is_paused(&self.conn)?,
             })),
             Op::RecoverList => {
                 let attempts = db::non_terminal_attempts(&self.conn)?
@@ -901,6 +902,9 @@ impl Coordinator {
             }
             tracing::info!("admission unblocked: the unsupported reservation was resolved");
             self.admission_blocked = None;
+        }
+        if db::is_paused(&self.conn)? {
+            return Ok(());
         }
         let now = now_ms();
         let leases = db::active_leases(&self.conn)?;
@@ -1518,6 +1522,20 @@ fn apply_mutation(
             )?;
             db::advance_dependency_graph(tx, now)?;
             Ok((job_reply(tx, paths, *job)?, Vec::new()))
+        }
+        Op::Pause | Op::Unpause => {
+            let paused = matches!(op, Op::Pause);
+            if db::set_paused(tx, paused, now)? {
+                db::append_event(
+                    tx,
+                    None,
+                    None,
+                    if paused { "queue_paused" } else { "queue_unpaused" },
+                    "client",
+                    None,
+                )?;
+            }
+            Ok((Reply::Paused { paused }, Vec::new()))
         }
         _ => Err(ApiError::new(error_codes::INTERNAL, "read op routed to mutation handler")),
     }

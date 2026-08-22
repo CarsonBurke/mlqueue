@@ -51,3 +51,6 @@ mlq submit --name NAME --max-parallel-runs N \
   `retry` to control it. Report the submitted job ID, chosen parallel limit,
   chosen time limit (or the decision to leave it unlimited), and any nonzero
   priority.
+- If `mlq status` reports the queue is paused, new work will not start until
+  an operator runs `mlq unpause`. Do not pause or unpause the shared queue
+  unless the user asked.

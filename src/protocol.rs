@@ -59,6 +59,10 @@ pub enum Op {
     Cancel { job: JobId, force: bool },
     Hold { job: JobId },
     Release { job: JobId },
+    /// Stop new admissions. Queued work stays queued; running leases continue.
+    Pause,
+    /// Resume admissions after [`Op::Pause`].
+    Unpause,
     Retry { job: JobId },
     SetMaxParallelRuns { job: JobId, max_parallel_runs: u32 },
     SetPriority { job: JobId, priority: i64 },
@@ -75,6 +79,8 @@ impl Op {
                 | Op::Cancel { .. }
                 | Op::Hold { .. }
                 | Op::Release { .. }
+                | Op::Pause
+                | Op::Unpause
                 | Op::Retry { .. }
                 | Op::SetMaxParallelRuns { .. }
                 | Op::SetPriority { .. }
@@ -94,6 +100,8 @@ impl Op {
             Op::Cancel { .. } => "cancel",
             Op::Hold { .. } => "hold",
             Op::Release { .. } => "release",
+            Op::Pause => "pause",
+            Op::Unpause => "unpause",
             Op::Retry { .. } => "retry",
             Op::SetMaxParallelRuns { .. } => "set_max_parallel_runs",
             Op::SetPriority { .. } => "set_priority",
@@ -257,6 +265,7 @@ pub enum Reply {
     LogPaths(LogPathsView),
     DaemonStatus(DaemonStatusView),
     RecoverList { attempts: Vec<AttemptView> },
+    Paused { paused: bool },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -380,6 +389,9 @@ pub struct StatusView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reservation: Option<ReservationView>,
     pub admission_blocked: bool,
+    /// Operator gate: no new run leases until `mlq unpause`.
+    #[serde(default)]
+    pub paused: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -445,6 +457,8 @@ pub struct DaemonStatusView {
     pub active_leases: u32,
     pub queued_jobs: u32,
     pub admission_blocked: bool,
+    #[serde(default)]
+    pub paused: bool,
 }
 
 fn frame_len(bytes_len: usize, max: u32) -> io::Result<u32> {
@@ -642,6 +656,18 @@ mod tests {
         // distinct from the other read ops.
         assert_ne!(Op::Subscribe.request_hash(), Op::Status.request_hash());
         assert!(Op::Subscribe.legacy_v5_request_hash().is_none());
+    }
+
+    #[test]
+    fn pause_and_unpause_are_idempotent_mutations() {
+        assert!(Op::Pause.is_mutation());
+        assert!(Op::Unpause.is_mutation());
+        assert_eq!(Op::Pause.kind(), "pause");
+        assert_eq!(Op::Unpause.kind(), "unpause");
+        assert_eq!(serde_json::to_string(&Op::Pause).unwrap(), r#"{"type":"pause"}"#);
+        assert_eq!(serde_json::to_string(&Op::Unpause).unwrap(), r#"{"type":"unpause"}"#);
+        assert_ne!(Op::Pause.request_hash(), Op::Unpause.request_hash());
+        assert!(Op::Pause.legacy_v5_request_hash().is_none());
     }
 
     #[test]

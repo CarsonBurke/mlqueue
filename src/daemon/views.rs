@@ -70,6 +70,8 @@ fn eligibility_reason(
                 && !parents.is_empty()
             {
                 Some(format!("waiting_for_dependencies: jobs {parents:?}"))
+            } else if db::is_paused(conn)? {
+                Some("paused".to_string())
             } else if let Some(res) = reservation {
                 let frontier = db::backfill_frontier(conn, res)?;
                 let protected = db::job_row(conn, res.job_id)?;
@@ -209,6 +211,7 @@ pub fn status_view(conn: &Connection, paths: &Paths, admission_blocked: bool) ->
             None => None,
         },
         admission_blocked,
+        paused: db::is_paused(conn)?,
     })
 }
 

@@ -51,6 +51,8 @@ mlq show 1
 mlq logs 1 --follow       # exit code matches the attempt
 mlq wait 1                # block until terminal; exit 0 / exit-code / 128+sig
 mlq cancel 1              # SIGTERM; add --force for SIGKILL after grace
+mlq pause                 # no new starts; queued work waits; running work continues
+mlq unpause               # resume admission
 ```
 
 ## Admission model
@@ -124,6 +126,7 @@ mlq set-priority 12 2     # retune queued or held job only
 | `wait JOB` | Block until terminal (`--timeout`, exit codes below) |
 | `cancel JOB` | Cancel; `--force` escalates to SIGKILL after grace |
 | `hold` / `release` | Park and restore a queued job |
+| `pause` / `unpause` | Stop / resume new starts (running work continues) |
 | `retry JOB` | Requeue a failed or lost job |
 | `set-max-parallel-runs JOB N` | Change limit on queued **or live** jobs |
 | `set-priority JOB P` | Change priority on **queued/held** jobs only |
@@ -186,6 +189,16 @@ supervisor can restart it. Streams are budgeted at a quarter of
 atomically. Lowering a limit below the current number of active leases is
 allowed: existing work keeps running (no preemption), and the scheduler
 refuses new admissions until the active set drains to a compatible size.
+
+
+### Pausing the queue
+
+`mlq pause` is a durable operator gate: new submissions still enqueue, running
+jobs keep their leases, and nothing queued becomes `starting`/`running` until
+`mlq unpause`. Typical use is to drain or kill current work before leaving the
+machine, then resume later. The flag is stored in SQLite, so it survives
+daemon restart. `mlq status` and `mlq daemon status` show when the queue is
+paused.
 
 ## Submit recipe for agents
 

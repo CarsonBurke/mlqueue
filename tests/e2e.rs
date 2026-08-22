@@ -1276,6 +1276,36 @@ fn hold_excludes_from_scheduling_until_release() {
 }
 
 #[test]
+fn pause_blocks_new_starts_until_unpause() {
+    let mut q = TestQueue::new();
+
+    let running = q.submit(&["--name", "running"], &["sleep", "2"]);
+    q.wait_state(running, "running", Duration::from_secs(5));
+
+    assert_eq!(q.cli(&["pause"]).trim(), "queue paused");
+    assert_eq!(q.status()["paused"], serde_json::json!(true));
+    assert_eq!(q.cli_json(&["daemon", "status", "--json"])["paused"], true);
+    assert_eq!(q.cli_json(&["pause", "--json"])["paused"], true);
+
+    let queued = q.submit(&["--name", "queued"], &["sh", "-c", "true"]);
+    q.wait_state(running, "succeeded", Duration::from_secs(10));
+    std::thread::sleep(Duration::from_millis(400));
+    let view = q.job(queued);
+    assert_eq!(view["state"], "queued");
+    assert_eq!(view["eligibility"], "paused");
+
+    q.kill_daemon();
+    q.start_daemon();
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(q.job_state(queued), "queued");
+    assert_eq!(q.status()["paused"], serde_json::json!(true));
+
+    assert_eq!(q.cli(&["unpause"]).trim(), "queue unpaused");
+    q.wait_state(queued, "succeeded", Duration::from_secs(10));
+    assert_eq!(q.status()["paused"], serde_json::json!(false));
+}
+
+#[test]
 fn second_daemon_instance_is_refused() {
     let q = TestQueue::new();
     let mut second = q.spawn_daemon();
