@@ -55,6 +55,11 @@ pub enum Op {
     FollowTtsSnapshot,
     Events { after: i64, limit: u32 },
     Show { job: JobId },
+    /// Job detail; omit `job` to select the most recently submitted job.
+    See {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        job: Option<JobId>,
+    },
     Logs { job: JobId, attempt: Option<i64> },
     Cancel { job: JobId, force: bool },
     Hold { job: JobId },
@@ -96,6 +101,7 @@ impl Op {
             Op::FollowTtsSnapshot => "follow_tts_snapshot",
             Op::Events { .. } => "events",
             Op::Show { .. } => "show",
+            Op::See { .. } => "see",
             Op::Logs { .. } => "logs",
             Op::Cancel { .. } => "cancel",
             Op::Hold { .. } => "hold",
@@ -668,6 +674,23 @@ mod tests {
         assert_eq!(serde_json::to_string(&Op::Unpause).unwrap(), r#"{"type":"unpause"}"#);
         assert_ne!(Op::Pause.request_hash(), Op::Unpause.request_hash());
         assert!(Op::Pause.legacy_v5_request_hash().is_none());
+    }
+
+    #[test]
+    fn see_is_a_read_op_with_optional_job() {
+        let wire = r#"{"protocol_version":8,"request_id":"r1","op":{"type":"see"}}"#;
+        let request: Request = serde_json::from_str(wire).unwrap();
+        assert_eq!(request.protocol_version, PROTOCOL_VERSION);
+        assert!(matches!(request.op, Op::See { job: None }));
+        assert_eq!(request.op.kind(), "see");
+        assert!(!request.op.is_mutation());
+        assert_eq!(serde_json::to_string(&Op::See { job: None }).unwrap(), r#"{"type":"see"}"#);
+        assert_eq!(
+            serde_json::to_string(&Op::See { job: Some(12) }).unwrap(),
+            r#"{"type":"see","job":12}"#
+        );
+        assert_ne!(Op::See { job: None }.request_hash(), Op::Show { job: 12 }.request_hash());
+        assert!(Op::See { job: None }.legacy_v5_request_hash().is_none());
     }
 
     #[test]

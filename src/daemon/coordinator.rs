@@ -264,6 +264,16 @@ impl Coordinator {
                     .ok_or_else(|| ApiError::new(error_codes::NOT_FOUND, format!("job {job} not found")))?;
                 Ok(Reply::Job { job: views::job_view(&self.conn, &self.paths, &row, true)? })
             }
+            Op::See { job } => {
+                let job = match *job {
+                    Some(job) => job,
+                    None => db::latest_job_id(&self.conn)?.ok_or_else(|| {
+                        ApiError::new(error_codes::NOT_FOUND, "no jobs")
+                    })?,
+                };
+                let row = db::job_row(&self.conn, job)?.ok_or_else(|| api_not_found(job))?;
+                Ok(Reply::Job { job: views::job_view(&self.conn, &self.paths, &row, true)? })
+            }
             Op::Logs { job, attempt } => {
                 let attempt_row = match attempt {
                     Some(number) => db::attempt_by_number(&self.conn, *job, *number)?,
