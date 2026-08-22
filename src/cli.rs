@@ -74,6 +74,13 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect one job: detail and latest stdout. Omit JOB to pick the most
+    /// recently submitted job.
+    See {
+        job: Option<JobId>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Print (or follow) an attempt's captured output.
     Logs {
         job: JobId,
@@ -283,6 +290,7 @@ pub fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::See { job, json } => see(&paths, job, json),
         Command::Logs { job, attempt, stderr, follow } => logs(&paths, job, attempt, stderr, follow),
         Command::Wait { job, timeout, json } => wait(&paths, job, timeout, json),
         Command::Cancel { job, force, json } => {
@@ -1066,6 +1074,21 @@ fn print_job_detail(job: &JobView) {
     }
 }
 
+fn see(paths: &Paths, job: Option<JobId>, json: bool) -> Result<()> {
+    let reply = send(paths, Op::See { job }, None)?;
+    let Reply::Job { job } = reply else { bail!(client::unexpected("job")) };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&job)?);
+        return Ok(());
+    }
+    print_job_detail(&job);
+    if !job.attempts.is_empty() {
+        println!();
+        logs(paths, job.id, None, false, false)?;
+    }
+    Ok(())
+}
+
 fn logs(paths: &Paths, job: JobId, attempt: Option<i64>, stderr: bool, follow: bool) -> Result<()> {
     let fetch = |attempt| -> Result<LogPathsView> {
         let reply = send(paths, Op::Logs { job, attempt }, None)?;
@@ -1468,6 +1491,18 @@ mod tests {
         job.priority = 3;
         let msg = format_mutation_message(&Op::SetPriority { job: 7, priority: 3 }, &job);
         assert_eq!(msg, "job 7 [retune] priority is now 3");
+    }
+
+    #[test]
+    fn see_accepts_optional_job_id() {
+        assert!(matches!(
+            Cli::try_parse_from(["mlq", "see"]).unwrap().command,
+            Command::See { job: None, json: false }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["mlq", "see", "12", "--json"]).unwrap().command,
+            Command::See { job: Some(12), json: true }
+        ));
     }
 
     #[test]

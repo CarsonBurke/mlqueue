@@ -47,10 +47,11 @@ mlq submit --name NAME --max-parallel-runs N \
 - Change a queued or held job's order with `mlq set-priority JOB P`. Running
   jobs cannot change priority (no preemption). Do not raise priority merely to
   jump the queue for your own work.
-- Use `mlq status`, `show`, and `logs` to observe work, and `cancel` or
+- Use `mlq status`, `show`, `see`, and `logs` to observe work, and `cancel` or
   `retry` to control it. Report the submitted job ID, chosen parallel limit,
   chosen time limit (or the decision to leave it unlimited), and any nonzero
   priority.
 - If `mlq status` reports the queue is paused, new work will not start until
   an operator runs `mlq unpause`. Do not pause or unpause the shared queue
   unless the user asked.
+

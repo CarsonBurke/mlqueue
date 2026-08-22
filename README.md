@@ -48,6 +48,8 @@ mlq submit --name bounded --time-limit 2h -- cargo run --release --bin train
 mlq status                # live queue: running, queued, held
 mlq status -f             # recent finished runs only
 mlq show 1
+mlq see 1                 # detail plus latest stdout
+mlq see                   # most recently submitted job
 mlq logs 1 --follow       # exit code matches the attempt
 mlq wait 1                # block until terminal; exit 0 / exit-code / 128+sig
 mlq cancel 1              # SIGTERM; add --force for SIGKILL after grace
@@ -122,6 +124,7 @@ mlq set-priority 12 2     # retune queued or held job only
 | `status -f` | Most recent finished runs only |
 | `subscribe` | Stream queue snapshots as NDJSON (no polling) |
 | `show JOB` | Full job detail and attempts |
+| `see [JOB]` | Job detail and latest stdout; latest job if omitted |
 | `logs JOB` | Stdout/stderr; `--follow` exits with attempt outcome |
 | `wait JOB` | Block until terminal (`--timeout`, exit codes below) |
 | `cancel JOB` | Cancel; `--force` escalates to SIGKILL after grace |
@@ -133,6 +136,7 @@ mlq set-priority 12 2     # retune queued or held job only
 | `follow-tts` | Speak completions and newly running work via local `tts` |
 | `daemon …` | `status` / `run` / `install` / `uninstall` |
 | `recover …` | List or resolve orphaned/quarantined attempts |
+
 
 Common flags:
 
@@ -190,7 +194,6 @@ atomically. Lowering a limit below the current number of active leases is
 allowed: existing work keeps running (no preemption), and the scheduler
 refuses new admissions until the active set drains to a compatible size.
 
-
 ### Pausing the queue
 
 `mlq pause` is a durable operator gate: new submissions still enqueue, running
@@ -199,6 +202,7 @@ jobs keep their leases, and nothing queued becomes `starting`/`running` until
 machine, then resume later. The flag is stored in SQLite, so it survives
 daemon restart. `mlq status` and `mlq daemon status` show when the queue is
 paused.
+
 
 ## Submit recipe for agents
 

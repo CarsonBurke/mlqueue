@@ -480,6 +480,11 @@ pub fn job_row(conn: &Connection, id: JobId) -> Result<Option<JobRow>> {
         .optional()?)
 }
 
+/// Most recently submitted job (`MAX(id)`), if the queue is not empty.
+pub fn latest_job_id(conn: &Connection) -> Result<Option<JobId>> {
+    Ok(conn.query_row("SELECT MAX(id) FROM jobs", [], |row| row.get(0))?)
+}
+
 /// Jobs shown by `status`: all non-terminal plus the most recent terminal.
 pub fn status_jobs(conn: &Connection, recent_terminal: u32) -> Result<Vec<JobRow>> {
     let mut stmt = conn.prepare(&format!(
@@ -1443,6 +1448,16 @@ mod tests {
         assert!(set_paused(&conn, false, 3).unwrap());
         assert!(!is_paused(&conn).unwrap());
         assert!(!set_paused(&conn, false, 4).unwrap());
+    }
+
+    #[test]
+    fn latest_job_id_tracks_max_rowid() {
+        let conn = open_in_memory().unwrap();
+        assert_eq!(latest_job_id(&conn).unwrap(), None);
+        let first = insert_job(&conn, &submit_params("a", 1), 1).unwrap();
+        let second = insert_job(&conn, &submit_params("b", 1), 2).unwrap();
+        assert_eq!(latest_job_id(&conn).unwrap(), Some(second));
+        assert!(second > first);
     }
 
     #[test]

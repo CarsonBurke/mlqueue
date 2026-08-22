@@ -1579,3 +1579,48 @@ fn logs_follow_reports_the_terminal_outcome() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("fine-marker"));
     assert!(String::from_utf8_lossy(&output.stderr).contains("attempt 1 succeeded"));
 }
+
+#[test]
+fn see_prints_detail_and_latest_stdout() {
+    let q = TestQueue::new();
+    let empty = q.try_cli(&["see"]);
+    assert!(!empty.status.success());
+    assert!(
+        String::from_utf8_lossy(&empty.stderr).contains("no jobs"),
+        "empty queue: {}",
+        String::from_utf8_lossy(&empty.stderr)
+    );
+
+    let older = q.submit(
+        &["--name", "older", "--env", "MLQ_SEE_MARK=older-stdout-only"],
+        &["sh", "-c", "echo \"$MLQ_SEE_MARK\""],
+    );
+    q.wait_state(older, "succeeded", Duration::from_secs(10));
+    let job = q.submit(
+        &["--name", "see-me", "--env", "MLQ_SEE_MARK=see-stdout-only"],
+        &["sh", "-c", "echo \"$MLQ_SEE_MARK\""],
+    );
+    q.wait_state(job, "succeeded", Duration::from_secs(10));
+
+    let shown = q.cli(&["see", &job.to_string()]);
+    assert!(shown.contains(&format!("job {job} [see-me]")), "{shown}");
+    assert!(shown.contains("see-stdout-only"), "{shown}");
+    assert!(!shown.contains("older-stdout-only"), "{shown}");
+
+    let latest = q.cli(&["see"]);
+    assert!(latest.contains(&format!("job {job} [see-me]")), "{latest}");
+    assert!(latest.contains("see-stdout-only"), "{latest}");
+    assert!(!latest.contains("older-stdout-only"), "{latest}");
+
+    let json = q.cli_json(&["see", "--json"]);
+    assert_eq!(json["id"], job);
+    assert_eq!(json["name"], "see-me");
+
+    let missing = q.try_cli(&["see", "999"]);
+    assert!(!missing.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("not found"),
+        "missing job: {}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+}
