@@ -118,6 +118,17 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Stop new runs from starting. Queued work stays queued; running work continues.
+    Pause {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resume admissions after `pause`.
+    Unpause {
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Requeue a failed or lost job for one more attempt.
     Retry {
         job: JobId,
@@ -279,6 +290,8 @@ pub fn main() -> Result<()> {
         }
         Command::Hold { job, json } => mutate_job(&paths, Op::Hold { job }, key, json),
         Command::Release { job, json } => mutate_job(&paths, Op::Release { job }, key, json),
+        Command::Pause { json } => mutate_pause(&paths, Op::Pause, key, json),
+        Command::Unpause { json } => mutate_pause(&paths, Op::Unpause, key, json),
         Command::Retry { job, json } => mutate_job(&paths, Op::Retry { job }, key, json),
         Command::SetMaxParallelRuns { job, max_parallel_runs, json } => {
             mutate_job(&paths, Op::SetMaxParallelRuns { job, max_parallel_runs }, key, json)
@@ -299,6 +312,9 @@ pub fn main() -> Result<()> {
                 println!("  database:       {}", view.db_path);
                 println!("  active leases:  {}", view.active_leases);
                 println!("  queued jobs:    {}", view.queued_jobs);
+                if view.paused {
+                    println!("  paused");
+                }
                 if view.admission_blocked {
                     println!("  admission blocked");
                 }
@@ -360,6 +376,19 @@ fn mutate_job(paths: &Paths, op: Op, key: String, json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&job)?);
     } else {
         println!("{}", format_mutation_message(&op, &job));
+    }
+    Ok(())
+}
+
+fn mutate_pause(paths: &Paths, op: Op, key: String, json: bool) -> Result<()> {
+    let reply = send(paths, op.clone(), Some(key))?;
+    let Reply::Paused { paused } = reply else { bail!(client::unexpected("paused")) };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "paused": paused }))?);
+    } else if matches!(op, Op::Pause) {
+        println!("queue paused");
+    } else {
+        println!("queue unpaused");
     }
     Ok(())
 }
@@ -845,6 +874,9 @@ fn render_status(view: &StatusView, finished_only: bool) -> String {
             res.protected_job, res.blocking_attempts, res.consumed_bypasses
         )
         .unwrap();
+    }
+    if view.paused {
+        writeln!(output, "paused: new runs will not start").unwrap();
     }
     if view.admission_blocked {
         writeln!(output, "admission blocked (see daemon logs)").unwrap();
@@ -1439,6 +1471,32 @@ mod tests {
     }
 
     #[test]
+    fn pause_and_unpause_are_top_level_commands() {
+        assert!(matches!(
+            Cli::try_parse_from(["mlq", "pause"]).unwrap().command,
+            Command::Pause { json: false }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["mlq", "unpause", "--json"]).unwrap().command,
+            Command::Unpause { json: true }
+        ));
+    }
+
+    #[test]
+    fn status_announces_operator_pause() {
+        let view = StatusView {
+            jobs: vec![],
+            active_leases: 0,
+            effective_limit: None,
+            reservation: None,
+            admission_blocked: false,
+            paused: true,
+        };
+        let shown = render_status(&view, false);
+        assert!(shown.contains("paused: new runs will not start"), "{shown}");
+    }
+
+    #[test]
     fn queued_status_orders_by_priority_then_fifo() {
         let low = status_job(1, "queued", None);
         let mut high_first = status_job(2, "queued", None);
@@ -1451,6 +1509,7 @@ mod tests {
             effective_limit: None,
             reservation: None,
             admission_blocked: false,
+            paused: false,
         };
         let (_, queued, _, _) = status_sections(&view);
         assert_eq!(
@@ -1503,6 +1562,7 @@ mod tests {
             effective_limit: Some(1),
             reservation: None,
             admission_blocked: false,
+            paused: false,
         };
 
         let (live, queued, held, finished) = status_sections(&view);
@@ -1557,6 +1617,7 @@ mod tests {
             effective_limit: None,
             reservation: None,
             admission_blocked: false,
+            paused: false,
         };
         assert_eq!(render_status(&empty, true).trim(), "no finished runs");
 
@@ -1566,6 +1627,7 @@ mod tests {
             effective_limit: Some(1),
             reservation: None,
             admission_blocked: false,
+            paused: false,
         };
         assert_eq!(render_status(&live_only, true).trim(), "no finished runs");
 
@@ -1575,6 +1637,7 @@ mod tests {
             effective_limit: None,
             reservation: None,
             admission_blocked: false,
+            paused: false,
         };
         let shown = render_status(&history, true);
         assert!(shown.contains("Finished Runs"), "{shown}");
