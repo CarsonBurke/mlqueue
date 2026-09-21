@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+"""Stage an mlqd binary and activate it only when the managed queue is idle."""
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import socket
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+
+def run(*args, **kwargs):
+    return subprocess.run(args, check=True, capture_output=True, text=True, timeout=30, **kwargs).stdout
+
+
+def systemctl(*args):
+    return run('systemctl', '--user', *args)
+
+
+def digest(path):
+    with open(path, 'rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+def sync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def atomic_json(path, value):
+    temporary = path.with_suffix('.new')
+    with temporary.open('w') as stream:
+        json.dump(value, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+    sync_directory(path.parent)
+
+
+@contextlib.contextmanager
+def locked(path):
+    with path.open('a') as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        yield
+
+
+def replace_binary(source, target):
+    # Rename, never truncate an executable that a running process may still use.
+    with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as stream:
+        temporary = Path(stream.name)
+    try:
+        shutil.copyfile(source, temporary)
+        temporary.chmod(0o755)
+        with temporary.open('rb') as stream:
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+        sync_directory(target.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def status(manifest):
+    return json.loads(run(manifest['observer'], 'daemon', 'status', '--json', env=manifest['env']))
+
+
+def ready(manifest):
+    deadline = time.monotonic() + 15
+    while True:
+        try:
+            pid = int(systemctl('show', manifest['service'], '-p', 'MainPID', '--value'))
+            if digest(f'/proc/{pid}/exe') == digest(manifest['target']):
+                with socket.socket(socket.AF_UNIX) as connection:
+                    connection.settimeout(1)
+                    connection.connect(manifest['socket'])
+                return
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+        if time.monotonic() >= deadline:
+            raise RuntimeError('managed daemon did not become ready; pending update retained')
+        time.sleep(0.1)
+
+
+def idle_snapshot(snapshot):
+    return (snapshot['activeLeases'] == 0 and not snapshot['admissionBlocked']
+            and all(job.get('finishedAt') is not None for job in snapshot['jobs']))
+
+
+def idle_database(path):
+    # The caller holds daemon.lock while mlqd is stopped. No admission can race
+    # this read. Unknown/nonterminal states and unreleased leases fail closed.
+    with contextlib.closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)) as db:
+        return not db.execute("SELECT EXISTS(SELECT 1 FROM jobs WHERE finished_at IS NULL) "
+                              "OR EXISTS(SELECT 1 FROM run_leases WHERE released_at IS NULL)").fetchone()[0]
+
+
+def activate(root):
+    with locked(root / 'update.lock'):
+        pending = root / 'pending.json'
+        if not pending.exists():
+            return
+        manifest = json.loads(pending.read_text())
+        if digest(manifest['candidate']) != manifest['sha256']:
+            raise RuntimeError('staged binary checksum changed')
+        service = manifest['service']
+        if systemctl('show', service, '-p', 'KillMode', '--value').strip() != 'process':
+            raise RuntimeError('refusing to stop a daemon without KillMode=process')
+        if systemctl('show', service, '-p', 'Transient', '--value').strip() != 'no':
+            raise RuntimeError('updating requires a persistent systemd unit')
+        info = status(manifest)
+        pid = int(systemctl('show', service, '-p', 'MainPID', '--value'))
+        if pid != info['pid']:
+            raise RuntimeError('CLI and systemd refer to different daemons')
+        command = systemctl('show', service, '-p', 'ExecStart', '--value')
+        if f'path={manifest["target"]} ;' not in command:
+            raise RuntimeError('service ExecStart does not match the configured target')
+        database = Path(info['dbPath'])
+        # Persist recovery intent before stopping. A killed updater is restarted
+        # by systemd and starts the daemon again before resuming observation.
+        atomic_json(root / 'restart.json', manifest)
+        try:
+            systemctl('stop', service)
+            with (database.parent / 'daemon.lock').open('a') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if not idle_database(database):
+                    print('queue changed before shutdown; deferring update', flush=True)
+                    return
+                target = Path(manifest['target'])
+                if digest(target) != manifest['sha256']:
+                    replace_binary(target, root / 'previous-mlqd')
+                    replace_binary(manifest['candidate'], target)
+        finally:
+            systemctl('start', service)
+            ready(manifest)
+            (root / 'restart.json').unlink()
+        if digest(manifest['target']) == manifest['sha256']:
+            pending.unlink()
+            sync_directory(root)
+            shutil.rmtree(Path(manifest['candidate']).parent)
+            print(f'activated mlqd {manifest["sha256"][:12]}', flush=True)
+
+
+def watch(root):
+    recovery = root / 'restart.json'
+    if recovery.exists():
+        with locked(root / 'update.lock'):
+            if recovery.exists():
+                manifest = json.loads(recovery.read_text())
+                systemctl('start', manifest['service'])
+                ready(manifest)
+                recovery.unlink()
+                pending = root / 'pending.json'
+                if (pending.exists() and json.loads(pending.read_text())['sha256'] == manifest['sha256']
+                        and digest(manifest['target']) == manifest['sha256']):
+                    pending.unlink()
+                    sync_directory(root)
+                    shutil.rmtree(Path(manifest['candidate']).parent)
+                    print(f'recovered mlqd update {manifest["sha256"][:12]}', flush=True)
+    while (root / 'pending.json').exists():
+        manifest = json.loads((root / 'pending.json').read_text())
+        print('waiting for no unfinished jobs and no active leases', flush=True)
+        # One subscription while busy; no status polling or periodic job output.
+        with subprocess.Popen([manifest['observer'], 'subscribe'], env=manifest['env'],
+                              stdout=subprocess.PIPE, text=True) as subscriber:
+            try:
+                for line in subscriber.stdout:
+                    if idle_snapshot(json.loads(line)):
+                        break
+                else:
+                    raise RuntimeError('queue subscription ended; pending update retained')
+            finally:
+                subscriber.terminate()
+                subscriber.wait(timeout=10)
+        activate(root)
+
+
+def stage(root, args):
+    source = Path(args.mlqd).resolve(strict=True)
+    observer = Path(args.cli).absolute()
+    target = Path(args.target).absolute()
+    if not target.is_file() or target.is_symlink():
+        raise RuntimeError('target must be an existing regular mlqd executable, not a symlink')
+    if not run(str(source), '--version').startswith('mlqd '):
+        raise RuntimeError('candidate is not mlqd')
+    with locked(root / 'update.lock'):
+        if (root / 'restart.json').exists():
+            raise RuntimeError('resolve the interrupted activation before staging another update')
+        pending = root / 'pending.json'
+        previous = json.loads(pending.read_text()) if pending.exists() else None
+        directory = root / uuid.uuid4().hex
+        directory.mkdir(mode=0o700)
+        replace_binary(source, directory / 'mlqd')
+        replace_binary(observer, directory / 'mlq')
+        manifest = dict(candidate=str(directory / 'mlqd'), observer=str(directory / 'mlq'),
+                        sha256=digest(directory / 'mlqd'), target=str(target), service=args.service,
+                        env={key: value for key, value in os.environ.items()
+                             if key in ('HOME', 'PATH', 'USER', 'LOGNAME', 'XDG_RUNTIME_DIR',
+                                        'XDG_STATE_HOME', 'XDG_CONFIG_HOME') or key.startswith('MLQUEUE_')})
+        info = status(manifest)  # Keep an observer compatible with the current daemon.
+        manifest['socket'] = info['socketPath']
+        atomic_json(pending, manifest)
+        if previous:
+            shutil.rmtree(Path(previous['candidate']).parent)
+        print(f'staged mlqd {manifest["sha256"][:12]}; installed daemon unchanged', flush=True)
+
+
+def install(root):
+    home = Path.home()
+    executable = home / '.local/bin/mlq-update'
+    executable.parent.mkdir(parents=True, exist_ok=True)
+    replace_binary(Path(__file__).resolve(), executable)
+    units = Path(os.environ.get('XDG_CONFIG_HOME', home / '.config')) / 'systemd/user'
+    units.mkdir(parents=True, exist_ok=True)
+    # systemd specifier and command quoting are intentionally constrained here.
+    if any(c in str(root) + str(executable) for c in '\n\r%"\\'):
+        raise RuntimeError('unsupported character in installation path')
+    (units / 'mlqd-update.path').write_text(
+        '[Unit]\nDescription=Watch for staged mlqd updates\n\n[Path]\n'
+        f'PathExists={root}/pending.json\nPathExists={root}/restart.json\n'
+        'Unit=mlqd-update.service\n\n[Install]\nWantedBy=default.target\n')
+    (units / 'mlqd-update.service').write_text(
+        '[Unit]\nDescription=Activate staged mlqd at queue downtime\n'
+        'StartLimitIntervalSec=0\n\n[Service]\nType=exec\n'
+        f'ExecStart="{executable}" --root "{root}" watch\n'
+        'Restart=on-failure\nRestartSec=30\nTimeoutStopSec=60\n')
+    systemctl('daemon-reload')
+    systemctl('enable', '--now', 'mlqd-update.path')
+    print('enabled mlqd-update.path; stage explicitly, activate automatically at downtime')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--root', type=Path, default=Path(os.environ.get(
+        'XDG_STATE_HOME', Path.home() / '.local/state')) / 'mlqueue-updates')
+    commands = parser.add_subparsers(dest='command', required=True)
+    commands.add_parser('install', help='install the updater and enable its systemd path unit')
+    staging = commands.add_parser('stage', help='stage a built daemon without replacing the live binary')
+    staging.add_argument('--mlqd', required=True)
+    staging.add_argument('--cli', default=str(Path.home() / '.cargo/bin/mlq'))
+    staging.add_argument('--target', default=str(Path.home() / '.cargo/bin/mlqd'))
+    staging.add_argument('--service', default='mlqd.service')
+    commands.add_parser('watch', help='wait for downtime and activate the pending daemon')
+    commands.add_parser('status', help='show pending update and interrupted activation state')
+    args = parser.parse_args()
+    root = args.root.absolute()
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if args.command == 'install':
+        install(root)
+    elif args.command == 'stage':
+        stage(root, args)
+    elif args.command == 'watch':
+        watch(root)
+    else:
+        for name in ('pending.json', 'restart.json'):
+            path = root / name
+            if path.exists():
+                value = json.loads(path.read_text())
+                print(f'{name}: {value["sha256"][:12]} -> {value["target"]}')
+        if not any((root / name).exists() for name in ('pending.json', 'restart.json')):
+            print('no pending daemon update')
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        print(f'mlq-update: {error}', file=sys.stderr)
+        sys.exit(1)
