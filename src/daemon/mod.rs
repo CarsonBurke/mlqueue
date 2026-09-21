@@ -19,7 +19,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use crate::config::Config;
 use crate::db;
 use crate::paths::Paths;
-use crate::protocol::{self, ErrorBody, Op, Request, Response, error_codes};
+use crate::protocol::{self, ErrorBody, Op, Reply, Request, Response, error_codes};
 
 use coordinator::{Coordinator, Msg};
 
@@ -172,12 +172,20 @@ fn max_subscriptions(config: &Config) -> usize {
 }
 
 async fn handle_connection(stream: UnixStream, serving: Serving) -> Result<()> {
-    let Serving { tx, config, revisions, subscriptions } = serving;
+    let Serving {
+        tx,
+        config,
+        revisions,
+        subscriptions,
+    } = serving;
     // Reject a different UID before parsing anything.
     let cred = stream.peer_cred().context("reading peer credentials")?;
     let euid = unsafe { libc::geteuid() };
     if cred.uid() != euid {
-        bail!("rejecting connection from uid {} (daemon runs as {euid})", cred.uid());
+        bail!(
+            "rejecting connection from uid {} (daemon runs as {euid})",
+            cred.uid()
+        );
     }
 
     let idle = Duration::from_millis(config.idle_timeout_ms.max(1_000));
@@ -210,12 +218,12 @@ async fn handle_connection(stream: UnixStream, serving: Serving) -> Result<()> {
         };
 
         let response = match serde_json::from_slice::<Request>(&frame) {
-            Ok(request) if matches!(request.op, Op::Subscribe) => {
+            Ok(request) if matches!(request.op, Op::Subscribe | Op::SubscribeJob { .. }) => {
                 match subscriptions.clone().try_acquire_owned() {
                     // One subscribe ends the request/response loop: the rest of
-                    // this connection is a snapshot stream, with no idle timeout.
+                    // this connection is a stream, with no idle timeout.
                     Ok(permit) => {
-                        return stream_snapshots(
+                        return stream_updates(
                             reader, writer, tx, config, request, revisions, permit,
                         )
                         .await;
@@ -258,55 +266,93 @@ async fn handle_connection(stream: UnixStream, serving: Serving) -> Result<()> {
 /// the coordinator is gone (shutdown), which ends the connection.
 async fn ask(tx: &mpsc::Sender<Msg>, request: Request) -> Option<Response> {
     let (reply_tx, reply_rx) = oneshot::channel();
-    tx.send(Msg::Request { request: Box::new(request), reply: reply_tx }).await.ok()?;
+    tx.send(Msg::Request {
+        request: Box::new(request),
+        reply: reply_tx,
+    })
+    .await
+    .ok()?;
     reply_rx.await.ok()
 }
 
-/// Stream complete `Status` snapshots for the life of the connection: one
-/// immediately, then one per committed change. Every frame is a full snapshot,
-/// so a consumer never replays events.
-async fn stream_snapshots(
+/// Share subscription budgets, framing and slow-reader handling for queue
+/// snapshots and job event streams. Only durable job cursors drive replay;
+/// watch revisions are wakeups, never a substitute for the event log.
+async fn stream_updates(
     mut reader: OwnedReadHalf,
     mut writer: OwnedWriteHalf,
     tx: mpsc::Sender<Msg>,
     config: Config,
-    request: Request,
+    mut request: Request,
     mut revisions: watch::Receiver<i64>,
     // Released when the stream ends, which is what frees the slot for the next
     // subscriber.
     _permit: OwnedSemaphorePermit,
 ) -> Result<()> {
-    // Claim the current revision before taking the first snapshot: a change
-    // committed in between then re-arms `changed()` instead of being lost.
-    revisions.mark_unchanged();
-
     // The read timeout is deliberately absent from this loop — an idle queue is
     // the normal case for a subscriber. A write that stalls this long, however,
     // means the peer stopped reading without closing, and its slot must not be
     // held forever.
     let write_timeout = Duration::from_millis(config.idle_timeout_ms.max(1_000));
     let mut sent: Option<Vec<u8>> = None;
+    let mut first = true;
     let mut probe = [0u8; 64];
     loop {
-        // Refetch through the coordinator, exactly like `Op::Status`.
-        let Some(response) = ask(&tx, request.clone()).await else { return Ok(()) };
+        // Consume the revision BEFORE querying. A change while the request is
+        // queued or the response is written must rearm changed(), not get
+        // swallowed by marking the revision after the snapshot.
+        revisions.mark_unchanged();
+        let Some(mut response) = ask(&tx, request.clone()).await else {
+            return Ok(());
+        };
         let failed = response.error.is_some();
-        let bytes = serde_json::to_vec(&response)?;
-        // `watch` already collapses a burst into one wake-up; identical
-        // snapshots (a change invisible to `Status`) are dropped here.
-        if sent.as_deref() != Some(bytes.as_slice()) {
+        let mut bytes = serde_json::to_vec(&response)?;
+        // A large job specification can leave less space for events. Shrink
+        // only the bounded page and retain its cursor; the omitted suffix is
+        // fetched immediately, rather than discarded or accumulated.
+        while bytes.len() > config.max_frame_bytes as usize {
+            let Some(Reply::JobUpdate(update)) = response.reply.as_mut() else {
+                break;
+            };
+            if update.events.len() <= 1 {
+                break;
+            }
+            update.events.truncate(update.events.len() / 2);
+            update.cursor = update.events.last().expect("nonempty page").id;
+            update.has_more = true;
+            bytes = serde_json::to_vec(&response)?;
+        }
+        let (send, has_more) = match response.reply.as_ref() {
+            Some(Reply::JobUpdate(update)) => {
+                if let Op::SubscribeJob { after, .. } = &mut request.op {
+                    *after = Some(update.cursor);
+                }
+                // Global queue revisions may wake us, but no unrelated job
+                // or quiet-queue snapshot is ever put on this wire.
+                (first || !update.events.is_empty(), update.has_more)
+            }
+            _ => (sent.as_deref() != Some(bytes.as_slice()), false),
+        };
+        if send {
             tokio::time::timeout(
                 write_timeout,
                 protocol::write_frame(&mut writer, &bytes, config.max_frame_bytes),
             )
             .await
             .map_err(|_| anyhow::anyhow!("subscriber stopped reading"))??;
-            sent = Some(bytes);
+            if !matches!(request.op, Op::SubscribeJob { .. }) {
+                sent = Some(bytes);
+            }
         }
         // A rejected subscribe (unsupported protocol version) is reported once
         // and never becomes a stream.
         if failed {
             return Ok(());
+        }
+        first = false;
+        if has_more {
+            // Backlog pages drain without another watch wake or client request.
+            continue;
         }
 
         tokio::select! {

@@ -7,7 +7,9 @@ use std::io;
 /// Stable identifier for the current boot; PIDs and start times are only
 /// meaningful within one boot.
 pub fn boot_id() -> io::Result<String> {
-    Ok(fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim().to_string())
+    Ok(fs::read_to_string("/proc/sys/kernel/random/boot_id")?
+        .trim()
+        .to_string())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -50,7 +52,9 @@ pub fn identity_alive(pid: i32, start_time: i64, recorded_boot_id: &str) -> bool
 /// PIDs currently in the given process group, from a full `/proc` scan.
 /// Includes zombies: an unreaped member still pins the group.
 pub fn group_members(pgid: i32) -> Vec<i32> {
-    let Ok(entries) = fs::read_dir("/proc") else { return Vec::new() };
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
     entries
         .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<i32>().ok())
         .filter_map(proc_stat)

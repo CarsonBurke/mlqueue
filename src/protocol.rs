@@ -52,28 +52,66 @@ pub enum Op {
     /// Turns the connection into a stream of `Status` snapshots (see
     /// ARCHITECTURE.md); the reply payload is identical to `Status`.
     Subscribe,
+    /// Stream one job and lossless, cursor-paged lifecycle events.
+    SubscribeJob {
+        job: JobId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<i64>,
+    },
     FollowTtsSnapshot,
-    Events { after: i64, limit: u32 },
-    Show { job: JobId },
+    Events {
+        after: i64,
+        limit: u32,
+    },
+    Show {
+        job: JobId,
+    },
     /// Job detail; omit `job` to select the most recently submitted job.
     See {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         job: Option<JobId>,
     },
-    Logs { job: JobId, attempt: Option<i64> },
-    Cancel { job: JobId, force: bool },
-    Hold { job: JobId },
-    Release { job: JobId },
+    Logs {
+        job: JobId,
+        attempt: Option<i64>,
+    },
+    Cancel {
+        job: JobId,
+        force: bool,
+    },
+    Hold {
+        job: JobId,
+    },
+    Release {
+        job: JobId,
+    },
     /// Stop new admissions. Queued work stays queued; running leases continue.
     Pause,
     /// Resume admissions after [`Op::Pause`].
     Unpause,
-    Retry { job: JobId },
-    SetMaxParallelRuns { job: JobId, max_parallel_runs: u32 },
-    SetPriority { job: JobId, priority: i64 },
+    Retry {
+        job: JobId,
+    },
+    SetMaxParallelRuns {
+        job: JobId,
+        max_parallel_runs: u32,
+    },
+    SetPriority {
+        job: JobId,
+        priority: i64,
+    },
+    /// Replace the per-attempt wall-clock limit. `None` clears it.
+    SetTimeLimit {
+        job: JobId,
+        time_limit_ms: Option<u64>,
+    },
     DaemonStatus,
     RecoverList,
-    RecoverResolve { job: JobId, attempt: i64, resolve_as: ResolveAs },
+    RecoverResolve {
+        job: JobId,
+        attempt: i64,
+        resolve_as: ResolveAs,
+    },
 }
 
 impl Op {
@@ -89,6 +127,7 @@ impl Op {
                 | Op::Retry { .. }
                 | Op::SetMaxParallelRuns { .. }
                 | Op::SetPriority { .. }
+                | Op::SetTimeLimit { .. }
                 | Op::RecoverResolve { .. }
         )
     }
@@ -98,6 +137,7 @@ impl Op {
             Op::Submit(_) => "submit",
             Op::Status => "status",
             Op::Subscribe => "subscribe",
+            Op::SubscribeJob { .. } => "subscribe_job",
             Op::FollowTtsSnapshot => "follow_tts_snapshot",
             Op::Events { .. } => "events",
             Op::Show { .. } => "show",
@@ -111,6 +151,7 @@ impl Op {
             Op::Retry { .. } => "retry",
             Op::SetMaxParallelRuns { .. } => "set_max_parallel_runs",
             Op::SetPriority { .. } => "set_priority",
+            Op::SetTimeLimit { .. } => "set_time_limit",
             Op::DaemonStatus => "daemon_status",
             Op::RecoverList => "recover_list",
             Op::RecoverResolve { .. } => "recover_resolve",
@@ -152,7 +193,9 @@ impl Op {
     /// the removal and restoration of dependencies. A replay only returns the
     /// original stored response; it never recreates migration-deleted edges.
     pub(crate) fn legacy_v5_request_hash(&self) -> Option<String> {
-        let Self::Submit(params) = self else { return None };
+        let Self::Submit(params) = self else {
+            return None;
+        };
         if params.time_limit_ms.is_some() {
             return None;
         }
@@ -267,6 +310,7 @@ pub enum Reply {
     Job { job: JobView },
     Status(StatusView),
     FollowTtsSnapshot(FollowTtsSnapshotView),
+    JobUpdate(JobUpdateView),
     Events { events: Vec<EventView> },
     LogPaths(LogPathsView),
     DaemonStatus(DaemonStatusView),
@@ -316,9 +360,25 @@ pub struct JobView {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct JobUpdateView {
+    /// Compact current snapshot, including only the latest attempt.
+    pub job: JobView,
+    /// Resume after this durable event id. With no requested cursor, the
+    /// initial snapshot starts at the current event-log head without replay.
+    pub cursor: i64,
+    pub events: Vec<EventView>,
+    /// More matching events are ready; do not infer completion until drained.
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DependencyView {
     pub parent: JobId,
-    #[serde(alias = "requirement", deserialize_with = "deserialize_dependency_condition")]
+    #[serde(
+        alias = "requirement",
+        deserialize_with = "deserialize_dependency_condition"
+    )]
     pub condition: DependencyCondition,
     /// Empty only when replaying a protocol-v5 response stored before current
     /// parent-state visibility existed.
@@ -332,7 +392,9 @@ pub struct DependencyView {
     pub resolved_at: Option<i64>,
 }
 
-fn deserialize_dependency_condition<'de, D>(deserializer: D) -> Result<DependencyCondition, D::Error>
+fn deserialize_dependency_condition<'de, D>(
+    deserializer: D,
+) -> Result<DependencyCondition, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -567,15 +629,33 @@ mod tests {
             _ => unreachable!(),
         };
         dependency_order_a.dependencies = vec![
-            DependencySpec { job: 9, condition: DependencyCondition::Terminal },
-            DependencySpec { job: 4, condition: DependencyCondition::Succeeded },
-            DependencySpec { job: 9, condition: DependencyCondition::Succeeded },
+            DependencySpec {
+                job: 9,
+                condition: DependencyCondition::Terminal,
+            },
+            DependencySpec {
+                job: 4,
+                condition: DependencyCondition::Succeeded,
+            },
+            DependencySpec {
+                job: 9,
+                condition: DependencyCondition::Succeeded,
+            },
         ];
         let mut dependency_order_b = dependency_order_a.clone();
         dependency_order_b.dependencies = vec![
-            DependencySpec { job: 9, condition: DependencyCondition::Succeeded },
-            DependencySpec { job: 4, condition: DependencyCondition::Succeeded },
-            DependencySpec { job: 9, condition: DependencyCondition::Succeeded },
+            DependencySpec {
+                job: 9,
+                condition: DependencyCondition::Succeeded,
+            },
+            DependencySpec {
+                job: 4,
+                condition: DependencyCondition::Succeeded,
+            },
+            DependencySpec {
+                job: 9,
+                condition: DependencyCondition::Succeeded,
+            },
         ];
         assert_eq!(
             Op::Submit(dependency_order_a).request_hash(),
@@ -600,7 +680,10 @@ mod tests {
             "{prioritized_json}"
         );
         let limited_json = serde_json::to_string(&limited).unwrap();
-        assert!(limited_json.contains("\"timeLimitMs\":5000"), "{limited_json}");
+        assert!(
+            limited_json.contains("\"timeLimitMs\":5000"),
+            "{limited_json}"
+        );
 
         let current = mk(1, 0);
         let legacy_json = concat!(
@@ -608,7 +691,10 @@ mod tests {
             r#""afterSuccess":[],"afterCompletion":[]}"#
         );
         let legacy_hash = hex::encode(Sha256::digest(legacy_json.as_bytes()));
-        assert_eq!(current.legacy_v5_request_hash().as_deref(), Some(legacy_hash.as_str()));
+        assert_eq!(
+            current.legacy_v5_request_hash().as_deref(),
+            Some(legacy_hash.as_str())
+        );
         assert_ne!(current.request_hash(), legacy_hash);
         assert!(Op::Status.legacy_v5_request_hash().is_none());
 
@@ -624,8 +710,7 @@ mod tests {
             r#"{"type":"submit","name":"x","cwd":"/tmp","args":["true"],"env":{},"maxParallelRuns":1,"maxAttempts":1,"retryDelayMs":0,"#,
             r#""afterSuccess":[42],"afterCompletion":[]}"#
         );
-        let legacy_dependency_hash =
-            hex::encode(Sha256::digest(legacy_dependency_json.as_bytes()));
+        let legacy_dependency_hash = hex::encode(Sha256::digest(legacy_dependency_json.as_bytes()));
         assert_eq!(
             Op::Submit(legacy_dependency_params)
                 .legacy_v5_request_hash()
@@ -670,10 +755,48 @@ mod tests {
         assert!(Op::Unpause.is_mutation());
         assert_eq!(Op::Pause.kind(), "pause");
         assert_eq!(Op::Unpause.kind(), "unpause");
-        assert_eq!(serde_json::to_string(&Op::Pause).unwrap(), r#"{"type":"pause"}"#);
-        assert_eq!(serde_json::to_string(&Op::Unpause).unwrap(), r#"{"type":"unpause"}"#);
+        assert_eq!(
+            serde_json::to_string(&Op::Pause).unwrap(),
+            r#"{"type":"pause"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Op::Unpause).unwrap(),
+            r#"{"type":"unpause"}"#
+        );
         assert_ne!(Op::Pause.request_hash(), Op::Unpause.request_hash());
         assert!(Op::Pause.legacy_v5_request_hash().is_none());
+    }
+
+    #[test]
+    fn set_time_limit_is_an_additive_mutation() {
+        let set = Op::SetTimeLimit {
+            job: 3,
+            time_limit_ms: Some(1_500),
+        };
+        let clear = Op::SetTimeLimit {
+            job: 3,
+            time_limit_ms: None,
+        };
+        assert!(set.is_mutation());
+        assert_eq!(set.kind(), "set_time_limit");
+        assert_ne!(set.request_hash(), clear.request_hash());
+        assert_eq!(
+            serde_json::to_string(&set).unwrap(),
+            r#"{"type":"set_time_limit","job":3,"time_limit_ms":1500}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&clear).unwrap(),
+            r#"{"type":"set_time_limit","job":3,"time_limit_ms":null}"#
+        );
+        let wire = r#"{"protocol_version":8,"request_id":"r1","idempotency_key":"k","op":{"type":"set_time_limit","job":3,"time_limit_ms":1500}}"#;
+        let request: Request = serde_json::from_str(wire).unwrap();
+        assert!(matches!(
+            request.op,
+            Op::SetTimeLimit {
+                job: 3,
+                time_limit_ms: Some(1_500)
+            }
+        ));
     }
 
     #[test]
@@ -684,12 +807,18 @@ mod tests {
         assert!(matches!(request.op, Op::See { job: None }));
         assert_eq!(request.op.kind(), "see");
         assert!(!request.op.is_mutation());
-        assert_eq!(serde_json::to_string(&Op::See { job: None }).unwrap(), r#"{"type":"see"}"#);
+        assert_eq!(
+            serde_json::to_string(&Op::See { job: None }).unwrap(),
+            r#"{"type":"see"}"#
+        );
         assert_eq!(
             serde_json::to_string(&Op::See { job: Some(12) }).unwrap(),
             r#"{"type":"see","job":12}"#
         );
-        assert_ne!(Op::See { job: None }.request_hash(), Op::Show { job: 12 }.request_hash());
+        assert_ne!(
+            Op::See { job: None }.request_hash(),
+            Op::Show { job: 12 }.request_hash()
+        );
         assert!(Op::See { job: None }.legacy_v5_request_hash().is_none());
     }
 
@@ -712,9 +841,16 @@ mod tests {
             panic!("expected job reply")
         };
         assert_eq!(job.dependencies.len(), 2);
-        assert_eq!(job.dependencies[0].condition, DependencyCondition::Succeeded);
+        assert_eq!(
+            job.dependencies[0].condition,
+            DependencyCondition::Succeeded
+        );
         assert_eq!(job.dependencies[1].condition, DependencyCondition::Terminal);
-        assert!(job.dependencies.iter().all(|dependency| dependency.parent_state.is_empty()));
+        assert!(
+            job.dependencies
+                .iter()
+                .all(|dependency| dependency.parent_state.is_empty())
+        );
     }
 
     #[test]
@@ -722,7 +858,10 @@ mod tests {
         let mut buf = Vec::new();
         write_frame_sync(&mut buf, b"hello", 1024).unwrap();
         let mut cursor = std::io::Cursor::new(buf);
-        assert_eq!(read_frame_sync(&mut cursor, 1024).unwrap().unwrap(), b"hello");
+        assert_eq!(
+            read_frame_sync(&mut cursor, 1024).unwrap().unwrap(),
+            b"hello"
+        );
         assert!(read_frame_sync(&mut cursor, 1024).unwrap().is_none());
 
         let mut oversized = Vec::new();

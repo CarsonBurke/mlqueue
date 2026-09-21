@@ -232,11 +232,16 @@ const MIGRATIONS: &[&str] = &[
     );
     INSERT INTO scheduler_pause (singleton, paused, updated_at) VALUES (1, 0, 0);
     "#,
+    // v7: when the current time limit was installed. Null means the attempt
+    // launched with it. Used so a later edit cannot reclassify an earlier cancel.
+    r#"
+    ALTER TABLE jobs ADD COLUMN time_limit_set_at INTEGER;
+    "#,
 ];
 
 pub fn open(path: &Path) -> Result<Connection> {
-    let conn = Connection::open(path)
-        .with_context(|| format!("opening database {}", path.display()))?;
+    let conn =
+        Connection::open(path).with_context(|| format!("opening database {}", path.display()))?;
     configure(&conn)?;
     migrate(&conn)?;
     Ok(conn)
@@ -285,6 +290,9 @@ pub struct JobRow {
     pub max_attempts: i64,
     pub retry_delay_ms: i64,
     pub time_limit_ms: Option<i64>,
+    /// When `time_limit_ms` was last changed after submission. Null means the
+    /// submitted value is still in force.
+    pub time_limit_set_at: Option<i64>,
     pub retry_not_before: Option<i64>,
     pub ready_seq: Option<i64>,
     pub attempt_count: i64,
@@ -356,8 +364,8 @@ pub struct EventRow {
 }
 
 const JOB_COLUMNS: &str = "id, name, state, cwd, args, env, max_parallel_runs, priority, \
-     max_attempts, retry_delay_ms, time_limit_ms, retry_not_before, ready_seq, attempt_count, \
-     state_reason, created_at, updated_at, finished_at";
+     max_attempts, retry_delay_ms, time_limit_ms, time_limit_set_at, retry_not_before, ready_seq, \
+     attempt_count, state_reason, created_at, updated_at, finished_at";
 
 fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRow> {
     let state: String = row.get(2)?;
@@ -375,13 +383,14 @@ fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRow> {
         max_attempts: row.get(8)?,
         retry_delay_ms: row.get(9)?,
         time_limit_ms: row.get(10)?,
-        retry_not_before: row.get(11)?,
-        ready_seq: row.get(12)?,
-        attempt_count: row.get(13)?,
-        state_reason: row.get(14)?,
-        created_at: row.get(15)?,
-        updated_at: row.get(16)?,
-        finished_at: row.get(17)?,
+        time_limit_set_at: row.get(11)?,
+        retry_not_before: row.get(12)?,
+        ready_seq: row.get(13)?,
+        attempt_count: row.get(14)?,
+        state_reason: row.get(15)?,
+        created_at: row.get(16)?,
+        updated_at: row.get(17)?,
+        finished_at: row.get(18)?,
     })
 }
 
@@ -519,7 +528,12 @@ pub fn update_job_state(
     Ok(())
 }
 
-pub fn set_job_retry_not_before(conn: &Connection, id: JobId, at: Option<i64>, now: i64) -> Result<()> {
+pub fn set_job_retry_not_before(
+    conn: &Connection,
+    id: JobId,
+    at: Option<i64>,
+    now: i64,
+) -> Result<()> {
     conn.execute(
         "UPDATE jobs SET retry_not_before = ?2, updated_at = ?3 WHERE id = ?1",
         params![id, at, now],
@@ -546,6 +560,24 @@ pub fn set_job_max_parallel_runs(conn: &Connection, id: JobId, value: u32, now: 
 pub fn set_job_priority(conn: &Connection, id: JobId, value: i64, now: i64) -> Result<()> {
     conn.execute(
         "UPDATE jobs SET priority = ?2, updated_at = ?3 WHERE id = ?1",
+        params![id, value, now],
+    )?;
+    Ok(())
+}
+
+/// Replace the job's per-attempt wall-clock limit. `None` clears it. The
+/// caller applies the same value to a live runner outside this transaction.
+pub fn set_job_time_limit(
+    conn: &Connection,
+    id: JobId,
+    value: Option<i64>,
+    now: i64,
+) -> Result<()> {
+    if let Some(value) = value {
+        ensure!(value > 0, "timeLimitMs must be a positive integer");
+    }
+    conn.execute(
+        "UPDATE jobs SET time_limit_ms = ?2, time_limit_set_at = ?3, updated_at = ?3 WHERE id = ?1",
         params![id, value, now],
     )?;
     Ok(())
@@ -599,7 +631,11 @@ pub fn max_job_seq(conn: &Connection) -> Result<i64> {
     // retention cleanup deleting the newest rows can never lower the frozen
     // backfill cutoff. The row is absent until the first job is inserted.
     Ok(conn
-        .query_row("SELECT seq FROM sqlite_sequence WHERE name = 'jobs'", [], |row| row.get(0))
+        .query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'jobs'",
+            [],
+            |row| row.get(0),
+        )
         .optional()?
         .unwrap_or(0))
 }
@@ -667,10 +703,17 @@ pub fn dependencies_of(conn: &Connection, child: JobId) -> Result<Vec<Dependency
         Ok(DependencyRow {
             parent_id: row.get(0)?,
             child_id: row.get(1)?,
-            condition: condition.parse().expect("valid dependency condition in database"),
-            parent_state: parent_state.parse().expect("valid parent state in database"),
-            resolution: resolution
-                .map(|value| value.parse().expect("valid dependency resolution in database")),
+            condition: condition
+                .parse()
+                .expect("valid dependency condition in database"),
+            parent_state: parent_state
+                .parse()
+                .expect("valid parent state in database"),
+            resolution: resolution.map(|value| {
+                value
+                    .parse()
+                    .expect("valid dependency resolution in database")
+            }),
             parent_outcome: parent_outcome
                 .map(|value| value.parse().expect("valid parent outcome in database")),
             resolved_at: row.get(6)?,
@@ -711,19 +754,20 @@ pub fn advance_dependency_graph(conn: &Connection, now: i64) -> Result<()> {
                     condition
                         .parse::<DependencyCondition>()
                         .expect("valid dependency condition in database"),
-                    outcome.parse::<JobState>().expect("valid job state in database"),
+                    outcome
+                        .parse::<JobState>()
+                        .expect("valid job state in database"),
                 ))
             })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
         for (parent, child, condition, outcome) in unresolved {
-            let resolution = if condition == DependencyCondition::Terminal
-                || outcome == JobState::Succeeded
-            {
-                DependencyResolution::Satisfied
-            } else {
-                DependencyResolution::Violated
-            };
+            let resolution =
+                if condition == DependencyCondition::Terminal || outcome == JobState::Succeeded {
+                    DependencyResolution::Satisfied
+                } else {
+                    DependencyResolution::Violated
+                };
             conn.execute(
                 "UPDATE dependencies
                     SET resolution = ?3, parent_outcome = ?4, resolved_at = ?5
@@ -916,7 +960,13 @@ pub fn active_leases(conn: &Connection) -> Result<Vec<(AttemptId, ActiveLease)>>
          WHERE released_at IS NULL ORDER BY attempt_id",
     )?;
     let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, AttemptId>(0)?, ActiveLease { job_id: row.get(1)?, limit: row.get(2)? }))
+        Ok((
+            row.get::<_, AttemptId>(0)?,
+            ActiveLease {
+                job_id: row.get(1)?,
+                limit: row.get(2)?,
+            },
+        ))
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
@@ -1011,7 +1061,14 @@ pub fn finalize_attempt(
     conn.execute(
         "UPDATE attempts SET state = ?2, exit_code = ?3, term_signal = ?4, \
          message = COALESCE(?5, message), finished_at = ?6 WHERE id = ?1",
-        params![attempt, state.as_str(), exit_code, term_signal, message, now],
+        params![
+            attempt,
+            state.as_str(),
+            exit_code,
+            term_signal,
+            message,
+            now
+        ],
     )?;
     Ok(())
 }
@@ -1061,10 +1118,11 @@ pub fn active_reservation(conn: &Connection) -> Result<Option<ReservationRow>> {
             },
         )
         .optional()?;
-    let Some(mut reservation) = row else { return Ok(None) };
-    let mut stmt = conn.prepare(
-        "SELECT job_id FROM scheduler_reservation_backfills WHERE reservation_id = ?1",
-    )?;
+    let Some(mut reservation) = row else {
+        return Ok(None);
+    };
+    let mut stmt = conn
+        .prepare("SELECT job_id FROM scheduler_reservation_backfills WHERE reservation_id = ?1")?;
     let consumed = stmt.query_map([reservation.id], |row| row.get::<_, JobId>(0))?;
     reservation.consumed = consumed.collect::<rusqlite::Result<BTreeSet<_>>>()?;
     Ok(Some(reservation))
@@ -1166,7 +1224,11 @@ pub fn any_blockers_advancing(conn: &Connection, attempts: &[AttemptId]) -> Resu
                AND l.attempt_id IN ({placeholders})
          )"
     ))?;
-    Ok(stmt.query_row(rusqlite::params_from_iter(attempts.iter()), |row| row.get(0))?)
+    Ok(
+        stmt.query_row(rusqlite::params_from_iter(attempts.iter()), |row| {
+            row.get(0)
+        })?,
+    )
 }
 
 pub fn resolve_reservation(
@@ -1261,7 +1323,11 @@ pub fn insert_operation(
 // ---------------------------------------------------------------------------
 
 pub fn latest_event_id(conn: &Connection) -> Result<i64> {
-    Ok(conn.query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| row.get(0))?)
+    Ok(
+        conn.query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| {
+            row.get(0)
+        })?,
+    )
 }
 
 pub fn events_after(conn: &Connection, after: i64, limit: u32) -> Result<Vec<EventRow>> {
@@ -1272,18 +1338,40 @@ pub fn events_after(conn: &Connection, after: i64, limit: u32) -> Result<Vec<Eve
          LEFT JOIN attempts a ON a.id = e.attempt_id \
          WHERE e.id > ?1 ORDER BY e.id LIMIT ?2",
     )?;
-    let rows = stmt.query_map(params![after, limit], |row| {
-        Ok(EventRow {
-            id: row.get(0)?,
-            timestamp: row.get(1)?,
-            job_id: row.get(2)?,
-            job_name: row.get(3)?,
-            attempt_id: row.get(4)?,
-            attempt_number: row.get(5)?,
-            event_type: row.get(6)?,
-        })
-    })?;
+    let rows = stmt.query_map(params![after, limit], event_from_row)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// The existing events_job index includes the INTEGER PRIMARY KEY (rowid) as
+/// its suffix, so both the job filter and cursor seek are indexed. Never scan
+/// the global event stream to find a particular job's next page.
+pub fn job_events_after(
+    conn: &Connection,
+    job: JobId,
+    after: i64,
+    limit: u32,
+) -> Result<Vec<EventRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.id, e.ts, e.job_id, substr(j.name, 1, 80), e.attempt_id, a.number, e.type \
+         FROM events e \
+         LEFT JOIN jobs j ON j.id = e.job_id \
+         LEFT JOIN attempts a ON a.id = e.attempt_id \
+         WHERE e.job_id = ?1 AND e.id > ?2 ORDER BY e.id LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(params![job, after, limit], event_from_row)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
+    Ok(EventRow {
+        id: row.get(0)?,
+        timestamp: row.get(1)?,
+        job_id: row.get(2)?,
+        job_name: row.get(3)?,
+        attempt_id: row.get(4)?,
+        attempt_number: row.get(5)?,
+        event_type: row.get(6)?,
+    })
 }
 
 pub fn append_event(
@@ -1326,7 +1414,9 @@ mod tests {
     #[test]
     fn empty_database_migrates_to_current() {
         let conn = open_in_memory().unwrap();
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(version, MIGRATIONS.len() as i64);
         // Idempotent.
         migrate(&conn).unwrap();
@@ -1357,7 +1447,26 @@ mod tests {
         let mut params = submit_params("limited", 1);
         params.time_limit_ms = Some(12_345);
         let id = insert_job(&conn, &params, 1000).unwrap();
-        assert_eq!(job_row(&conn, id).unwrap().unwrap().time_limit_ms, Some(12_345));
+        assert_eq!(
+            job_row(&conn, id).unwrap().unwrap().time_limit_ms,
+            Some(12_345)
+        );
+    }
+
+    #[test]
+    fn set_job_time_limit_replaces_and_clears() {
+        let conn = open_in_memory().unwrap();
+        let id = insert_job(&conn, &submit_params("limited", 1), 1000).unwrap();
+        set_job_time_limit(&conn, id, Some(5_000), 1001).unwrap();
+        let job = job_row(&conn, id).unwrap().unwrap();
+        assert_eq!(job.time_limit_ms, Some(5_000));
+        assert_eq!(job.time_limit_set_at, Some(1001));
+        assert_eq!(job.updated_at, 1001);
+        set_job_time_limit(&conn, id, None, 1002).unwrap();
+        let cleared = job_row(&conn, id).unwrap().unwrap();
+        assert_eq!(cleared.time_limit_ms, None);
+        assert_eq!(cleared.time_limit_set_at, Some(1002));
+        assert!(set_job_time_limit(&conn, id, Some(0), 1003).is_err());
     }
 
     #[test]
@@ -1540,7 +1649,10 @@ mod tests {
                 Some("dependency feature removed before prerequisites completed")
             );
             assert_eq!(job.finished_at, Some(job.updated_at));
-            assert!(job.updated_at > 80, "job {id} needs an upgrade-time timestamp");
+            assert!(
+                job.updated_at > 80,
+                "job {id} needs an upgrade-time timestamp"
+            );
         }
         assert_eq!(job_row(&conn, 5).unwrap().unwrap().state, JobState::Queued);
         assert_eq!(job_row(&conn, 7).unwrap().unwrap().state, JobState::Queued);
@@ -1552,11 +1664,17 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(dependencies_exist, "the restored schema recreates an empty edge table");
+        assert!(
+            dependencies_exist,
+            "the restored schema recreates an empty edge table"
+        );
         let restored_edges: i64 = conn
             .query_row("SELECT COUNT(*) FROM dependencies", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(restored_edges, 0, "removed legacy edges cannot be reconstructed");
+        assert_eq!(
+            restored_edges, 0,
+            "removed legacy edges cannot be reconstructed"
+        );
         let migration_events: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM events WHERE type = 'job_cancelled' AND actor = 'migration'",
@@ -1624,17 +1742,33 @@ mod tests {
         let independent = insert_job(&conn, &submit_params("independent", 1), 1004).unwrap();
 
         assert!(job_row(&conn, child).unwrap().unwrap().ready_seq.is_none());
-        assert!(job_row(&conn, cleanup).unwrap().unwrap().ready_seq.is_none());
+        assert!(
+            job_row(&conn, cleanup)
+                .unwrap()
+                .unwrap()
+                .ready_seq
+                .is_none()
+        );
         update_job_state(&conn, parent, JobState::Failed, Some("test failure"), 2000).unwrap();
         advance_dependency_graph(&conn, 2000).unwrap();
 
-        assert_eq!(job_row(&conn, child).unwrap().unwrap().state, JobState::Skipped);
-        assert_eq!(job_row(&conn, grandchild).unwrap().unwrap().state, JobState::Skipped);
+        assert_eq!(
+            job_row(&conn, child).unwrap().unwrap().state,
+            JobState::Skipped
+        );
+        assert_eq!(
+            job_row(&conn, grandchild).unwrap().unwrap().state,
+            JobState::Skipped
+        );
         let cleanup_row = job_row(&conn, cleanup).unwrap().unwrap();
         assert_eq!(cleanup_row.state, JobState::Queued);
         assert!(
             cleanup_row.ready_seq.unwrap()
-                > job_row(&conn, independent).unwrap().unwrap().ready_seq.unwrap(),
+                > job_row(&conn, independent)
+                    .unwrap()
+                    .unwrap()
+                    .ready_seq
+                    .unwrap(),
             "dependency-delayed work joins FIFO when it becomes ready"
         );
 
@@ -1642,13 +1776,19 @@ mod tests {
         assert_eq!(child_edge.resolution, Some(DependencyResolution::Violated));
         assert_eq!(child_edge.parent_outcome, Some(JobState::Failed));
         let cleanup_edge = dependencies_of(&conn, cleanup).unwrap().pop().unwrap();
-        assert_eq!(cleanup_edge.resolution, Some(DependencyResolution::Satisfied));
+        assert_eq!(
+            cleanup_edge.resolution,
+            Some(DependencyResolution::Satisfied)
+        );
 
         // Manual retry is non-monotonic job state, but observed dependency
         // outcomes are immutable: descendants neither revive nor retract.
         update_job_state(&conn, parent, JobState::Queued, None, 3000).unwrap();
         advance_dependency_graph(&conn, 3000).unwrap();
-        assert_eq!(job_row(&conn, child).unwrap().unwrap().state, JobState::Skipped);
+        assert_eq!(
+            job_row(&conn, child).unwrap().unwrap().state,
+            JobState::Skipped
+        );
         assert_eq!(
             dependencies_of(&conn, cleanup).unwrap()[0].resolution,
             Some(DependencyResolution::Satisfied)
@@ -1661,9 +1801,18 @@ mod tests {
         let parent = insert_job(&conn, &submit_params("parent", 1), 1000).unwrap();
         let mut child = submit_params("child", 1);
         child.dependencies = vec![
-            DependencySpec { job: parent, condition: DependencyCondition::Terminal },
-            DependencySpec { job: parent, condition: DependencyCondition::Succeeded },
-            DependencySpec { job: parent, condition: DependencyCondition::Terminal },
+            DependencySpec {
+                job: parent,
+                condition: DependencyCondition::Terminal,
+            },
+            DependencySpec {
+                job: parent,
+                condition: DependencyCondition::Succeeded,
+            },
+            DependencySpec {
+                job: parent,
+                condition: DependencyCondition::Terminal,
+            },
         ];
         let child = insert_job(&conn, &child, 1001).unwrap();
         let dependencies = dependencies_of(&conn, child).unwrap();
@@ -1763,11 +1912,19 @@ mod tests {
         let protected = insert_job(&conn, &submit_params("protected", 1), 1002).unwrap();
 
         // Native version with a live blocker: the window is open.
-        let rid =
-            create_reservation(&conn, protected, SCHEDULER_SEMANTICS_VERSION, &[attempt.id], 1003)
-                .unwrap();
+        let rid = create_reservation(
+            &conn,
+            protected,
+            SCHEDULER_SEMANTICS_VERSION,
+            &[attempt.id],
+            1003,
+        )
+        .unwrap();
         let res = active_reservation(&conn).unwrap().unwrap();
-        assert_eq!(backfill_frontier(&conn, &res).unwrap(), BackfillFrontier::OpenWindow);
+        assert_eq!(
+            backfill_frontier(&conn, &res).unwrap(),
+            BackfillFrontier::OpenWindow
+        );
 
         // Blocker drained: a freeze at the current maximum sequence is
         // pending, then pinning makes it durable.
@@ -1778,7 +1935,10 @@ mod tests {
         );
         freeze_reservation_cutoff(&conn, rid, protected).unwrap();
         let res = active_reservation(&conn).unwrap().unwrap();
-        assert_eq!(backfill_frontier(&conn, &res).unwrap(), BackfillFrontier::Frozen(protected));
+        assert_eq!(
+            backfill_frontier(&conn, &res).unwrap(),
+            BackfillFrontier::Frozen(protected)
+        );
         resolve_reservation(&conn, rid, "invalidated", "test", 1005).unwrap();
 
         // A v1 reservation stays frozen at its stored cutoff even while a
@@ -1789,13 +1949,19 @@ mod tests {
         freeze_reservation_cutoff(&conn, rid, 1).unwrap();
         let res = active_reservation(&conn).unwrap().unwrap();
         assert!(any_blockers_advancing(&conn, &res.initial_blockers).unwrap());
-        assert_eq!(backfill_frontier(&conn, &res).unwrap(), BackfillFrontier::Frozen(1));
+        assert_eq!(
+            backfill_frontier(&conn, &res).unwrap(),
+            BackfillFrontier::Frozen(1)
+        );
         resolve_reservation(&conn, rid, "invalidated", "test", 1008).unwrap();
 
         // Unknown versions must surface as unsupported, never as a guess.
         create_reservation(&conn, protected, 99, &[], 1009).unwrap();
         let res = active_reservation(&conn).unwrap().unwrap();
-        assert_eq!(backfill_frontier(&conn, &res).unwrap(), BackfillFrontier::Unsupported(99));
+        assert_eq!(
+            backfill_frontier(&conn, &res).unwrap(),
+            BackfillFrontier::Unsupported(99)
+        );
     }
 
     #[test]
@@ -1862,6 +2028,50 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, 2);
         assert_eq!(events[0].event_type, "job_succeeded");
+    }
+
+    #[test]
+    fn job_event_pages_preserve_transitions_across_unrelated_events() {
+        let conn = open_in_memory().unwrap();
+        let job = insert_job(&conn, &submit_params("watched", 1), 1000).unwrap();
+        let other = insert_job(&conn, &submit_params("other", 1), 1000).unwrap();
+        let transitions = [
+            "attempt_starting",
+            "attempt_running",
+            "attempt_failed",
+            "job_retry_scheduled",
+            "attempt_starting",
+            "attempt_running",
+            "job_succeeded",
+        ];
+        let mut expected_ids = Vec::new();
+        for event in transitions {
+            append_event(&conn, Some(other), None, "job_submitted", "client", None).unwrap();
+            append_event(&conn, Some(job), None, event, "daemon", None).unwrap();
+            expected_ids.push(latest_event_id(&conn).unwrap());
+            append_event(&conn, None, None, "queue_paused", "client", None).unwrap();
+        }
+        let mut cursor = 0;
+        let mut actual = Vec::new();
+        loop {
+            let page = job_events_after(&conn, job, cursor, 2).unwrap();
+            assert!(page.len() <= 2);
+            if page.is_empty() {
+                break;
+            }
+            for event in page {
+                assert_eq!(event.job_id, Some(job));
+                cursor = event.id;
+                actual.push((event.id, event.event_type));
+            }
+        }
+        assert_eq!(
+            actual,
+            expected_ids
+                .into_iter()
+                .zip(transitions.map(str::to_string))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

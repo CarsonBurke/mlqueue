@@ -1,5 +1,5 @@
-//! Synchronous Unix-socket client used by the CLI. Mutations always carry a
-//! durable idempotency key, so transport retries are safe.
+//! Unix-socket clients. Mutations always carry a durable idempotency key, so
+//! transport retries are safe; subscriptions keep one socket without polling.
 
 use std::io;
 use std::os::unix::net::UnixStream;
@@ -7,9 +7,11 @@ use std::time::Duration;
 
 use anyhow::Context;
 
+use crate::domain::JobId;
 use crate::paths::Paths;
 use crate::protocol::{
-    self, ErrorBody, Op, Reply, Request, Response, StatusView, read_frame_sync, write_frame_sync,
+    self, ErrorBody, JobUpdateView, Op, Reply, Request, Response, StatusView, read_frame_sync,
+    write_frame_sync,
 };
 
 const CLIENT_RETRIES: u32 = 3;
@@ -27,7 +29,11 @@ pub enum ClientError {
 /// Send one operation and return the daemon's reply. Transport failures are
 /// retried with the same request (and therefore the same idempotency key);
 /// the daemon replays the original result for a repeated mutation.
-pub fn request(paths: &Paths, op: Op, idempotency_key: Option<String>) -> Result<Reply, ClientError> {
+pub fn request(
+    paths: &Paths,
+    op: Op,
+    idempotency_key: Option<String>,
+) -> Result<Reply, ClientError> {
     let request = Request {
         protocol_version: protocol::PROTOCOL_VERSION,
         request_id: uuid::Uuid::new_v4().to_string(),
@@ -90,7 +96,9 @@ pub fn subscribe(
     };
     let mut stream = UnixStream::connect(paths.socket()).map_err(unavailable)?;
     // No read timeout: a quiet queue sends nothing for as long as it likes.
-    stream.set_write_timeout(Some(Duration::from_secs(30))).map_err(unavailable)?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(30)))
+        .map_err(unavailable)?;
     let bytes = serde_json::to_vec(&request).expect("subscribe request serializes");
     write_frame_sync(&mut stream, &bytes, protocol::DEFAULT_MAX_FRAME_BYTES)
         .map_err(unavailable)?;
@@ -101,8 +109,9 @@ pub fn subscribe(
             Ok(None) => return Ok(()),
             Err(err) => return Err(unavailable(err)),
         };
-        let response: Response = serde_json::from_slice(&frame)
-            .map_err(|err| ClientError::Other(anyhow::anyhow!("daemon sent invalid JSON: {err}")))?;
+        let response: Response = serde_json::from_slice(&frame).map_err(|err| {
+            ClientError::Other(anyhow::anyhow!("daemon sent invalid JSON: {err}"))
+        })?;
         if let Some(error) = response.error {
             return Err(ClientError::Daemon(error));
         }
@@ -110,6 +119,109 @@ pub fn subscribe(
             Some(Reply::Status(view)) => on_snapshot(view).map_err(ClientError::Other)?,
             _ => return Err(ClientError::Other(unexpected("status"))),
         }
+    }
+}
+
+/// One asynchronous, job-scoped subscription. Quiet streams have no read
+/// timeout; EOF is an error, never evidence that the job completed.
+pub struct JobSubscription {
+    stream: tokio::net::UnixStream,
+    socket: String,
+    request_id: String,
+    job: JobId,
+    cursor: Option<i64>,
+}
+
+impl JobSubscription {
+    pub async fn connect(
+        paths: &Paths,
+        job: JobId,
+        after: Option<i64>,
+    ) -> Result<Self, ClientError> {
+        let socket = paths.socket().display().to_string();
+        let unavailable = |source| ClientError::Unavailable {
+            socket: socket.clone(),
+            source,
+        };
+        let request = Request {
+            protocol_version: protocol::PROTOCOL_VERSION,
+            request_id: uuid::Uuid::new_v4().to_string(),
+            idempotency_key: None,
+            op: Op::SubscribeJob { job, after },
+        };
+        let bytes = serde_json::to_vec(&request).expect("subscribe request serializes");
+        let stream = tokio::time::timeout(Duration::from_secs(30), async {
+            let mut stream = tokio::net::UnixStream::connect(paths.socket()).await?;
+            protocol::write_frame(&mut stream, &bytes, protocol::DEFAULT_MAX_FRAME_BYTES).await?;
+            Ok::<_, io::Error>(stream)
+        })
+        .await
+        .map_err(|_| {
+            unavailable(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out opening job subscription",
+            ))
+        })?
+        .map_err(unavailable)?;
+        Ok(Self {
+            stream,
+            socket,
+            request_id: request.request_id,
+            job,
+            cursor: after,
+        })
+    }
+
+    /// Keep this future pinned across timer/select ticks: cancelling a frame
+    /// read partway through would discard its partial framing state.
+    pub async fn next(&mut self) -> Result<JobUpdateView, ClientError> {
+        let frame = protocol::read_frame(&mut self.stream, protocol::DEFAULT_MAX_FRAME_BYTES)
+            .await
+            .and_then(|frame| {
+                frame.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "daemon closed job subscription",
+                    )
+                })
+            })
+            .map_err(|source| ClientError::Unavailable {
+                socket: self.socket.clone(),
+                source,
+            })?;
+        let response: Response = serde_json::from_slice(&frame).map_err(|err| {
+            ClientError::Other(anyhow::anyhow!("daemon sent invalid JSON: {err}"))
+        })?;
+        if response.request_id != self.request_id {
+            return Err(ClientError::Other(anyhow::anyhow!(
+                "subscription response request id mismatch"
+            )));
+        }
+        if let Some(error) = response.error {
+            return Err(ClientError::Daemon(error));
+        }
+        let Some(Reply::JobUpdate(update)) = response.reply else {
+            return Err(ClientError::Other(unexpected("job_update")));
+        };
+        let mut cursor = self.cursor.unwrap_or(0);
+        if update.job.id != self.job
+            || update.cursor < cursor
+            || (update.has_more && update.events.is_empty())
+        {
+            return Err(ClientError::Other(anyhow::anyhow!(
+                "invalid job subscription snapshot"
+            )));
+        }
+        for event in &update.events {
+            if event.job != Some(self.job) || event.id <= cursor || event.id > update.cursor {
+                return Err(ClientError::Other(anyhow::anyhow!(
+                    "invalid job subscription event cursor"
+                )));
+            }
+            cursor = event.id;
+        }
+        self.cursor = Some(update.cursor);
+        Ok(update)
     }
 }
 

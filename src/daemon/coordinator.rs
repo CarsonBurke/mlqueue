@@ -18,24 +18,28 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::config::Config;
 use crate::db::{self, AttemptRow};
 use crate::domain::{
-    AttemptId, AttemptState, JobId, JobState, SCHEDULER_SEMANTICS_VERSION, now_ms,
+    self, AttemptId, AttemptState, JobId, JobState, SCHEDULER_SEMANTICS_VERSION, now_ms,
 };
 use crate::paths::Paths;
 use crate::process::artifacts::{
     self, CANCEL_FILE, COMMAND_FILE, CancelFile, CommandFile, EXEC_FILE, ExecFile, IDENTITY_FILE,
-    IdentityFile, RESULT_FILE, RUNNER_LOG_FILE, ResultFile, ResultOutcome, START_FILE, StartFile,
+    IdentityFile, LIMIT_FILE, LimitFile, RESULT_FILE, RUNNER_LOG_FILE, ResultFile, ResultOutcome,
+    START_FILE, StartFile, TIMEOUT_FILE, TimeoutFile,
 };
 use crate::process::identity;
 use crate::protocol::{
-    self, DaemonStatusView, ErrorBody, LogPathsView, Op, Reply, Request, ResolveAs, Response,
-    SubmitParams, error_codes,
+    self, DaemonStatusView, ErrorBody, JobUpdateView, LogPathsView, Op, Reply, Request, ResolveAs,
+    Response, SubmitParams, error_codes,
 };
 use crate::scheduler::{self, ReservationSnapshot};
 
 use super::views;
 
 pub enum Msg {
-    Request { request: Box<Request>, reply: oneshot::Sender<Response> },
+    Request {
+        request: Box<Request>,
+        reply: oneshot::Sender<Response>,
+    },
     Tick,
     Shutdown,
 }
@@ -48,7 +52,10 @@ pub struct ApiError {
 
 impl ApiError {
     fn new(code: &'static str, message: impl Into<String>) -> Self {
-        Self { code, message: message.into() }
+        Self {
+            code,
+            message: message.into(),
+        }
     }
 }
 
@@ -70,8 +77,22 @@ type ApiResult<T> = Result<T, ApiError>;
 /// transaction. They are idempotently re-derived from committed state by
 /// reconcile, so a crash between commit and action loses nothing.
 enum PostAction {
-    PublishCancel { attempt_id: AttemptId, token: String, force: bool, requested_at: i64 },
-    SignalGroup { pgid: i32, signal: i32 },
+    PublishCancel {
+        attempt_id: AttemptId,
+        token: String,
+        force: bool,
+        requested_at: i64,
+    },
+    PublishTimeLimit {
+        attempt_id: AttemptId,
+        token: String,
+        time_limit_ms: Option<u64>,
+        updated_at: i64,
+    },
+    SignalGroup {
+        pgid: i32,
+        signal: i32,
+    },
 }
 
 pub struct Coordinator {
@@ -223,11 +244,18 @@ impl Coordinator {
             self.handle_read(&request.op)
         };
         match result {
-            Ok(reply) => Response { request_id, reply: Some(reply), error: None },
+            Ok(reply) => Response {
+                request_id,
+                reply: Some(reply),
+                error: None,
+            },
             Err(err) => Response {
                 request_id,
                 reply: None,
-                error: Some(ErrorBody { code: err.code.to_string(), message: err.message }),
+                error: Some(ErrorBody {
+                    code: err.code.to_string(),
+                    message: err.message,
+                }),
             },
         }
     }
@@ -243,9 +271,48 @@ impl Coordinator {
                 &self.paths,
                 self.admission_blocked.is_some(),
             )?)),
-            Op::FollowTtsSnapshot => Ok(Reply::FollowTtsSnapshot(
-                views::follow_tts_snapshot(&self.conn)?,
-            )),
+            Op::SubscribeJob { job, after } => {
+                if after.is_some_and(|cursor| cursor < 0) {
+                    return Err(ApiError::new(
+                        error_codes::INVALID_ARGUMENT,
+                        "subscribe_job requires after >= 0",
+                    ));
+                }
+                // The snapshot and cursor/page share a read transaction.
+                // No connection can insert a lifecycle event between them.
+                let tx = self.conn.transaction()?;
+                let row = db::job_row(&tx, *job)?.ok_or_else(|| api_not_found(*job))?;
+                let mut snapshot = views::job_view(&tx, &self.paths, &row, false)?;
+                if let Some(attempt) = db::attempt_by_number(&tx, *job, row.attempt_count)? {
+                    snapshot
+                        .attempts
+                        .push(views::attempt_view(&self.paths, &attempt));
+                }
+                const PAGE_SIZE: u32 = 256;
+                let (cursor, events, has_more) = match after {
+                    None => (db::latest_event_id(&tx)?, Vec::new(), false),
+                    Some(after) => {
+                        let mut rows = db::job_events_after(&tx, *job, *after, PAGE_SIZE + 1)?;
+                        let has_more = rows.len() > PAGE_SIZE as usize;
+                        if has_more {
+                            rows.pop();
+                        }
+                        let cursor = rows.last().map_or(*after, |event| event.id);
+                        let events = rows.iter().map(views::event_view).collect();
+                        (cursor, events, has_more)
+                    }
+                };
+                tx.commit()?;
+                Ok(Reply::JobUpdate(JobUpdateView {
+                    job: snapshot,
+                    cursor,
+                    events,
+                    has_more,
+                }))
+            }
+            Op::FollowTtsSnapshot => Ok(Reply::FollowTtsSnapshot(views::follow_tts_snapshot(
+                &self.conn,
+            )?)),
             Op::Events { after, limit } => {
                 if *after < 0 || !(1..=1_000).contains(limit) {
                     return Err(ApiError::new(
@@ -260,24 +327,30 @@ impl Coordinator {
                 Ok(Reply::Events { events })
             }
             Op::Show { job } => {
-                let row = db::job_row(&self.conn, *job)?
-                    .ok_or_else(|| ApiError::new(error_codes::NOT_FOUND, format!("job {job} not found")))?;
-                Ok(Reply::Job { job: views::job_view(&self.conn, &self.paths, &row, true)? })
+                let row = db::job_row(&self.conn, *job)?.ok_or_else(|| {
+                    ApiError::new(error_codes::NOT_FOUND, format!("job {job} not found"))
+                })?;
+                Ok(Reply::Job {
+                    job: views::job_view(&self.conn, &self.paths, &row, true)?,
+                })
             }
             Op::See { job } => {
                 let job = match *job {
                     Some(job) => job,
-                    None => db::latest_job_id(&self.conn)?.ok_or_else(|| {
-                        ApiError::new(error_codes::NOT_FOUND, "no jobs")
-                    })?,
+                    None => db::latest_job_id(&self.conn)?
+                        .ok_or_else(|| ApiError::new(error_codes::NOT_FOUND, "no jobs"))?,
                 };
                 let row = db::job_row(&self.conn, job)?.ok_or_else(|| api_not_found(job))?;
-                Ok(Reply::Job { job: views::job_view(&self.conn, &self.paths, &row, true)? })
+                Ok(Reply::Job {
+                    job: views::job_view(&self.conn, &self.paths, &row, true)?,
+                })
             }
             Op::Logs { job, attempt } => {
                 let attempt_row = match attempt {
                     Some(number) => db::attempt_by_number(&self.conn, *job, *number)?,
-                    None => db::attempts_for_job(&self.conn, *job)?.into_iter().next_back(),
+                    None => db::attempts_for_job(&self.conn, *job)?
+                        .into_iter()
+                        .next_back(),
                 }
                 .ok_or_else(|| {
                     ApiError::new(
@@ -321,7 +394,10 @@ impl Coordinator {
                     .collect();
                 Ok(Reply::RecoverList { attempts })
             }
-            _ => Err(ApiError::new(error_codes::INTERNAL, "mutation routed to read handler")),
+            _ => Err(ApiError::new(
+                error_codes::INTERNAL,
+                "mutation routed to read handler",
+            )),
         }
     }
 
@@ -340,7 +416,10 @@ impl Coordinator {
                 ));
             }
             let reply = serde_json::from_str(&stored_response).map_err(|err| {
-                ApiError::new(error_codes::INTERNAL, format!("stored response corrupt: {err}"))
+                ApiError::new(
+                    error_codes::INTERNAL,
+                    format!("stored response corrupt: {err}"),
+                )
             })?;
             return Ok(reply);
         }
@@ -372,28 +451,45 @@ impl Coordinator {
 
     fn perform(&mut self, action: PostAction) {
         match action {
-            PostAction::PublishCancel { attempt_id, token, force, requested_at } => {
+            PostAction::PublishCancel {
+                attempt_id,
+                token,
+                force,
+                requested_at,
+            } => {
                 let dir = self.paths.attempt_dir(attempt_id);
-                if let Err(err) = fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir) {
+                if let Err(err) = fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(&dir)
+                {
                     tracing::warn!("creating {} for cancel intent: {err}", dir.display());
                 }
-                if let Err(err) =
-                    artifacts::write_artifact(
-                        &dir,
-                        CANCEL_FILE,
-                        &CancelFile { token, force, requested_at: Some(requested_at) },
-                        false,
-                    )
-                {
+                if let Err(err) = artifacts::write_artifact(
+                    &dir,
+                    CANCEL_FILE,
+                    &CancelFile {
+                        token,
+                        force,
+                        requested_at: Some(requested_at),
+                    },
+                    false,
+                ) {
                     // Reconcile republishes committed cancellation intent.
                     tracing::warn!("publishing cancel for attempt {attempt_id}: {err}");
                 }
             }
-            PostAction::SignalGroup { pgid, signal } => {
-                unsafe {
-                    libc::killpg(pgid, signal);
-                }
+            PostAction::PublishTimeLimit {
+                attempt_id,
+                token,
+                time_limit_ms,
+                updated_at,
+            } => {
+                publish_time_limit(&self.paths, attempt_id, &token, time_limit_ms, updated_at);
             }
+            PostAction::SignalGroup { pgid, signal } => unsafe {
+                libc::killpg(pgid, signal);
+            },
         }
     }
 
@@ -428,7 +524,9 @@ impl Coordinator {
                 return self.finalize_from_result(attempt, &result);
             }
             Ok(Some(_)) => return self.quarantine(attempt, "result artifact token mismatch"),
-            Err(err) => return self.quarantine(attempt, &format!("corrupt result artifact: {err}")),
+            Err(err) => {
+                return self.quarantine(attempt, &format!("corrupt result artifact: {err}"));
+            }
             Ok(None) => {}
         }
 
@@ -453,16 +551,56 @@ impl Coordinator {
             );
         }
 
+        // A crash between the limit commit and its publication, or a daemon
+        // restart, leaves the runner holding the launch snapshot. Republish
+        // the job's current limit so the surviving runner adopts it.
+        if matches!(
+            attempt.state,
+            AttemptState::Prepared | AttemptState::Authorized | AttemptState::Running
+        ) {
+            self.republish_time_limit(attempt, &dir);
+        }
+
         match attempt.state {
             AttemptState::Prepared => self.reconcile_prepared(attempt, &dir),
             AttemptState::Authorized => self.reconcile_authorized(attempt, &dir),
             AttemptState::Running => self.reconcile_running(attempt),
-            AttemptState::Orphaned => self.reconcile_orphaned(attempt),
+            AttemptState::Orphaned => self.reconcile_orphaned(attempt, &dir),
             // Quarantine holds its lease until an operator resolves it (or a
             // valid result appears above).
             AttemptState::Quarantined => Ok(()),
             _ => Ok(()),
         }
+    }
+
+    fn republish_time_limit(&self, attempt: &AttemptRow, dir: &std::path::Path) {
+        let (desired, set_at) = match db::job_row(&self.conn, attempt.job_id) {
+            Ok(Some(job)) => (
+                job.time_limit_ms.map(|value| value as u64),
+                job.time_limit_set_at,
+            ),
+            Ok(None) => return,
+            Err(err) => {
+                tracing::warn!(
+                    "reading job {} to republish its time limit: {err:#}",
+                    attempt.job_id
+                );
+                return;
+            }
+        };
+        if published_time_limit_is_current(dir, &attempt.launch_token, desired, set_at) {
+            return;
+        }
+        let Some(set_at) = set_at else {
+            return;
+        };
+        publish_time_limit(
+            &self.paths,
+            attempt.id,
+            &attempt.launch_token,
+            desired,
+            set_at,
+        );
     }
 
     fn reconcile_prepared(&mut self, attempt: &AttemptRow, dir: &std::path::Path) -> Result<()> {
@@ -566,7 +704,9 @@ impl Coordinator {
         match artifacts::write_artifact(
             &dir,
             START_FILE,
-            &StartFile { token: attempt.launch_token.clone() },
+            &StartFile {
+                token: attempt.launch_token.clone(),
+            },
             true,
         ) {
             Ok(()) => Ok(()),
@@ -581,8 +721,11 @@ impl Coordinator {
     }
 
     fn reconcile_authorized(&mut self, attempt: &AttemptRow, dir: &std::path::Path) -> Result<()> {
-        let runner_dead = match (attempt.runner_pid, attempt.runner_start_time, &attempt.runner_boot_id)
-        {
+        let runner_dead = match (
+            attempt.runner_pid,
+            attempt.runner_start_time,
+            &attempt.runner_boot_id,
+        ) {
             (Some(pid), Some(start_time), Some(boot)) => {
                 !identity::identity_alive(pid, start_time, boot)
             }
@@ -609,7 +752,9 @@ impl Coordinator {
             match artifacts::write_artifact(
                 dir,
                 START_FILE,
-                &StartFile { token: attempt.launch_token.clone() },
+                &StartFile {
+                    token: attempt.launch_token.clone(),
+                },
                 true,
             ) {
                 Ok(()) => {}
@@ -659,8 +804,11 @@ impl Coordinator {
     }
 
     fn reconcile_running(&mut self, attempt: &AttemptRow) -> Result<()> {
-        let runner_alive = match (attempt.runner_pid, attempt.runner_start_time, &attempt.runner_boot_id)
-        {
+        let runner_alive = match (
+            attempt.runner_pid,
+            attempt.runner_start_time,
+            &attempt.runner_boot_id,
+        ) {
             (Some(pid), Some(start_time), Some(boot)) => {
                 identity::identity_alive(pid, start_time, boot)
             }
@@ -693,44 +841,126 @@ impl Coordinator {
         Ok(())
     }
 
-    fn reconcile_orphaned(&mut self, attempt: &AttemptRow) -> Result<()> {
+    fn reconcile_orphaned(&mut self, attempt: &AttemptRow, dir: &std::path::Path) -> Result<()> {
         let (Some(pgid), Some(boot)) = (attempt.cmd_pgid, attempt.runner_boot_id.as_deref()) else {
             // Orphaned is only entered from running, which has exec identity.
             return self.quarantine(attempt, "orphaned attempt lacks command identity");
         };
         let job = db::job_row(&self.conn, attempt.job_id)?.context("job of orphaned attempt")?;
-        let deadline = match (attempt.command_started_at, job.time_limit_ms) {
+        let policy_deadline = match (attempt.command_started_at, job.time_limit_ms) {
             (Some(started_at), Some(limit)) => started_at.checked_add(limit),
             _ => None,
         };
-        let deadline_expired = deadline.is_some_and(|deadline| now_ms() >= deadline);
-        let timeout_classifies = deadline.is_some_and(|deadline| {
-            now_ms() >= deadline
-                && attempt.cancel_requested_at.is_none_or(|cancelled_at| cancelled_at > deadline)
-        });
-        if !identity::group_possibly_alive(pgid, boot, attempt.cmd_start_time) {
-            let (state, message) = if attempt.timed_out_at.is_some() {
-                (AttemptState::Failed, "time limit exceeded; orphaned process group drained")
-            } else if attempt.cancel_requested {
-                (AttemptState::Cancelled, "cancelled; orphaned process group drained")
+        // The runner records a timeout it has already started. That commitment
+        // outlives both the runner and a later edit of the job's limit.
+        let committed = match artifacts::read_artifact::<TimeoutFile>(&dir.join(TIMEOUT_FILE)) {
+            Ok(Some(file)) if file.token == attempt.launch_token => Some(file),
+            Ok(Some(_)) => {
+                return self.quarantine(attempt, "timeout artifact token mismatch");
+            }
+            Err(err) => {
+                return self.quarantine(attempt, &format!("corrupt timeout artifact: {err}"));
+            }
+            Ok(None) => None,
+        };
+        let now = now_ms();
+        let deadline = committed
+            .as_ref()
+            .map(|file| file.deadline)
+            .or(attempt.timed_out_at)
+            .or(policy_deadline);
+        let deadline_expired =
+            committed.is_some() || deadline.is_some_and(|deadline| now >= deadline);
+        let timeout_classifies = if committed.is_some() || attempt.timed_out_at.is_some() {
+            true
+        } else if let Some(deadline) = deadline.filter(|_| deadline_expired) {
+            if attempt.cancel_requested {
+                attempt.cancel_requested_at.is_some_and(|cancelled_at| {
+                    domain::timeout_wins_over_cancel(cancelled_at, deadline, job.time_limit_set_at)
+                })
             } else {
-                (AttemptState::Lost, "runner died; command exit status unknown")
+                true
+            }
+        } else {
+            false
+        };
+        // A deadline noticed only after the group has already drained is not a
+        // timeout: nobody committed to termination while the command was alive.
+        // `timeout.json` and `timed_out_at` are that commitment.
+        let timed_out = committed.is_some() || attempt.timed_out_at.is_some();
+        if !identity::group_possibly_alive(pgid, boot, attempt.cmd_start_time) {
+            let (state, message) = if timed_out {
+                (
+                    AttemptState::Failed,
+                    "time limit exceeded; orphaned process group drained",
+                )
+            } else if attempt.cancel_requested {
+                (
+                    AttemptState::Cancelled,
+                    "cancelled; orphaned process group drained",
+                )
+            } else {
+                (
+                    AttemptState::Lost,
+                    "runner died; command exit status unknown",
+                )
             };
-            return self.finalize_attempt_and_job(attempt, state, None, None, Some(message), "daemon");
+            return self.finalize_attempt_and_job(
+                attempt,
+                state,
+                None,
+                None,
+                Some(message),
+                "daemon",
+            );
         }
         // The group is still live and there is no runner: the daemon itself
         // delivers committed cancellation signals from outside the group.
-        if deadline_expired {
+        if deadline_expired && timeout_classifies {
             let deadline = deadline.expect("timeout precedence requires a deadline");
-            if timeout_classifies && attempt.timed_out_at.is_none() {
+            if attempt.timed_out_at.is_none() {
                 db::set_attempt_timed_out(&self.conn, attempt.id, deadline)?;
             }
+            // Freeze the grace anchor in timeout.json. A later edit of the job
+            // limit must not move a kill that has already been armed.
+            let anchor = if let Some(file) = &committed {
+                file.observed_at
+            } else {
+                let anchor = domain::timeout_kill_anchor(deadline, job.time_limit_set_at, None);
+                let record = TimeoutFile {
+                    token: attempt.launch_token.clone(),
+                    deadline,
+                    observed_at: anchor,
+                };
+                if let Err(err) = artifacts::write_artifact(dir, TIMEOUT_FILE, &record, true)
+                    && err.kind() != std::io::ErrorKind::AlreadyExists
+                {
+                    tracing::warn!("recording timeout for attempt {}: {err}", attempt.id);
+                }
+                anchor
+            };
             if self.orphan_term_sent.insert(attempt.id) {
                 unsafe {
                     libc::killpg(pgid, libc::SIGTERM);
                 }
             }
-            if now_ms().saturating_sub(deadline) >= self.config.cancel_grace_ms as i64 {
+            if now.saturating_sub(anchor) >= self.config.cancel_grace_ms as i64 {
+                unsafe {
+                    libc::killpg(pgid, libc::SIGKILL);
+                }
+            }
+        } else if deadline_expired {
+            // The deadline fired, but an earlier cancel keeps the classification.
+            // Escalation still uses the deadline that was already in force, or
+            // the installation time of a limit moved into the past.
+            let deadline = deadline.expect("expired deadline");
+            let anchor = domain::timeout_kill_anchor(deadline, job.time_limit_set_at, None);
+            if self.orphan_term_sent.insert(attempt.id) {
+                unsafe {
+                    libc::killpg(pgid, libc::SIGTERM);
+                }
+            }
+            if now.saturating_sub(anchor) >= self.config.cancel_grace_ms as i64 {
                 unsafe {
                     libc::killpg(pgid, libc::SIGKILL);
                 }
@@ -791,10 +1021,13 @@ impl Coordinator {
                         (None, Some(signal)) => format!("command terminated by signal {signal}"),
                         (None, None) => "command exited abnormally".to_string(),
                     };
-                    (AttemptState::Failed, Some(match &result.message {
-                        Some(extra) => format!("{describe} ({extra})"),
-                        None => describe,
-                    }))
+                    (
+                        AttemptState::Failed,
+                        Some(match &result.message {
+                            Some(extra) => format!("{describe} ({extra})"),
+                            None => describe,
+                        }),
+                    )
                 }
             }
             ResultOutcome::LaunchFailed | ResultOutcome::AuthorizationTimeout => {
@@ -835,7 +1068,9 @@ impl Coordinator {
                 Some(attempt.id),
                 &format!("attempt_{}", state.as_str()),
                 actor,
-                message.map(|m| json!({ "message": m }).to_string()).as_deref(),
+                message
+                    .map(|m| json!({ "message": m }).to_string())
+                    .as_deref(),
             )?;
             let job = db::job_row(&tx, attempt.job_id)?.context("job of finalized attempt")?;
             if !job.state.is_terminal() {
@@ -973,8 +1208,10 @@ impl Coordinator {
             return Ok(());
         }
 
-        let lease_attempt_by_job: BTreeMap<JobId, AttemptId> =
-            leases.iter().map(|(attempt, lease)| (lease.job_id, *attempt)).collect();
+        let lease_attempt_by_job: BTreeMap<JobId, AttemptId> = leases
+            .iter()
+            .map(|(attempt, lease)| (lease.job_id, *attempt))
+            .collect();
         let mut launched: Vec<AttemptId> = Vec::new();
         {
             let tx = self.conn.transaction()?;
@@ -1029,13 +1266,23 @@ impl Coordinator {
 
             let mut current_reservation = reservation.as_ref().map(|res| (res.id, res.job_id));
             if outcome.satisfy_reservation {
-                let (id, job) = current_reservation.take().context("satisfy without reservation")?;
+                let (id, job) = current_reservation
+                    .take()
+                    .context("satisfy without reservation")?;
                 db::resolve_reservation(&tx, id, "satisfied", "protected job started", now)?;
-                db::append_event(&tx, Some(job), None, "reservation_satisfied", "daemon", None)?;
+                db::append_event(
+                    &tx,
+                    Some(job),
+                    None,
+                    "reservation_satisfied",
+                    "daemon",
+                    None,
+                )?;
             }
             if let Some(reason) = outcome.invalidate_reservation {
-                let (id, job) =
-                    current_reservation.take().context("invalidate without reservation")?;
+                let (id, job) = current_reservation
+                    .take()
+                    .context("invalidate without reservation")?;
                 db::resolve_reservation(&tx, id, "invalidated", reason, now)?;
                 db::append_event(
                     &tx,
@@ -1066,8 +1313,10 @@ impl Coordinator {
                     now,
                 )?;
                 for job in &new_res.initial_consumed {
-                    let attempt =
-                        lease_attempt_by_job.get(job).or_else(|| batch.get(job)).copied();
+                    let attempt = lease_attempt_by_job
+                        .get(job)
+                        .or_else(|| batch.get(job))
+                        .copied();
                     db::record_backfill(&tx, rid, *job, "initial_active", attempt, now)?;
                 }
                 db::append_event(
@@ -1087,7 +1336,9 @@ impl Coordinator {
                 current_reservation = Some((rid, new_res.job_id));
             }
             for start in &outcome.starts {
-                let Some(bypassed) = start.bypasses else { continue };
+                let Some(bypassed) = start.bypasses else {
+                    continue;
+                };
                 // A pass can consume bypasses of the old reservation (before
                 // it was satisfied) and of a newly created one; attribute by
                 // protected job.
@@ -1097,7 +1348,14 @@ impl Coordinator {
                     .flatten()
                     .find(|(_, job)| *job == bypassed)
                     .context("backfill without matching reservation")?;
-                db::record_backfill(&tx, rid, start.job_id, "admitted", batch.get(&start.job_id).copied(), now)?;
+                db::record_backfill(
+                    &tx,
+                    rid,
+                    start.job_id,
+                    "admitted",
+                    batch.get(&start.job_id).copied(),
+                    now,
+                )?;
                 db::append_event(
                     &tx,
                     Some(start.job_id),
@@ -1149,7 +1407,10 @@ impl Coordinator {
         let job = db::job_row(&self.conn, attempt.job_id)?.context("job of attempt exists")?;
         let dir = self.paths.attempt_dir(attempt.id);
         if !dir.exists() {
-            fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&dir)?;
         }
 
         match artifacts::read_artifact::<CommandFile>(&dir.join(COMMAND_FILE)) {
@@ -1230,6 +1491,60 @@ impl Coordinator {
 // transaction without borrowing the whole coordinator)
 // ---------------------------------------------------------------------------
 
+fn publish_time_limit(
+    paths: &Paths,
+    attempt_id: AttemptId,
+    token: &str,
+    time_limit_ms: Option<u64>,
+    updated_at: i64,
+) {
+    let dir = paths.attempt_dir(attempt_id);
+    if let Err(err) = fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+    {
+        tracing::warn!("creating {} for time limit: {err}", dir.display());
+    }
+    if let Err(err) = artifacts::write_artifact(
+        &dir,
+        LIMIT_FILE,
+        &LimitFile {
+            token: token.to_string(),
+            time_limit_ms,
+            updated_at: Some(updated_at),
+        },
+        false,
+    ) {
+        // Reconcile republishes the committed job limit on a later tick.
+        tracing::warn!("publishing time limit for attempt {attempt_id}: {err}");
+    }
+}
+
+/// True when a live runner will already observe `desired`, either from an
+/// up-to-date `limit.json` or from the launch snapshot when no override exists.
+fn published_time_limit_is_current(
+    dir: &std::path::Path,
+    token: &str,
+    desired: Option<u64>,
+    set_at: Option<i64>,
+) -> bool {
+    match artifacts::read_artifact::<LimitFile>(&dir.join(LIMIT_FILE)) {
+        Ok(Some(limit)) => {
+            limit.token == token && limit.time_limit_ms == desired && limit.updated_at == set_at
+        }
+        Ok(None) => match artifacts::read_artifact::<CommandFile>(&dir.join(COMMAND_FILE)) {
+            // No override is current only while the launch snapshot is still the policy.
+            Ok(Some(command)) if command.token == token => {
+                command.time_limit_ms == desired && set_at.is_none()
+            }
+            // Nothing launched yet, or the command record is not ours to repair.
+            _ => true,
+        },
+        Err(_) => false,
+    }
+}
+
 fn api_not_found(job: JobId) -> ApiError {
     ApiError::new(error_codes::NOT_FOUND, format!("job {job} not found"))
 }
@@ -1258,7 +1573,9 @@ fn invalidate_reservation_if_protected(
 
 fn job_reply(tx: &Transaction<'_>, paths: &Paths, job: JobId) -> ApiResult<Reply> {
     let row = db::job_row(tx, job)?.ok_or_else(|| api_not_found(job))?;
-    Ok(Reply::Job { job: views::job_view(tx, paths, &row, true)? })
+    Ok(Reply::Job {
+        job: views::job_view(tx, paths, &row, true)?,
+    })
 }
 
 fn apply_mutation(
@@ -1290,7 +1607,9 @@ fn apply_mutation(
             db::advance_dependency_graph(tx, now)?;
             let row = db::job_row(tx, job)?.ok_or_else(|| api_not_found(job))?;
             Ok((
-                Reply::Submitted { job: views::job_view(tx, paths, &row, true)? },
+                Reply::Submitted {
+                    job: views::job_view(tx, paths, &row, true)?,
+                },
                 Vec::new(),
             ))
         }
@@ -1303,7 +1622,10 @@ fn apply_mutation(
             if row.state != JobState::Queued {
                 return Err(ApiError::new(
                     error_codes::INVALID_STATE,
-                    format!("only queued jobs can be held; job {} is {}", row.id, row.state),
+                    format!(
+                        "only queued jobs can be held; job {} is {}",
+                        row.id, row.state
+                    ),
                 ));
             }
             invalidate_reservation_if_protected(tx, row.id, "protected job was held", now)?;
@@ -1316,7 +1638,10 @@ fn apply_mutation(
             if row.state != JobState::Held {
                 return Err(ApiError::new(
                     error_codes::INVALID_STATE,
-                    format!("only held jobs can be released; job {} is {}", row.id, row.state),
+                    format!(
+                        "only held jobs can be released; job {} is {}",
+                        row.id, row.state
+                    ),
                 ));
             }
             db::update_job_state(tx, row.id, JobState::Queued, None, now)?;
@@ -1341,7 +1666,10 @@ fn apply_mutation(
             db::append_event(tx, Some(row.id), None, "job_retried", "client", None)?;
             Ok((job_reply(tx, paths, *job)?, Vec::new()))
         }
-        Op::SetMaxParallelRuns { job, max_parallel_runs } => {
+        Op::SetMaxParallelRuns {
+            job,
+            max_parallel_runs,
+        } => {
             if *max_parallel_runs == 0 {
                 return Err(ApiError::new(
                     error_codes::INVALID_ARGUMENT,
@@ -1464,14 +1792,85 @@ fn apply_mutation(
             )?;
             Ok((job_reply(tx, paths, *job)?, Vec::new()))
         }
-        Op::RecoverResolve { job, attempt, resolve_as } => {
+        Op::SetTimeLimit { job, time_limit_ms } => {
+            let stored = validate_time_limit(*time_limit_ms)?;
+            let row = db::job_row(tx, *job)?.ok_or_else(|| api_not_found(*job))?;
+            if !matches!(
+                row.state,
+                JobState::Queued
+                    | JobState::Held
+                    | JobState::Starting
+                    | JobState::Running
+                    | JobState::NeedsAttention
+            ) {
+                return Err(ApiError::new(
+                    error_codes::INVALID_STATE,
+                    format!(
+                        "time limit cannot be changed after a job finishes; job {} is {}",
+                        row.id, row.state
+                    ),
+                ));
+            }
+            let current = row
+                .time_limit_ms
+                .and_then(|value| u64::try_from(value).ok());
+            if current == *time_limit_ms {
+                return Ok((job_reply(tx, paths, *job)?, Vec::new()));
+            }
+            let publish = match row.state {
+                JobState::Queued | JobState::Held => None,
+                JobState::Starting | JobState::Running | JobState::NeedsAttention => {
+                    let attempt = db::live_attempt_for_job(tx, row.id)?.ok_or_else(|| {
+                        ApiError::new(
+                            error_codes::INVALID_STATE,
+                            format!("job {} has no live attempt to update", row.id),
+                        )
+                    })?;
+                    Some((attempt.id, attempt.launch_token))
+                }
+                _ => unreachable!("state eligibility checked above"),
+            };
+            db::set_job_time_limit(tx, row.id, stored, now)?;
+            db::append_event(
+                tx,
+                Some(row.id),
+                publish.as_ref().map(|(attempt, _)| *attempt),
+                "time_limit_changed",
+                "client",
+                Some(
+                    &json!({
+                        "from": row.time_limit_ms,
+                        "to": stored,
+                    })
+                    .to_string(),
+                ),
+            )?;
+            let actions = publish
+                .map(|(attempt_id, token)| PostAction::PublishTimeLimit {
+                    attempt_id,
+                    token,
+                    time_limit_ms: *time_limit_ms,
+                    updated_at: now,
+                })
+                .into_iter()
+                .collect();
+            Ok((job_reply(tx, paths, *job)?, actions))
+        }
+        Op::RecoverResolve {
+            job,
+            attempt,
+            resolve_as,
+        } => {
             let attempt_row = db::attempt_by_number(tx, *job, *attempt)?.ok_or_else(|| {
                 ApiError::new(
                     error_codes::NOT_FOUND,
                     format!("job {job} has no attempt number {attempt}"),
                 )
             })?;
-            if !matches!(attempt_row.state, AttemptState::Orphaned | AttemptState::Quarantined) {
+            if !matches!(
+                attempt_row.state,
+                AttemptState::Orphaned | AttemptState::Quarantined
+            ) {
                 return Err(ApiError::new(
                     error_codes::INVALID_STATE,
                     format!(
@@ -1507,7 +1906,15 @@ fn apply_mutation(
             } else {
                 "resolved by operator via recover resolve"
             };
-            db::finalize_attempt(tx, attempt_row.id, attempt_state, None, None, Some(message), now)?;
+            db::finalize_attempt(
+                tx,
+                attempt_row.id,
+                attempt_state,
+                None,
+                None,
+                Some(message),
+                now,
+            )?;
             db::release_lease(tx, attempt_row.id, now)?;
             db::update_job_state(tx, *job, job_state, Some(message), now)?;
             db::append_event(
@@ -1540,23 +1947,41 @@ fn apply_mutation(
                     tx,
                     None,
                     None,
-                    if paused { "queue_paused" } else { "queue_unpaused" },
+                    if paused {
+                        "queue_paused"
+                    } else {
+                        "queue_unpaused"
+                    },
                     "client",
                     None,
                 )?;
             }
             Ok((Reply::Paused { paused }, Vec::new()))
         }
-        _ => Err(ApiError::new(error_codes::INTERNAL, "read op routed to mutation handler")),
+        _ => Err(ApiError::new(
+            error_codes::INTERNAL,
+            "read op routed to mutation handler",
+        )),
     }
 }
 
-fn cancel_job(tx: &Transaction<'_>, job: JobId, force: bool, now: i64) -> ApiResult<Vec<PostAction>> {
+fn cancel_job(
+    tx: &Transaction<'_>,
+    job: JobId,
+    force: bool,
+    now: i64,
+) -> ApiResult<Vec<PostAction>> {
     let row = db::job_row(tx, job)?.ok_or_else(|| api_not_found(job))?;
     match row.state {
         JobState::Queued | JobState::Held => {
             invalidate_reservation_if_protected(tx, row.id, "protected job was cancelled", now)?;
-            db::update_job_state(tx, row.id, JobState::Cancelled, Some("cancelled before start"), now)?;
+            db::update_job_state(
+                tx,
+                row.id,
+                JobState::Cancelled,
+                Some("cancelled before start"),
+                now,
+            )?;
             db::append_event(tx, Some(row.id), None, "job_cancelled", "client", None)?;
             db::advance_dependency_graph(tx, now)?;
             Ok(Vec::new())
@@ -1622,7 +2047,10 @@ fn cancel_job(tx: &Transaction<'_>, job: JobId, force: bool, now: i64) -> ApiRes
                 // and reconcile finalizes once the group drains.
                 AttemptState::Orphaned => Ok(attempt
                     .cmd_pgid
-                    .map(|pgid| PostAction::SignalGroup { pgid, signal: libc::SIGTERM })
+                    .map(|pgid| PostAction::SignalGroup {
+                        pgid,
+                        signal: libc::SIGTERM,
+                    })
                     .into_iter()
                     .collect()),
                 AttemptState::Quarantined => Err(ApiError::new(
@@ -1650,12 +2078,27 @@ fn cancel_job(tx: &Transaction<'_>, job: JobId, force: bool, now: i64) -> ApiRes
     }
 }
 
+fn validate_time_limit(limit: Option<u64>) -> ApiResult<Option<i64>> {
+    match limit {
+        None => Ok(None),
+        Some(0) => Err(ApiError::new(
+            error_codes::INVALID_ARGUMENT,
+            "timeLimitMs must be a positive integer",
+        )),
+        Some(limit) => i64::try_from(limit)
+            .map(Some)
+            .map_err(|_| ApiError::new(error_codes::INVALID_ARGUMENT, "timeLimitMs is too large")),
+    }
+}
+
 /// Argument and filesystem validation with no database dependency; runs on
 /// the coordinator before the write transaction opens.
 fn validate_submission_fs(params: &SubmitParams) -> ApiResult<()> {
     let invalid = |message: String| ApiError::new(error_codes::INVALID_ARGUMENT, message);
     if params.name.is_empty() || params.name.contains('\0') {
-        return Err(invalid("job name must be non-empty UTF-8 without NUL".into()));
+        return Err(invalid(
+            "job name must be non-empty UTF-8 without NUL".into(),
+        ));
     }
     if params.max_parallel_runs == 0 {
         return Err(invalid("maxParallelRuns must be a positive integer".into()));
@@ -1666,7 +2109,10 @@ fn validate_submission_fs(params: &SubmitParams) -> ApiResult<()> {
     if params.time_limit_ms == Some(0) {
         return Err(invalid("timeLimitMs must be a positive integer".into()));
     }
-    if params.time_limit_ms.is_some_and(|limit| i64::try_from(limit).is_err()) {
+    if params
+        .time_limit_ms
+        .is_some_and(|limit| i64::try_from(limit).is_err())
+    {
         return Err(invalid("timeLimitMs is too large".into()));
     }
     if params.args.is_empty() {
@@ -1689,7 +2135,10 @@ fn validate_submission_fs(params: &SubmitParams) -> ApiResult<()> {
     // Fast feedback only; the launch path revalidates because queued
     // filesystem state can change.
     if !cwd.is_dir() {
-        return Err(invalid(format!("working directory {} is not a directory", params.cwd)));
+        return Err(invalid(format!(
+            "working directory {} is not a directory",
+            params.cwd
+        )));
     }
     let executable = &params.args[0];
     if executable.contains('/') {
@@ -1729,4 +2178,203 @@ fn validate_submission_parents(tx: &Transaction<'_>, params: &SubmitParams) -> A
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn command(limit: Option<u64>) -> CommandFile {
+        CommandFile {
+            attempt_id: 1,
+            job_id: 1,
+            token: "token".into(),
+            argv: vec!["true".into()],
+            cwd: "/tmp".into(),
+            env: BTreeMap::new(),
+            start_wait_ms: 1,
+            cancel_grace_ms: 1,
+            poll_ms: 10,
+            time_limit_ms: limit,
+        }
+    }
+
+    #[test]
+    fn published_time_limit_follows_the_override_or_the_launch_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(published_time_limit_is_current(
+            dir.path(),
+            "token",
+            None,
+            None
+        ));
+
+        artifacts::write_artifact(dir.path(), COMMAND_FILE, &command(Some(1_000)), true).unwrap();
+        assert!(published_time_limit_is_current(
+            dir.path(),
+            "token",
+            Some(1_000),
+            None
+        ));
+        assert!(!published_time_limit_is_current(
+            dir.path(),
+            "token",
+            Some(50),
+            None
+        ));
+        assert!(!published_time_limit_is_current(
+            dir.path(),
+            "token",
+            None,
+            None
+        ));
+        assert!(!published_time_limit_is_current(
+            dir.path(),
+            "token",
+            Some(1_000),
+            Some(5)
+        ));
+
+        artifacts::write_artifact(
+            dir.path(),
+            LIMIT_FILE,
+            &LimitFile {
+                token: "token".into(),
+                time_limit_ms: None,
+                updated_at: Some(5),
+            },
+            false,
+        )
+        .unwrap();
+        assert!(published_time_limit_is_current(
+            dir.path(),
+            "token",
+            None,
+            Some(5)
+        ));
+        assert!(!published_time_limit_is_current(
+            dir.path(),
+            "token",
+            Some(1_000),
+            Some(5)
+        ));
+
+        std::fs::write(dir.path().join(LIMIT_FILE), b"{ not json").unwrap();
+        assert!(!published_time_limit_is_current(
+            dir.path(),
+            "token",
+            Some(1_000),
+            None
+        ));
+    }
+
+    #[test]
+    fn job_subscription_starts_at_head_and_replays_every_backlog_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            runtime_dir: dir.path().join("runtime"),
+            state_dir: dir.path().join("state"),
+            config_file: dir.path().join("config.toml"),
+        };
+        let conn = db::open_in_memory().unwrap();
+        let params = SubmitParams {
+            name: "subscribed".into(),
+            cwd: "/tmp".into(),
+            args: vec!["true".into()],
+            env: BTreeMap::new(),
+            max_parallel_runs: 1,
+            priority: 0,
+            max_attempts: 1,
+            retry_delay_ms: 0,
+            time_limit_ms: None,
+            dependencies: Vec::new(),
+        };
+        let job = db::insert_job(&conn, &params, 1000).unwrap();
+        let other = db::insert_job(&conn, &params, 1000).unwrap();
+        db::append_event(&conn, Some(job), None, "job_submitted", "client", None).unwrap();
+        let mut coordinator = Coordinator::new(conn, Config::default(), paths).unwrap();
+        let Reply::JobUpdate(initial) = coordinator
+            .handle_read(&Op::SubscribeJob { job, after: None })
+            .unwrap()
+        else {
+            panic!("expected job update")
+        };
+        assert_eq!(initial.job.id, job);
+        assert_eq!(
+            initial.cursor,
+            db::latest_event_id(&coordinator.conn).unwrap()
+        );
+        assert!(
+            initial.events.is_empty(),
+            "initial subscribe does not replay history"
+        );
+        assert!(!initial.has_more);
+
+        // All transitions commit before any reader gets another turn, just as
+        // with coalesced watch wakeups and rapid starts/retries/completion.
+        let mut expected = Vec::new();
+        for _ in 0..200 {
+            for event in ["attempt_running", "attempt_failed", "job_retry_scheduled"] {
+                db::append_event(&coordinator.conn, Some(other), None, event, "daemon", None)
+                    .unwrap();
+                db::append_event(&coordinator.conn, Some(job), None, event, "daemon", None)
+                    .unwrap();
+                expected.push((
+                    db::latest_event_id(&coordinator.conn).unwrap(),
+                    event.to_string(),
+                ));
+            }
+        }
+        db::update_job_state(&coordinator.conn, job, JobState::Succeeded, None, 2000).unwrap();
+        db::append_event(
+            &coordinator.conn,
+            Some(job),
+            None,
+            "job_succeeded",
+            "daemon",
+            None,
+        )
+        .unwrap();
+        expected.push((
+            db::latest_event_id(&coordinator.conn).unwrap(),
+            "job_succeeded".into(),
+        ));
+        let mut cursor = initial.cursor;
+        let mut actual = Vec::new();
+        loop {
+            let Reply::JobUpdate(page) = coordinator
+                .handle_read(&Op::SubscribeJob {
+                    job,
+                    after: Some(cursor),
+                })
+                .unwrap()
+            else {
+                panic!("expected job update")
+            };
+            assert_eq!(page.job.state, "succeeded");
+            assert!(page.events.iter().all(|event| event.job == Some(job)));
+            if actual.is_empty() {
+                assert!(page.has_more, "terminal snapshot must not hide a backlog");
+            }
+            assert!(page.events.len() <= 256);
+            cursor = page.cursor;
+            actual.extend(
+                page.events
+                    .into_iter()
+                    .map(|event| (event.id, event.event_type)),
+            );
+            if !page.has_more {
+                break;
+            }
+        }
+        assert_eq!(actual, expected);
+        let missing = coordinator
+            .handle_read(&Op::SubscribeJob {
+                job: other + 1,
+                after: None,
+            })
+            .unwrap_err();
+        assert_eq!(missing.code, error_codes::NOT_FOUND);
+    }
 }

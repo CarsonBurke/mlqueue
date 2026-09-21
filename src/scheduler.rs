@@ -167,7 +167,10 @@ pub fn plan_pass(
                     .find(|c| c.job_id == r.job_id)
                     .expect("protected job verified eligible");
                 if can_admit(&shadow_limits, protected.limit) {
-                    outcome.starts.push(Start { job_id: protected.job_id, bypasses: None });
+                    outcome.starts.push(Start {
+                        job_id: protected.job_id,
+                        bypasses: None,
+                    });
                     started.insert(protected.job_id);
                     shadow_limits.push(protected.limit);
                     shadow_jobs.insert(protected.job_id);
@@ -197,7 +200,10 @@ pub fn plan_pass(
                 });
                 match backfill {
                     Some(c) => {
-                        outcome.starts.push(Start { job_id: c.job_id, bypasses: Some(r.job_id) });
+                        outcome.starts.push(Start {
+                            job_id: c.job_id,
+                            bypasses: Some(r.job_id),
+                        });
                         started.insert(c.job_id);
                         shadow_limits.push(c.limit);
                         shadow_jobs.insert(c.job_id);
@@ -215,7 +221,10 @@ pub fn plan_pass(
                     break;
                 };
                 if can_admit(&shadow_limits, head.limit) {
-                    outcome.starts.push(Start { job_id: head.job_id, bypasses: None });
+                    outcome.starts.push(Start {
+                        job_id: head.job_id,
+                        bypasses: None,
+                    });
                     started.insert(head.job_id);
                     shadow_limits.push(head.limit);
                     shadow_jobs.insert(head.job_id);
@@ -253,7 +262,10 @@ mod tests {
         limits
             .iter()
             .enumerate()
-            .map(|(i, &limit)| ActiveLease { job_id: -(i as i64 + 1), limit })
+            .map(|(i, &limit)| ActiveLease {
+                job_id: -(i as i64 + 1),
+                limit,
+            })
             .collect()
     }
 
@@ -328,8 +340,14 @@ mod tests {
     #[test]
     fn lower_priority_cannot_backfill_a_protected_job() {
         let active = vec![
-            ActiveLease { job_id: 100, limit: 3 },
-            ActiveLease { job_id: 101, limit: 3 },
+            ActiveLease {
+                job_id: 100,
+                limit: 3,
+            },
+            ActiveLease {
+                job_id: 101,
+                limit: 3,
+            },
         ];
         let res = ReservationSnapshot {
             job_id: 1,
@@ -345,8 +363,14 @@ mod tests {
     #[test]
     fn higher_priority_supersedes_a_lower_priority_reservation() {
         let active = vec![
-            ActiveLease { job_id: 100, limit: 3 },
-            ActiveLease { job_id: 101, limit: 3 },
+            ActiveLease {
+                job_id: 100,
+                limit: 3,
+            },
+            ActiveLease {
+                job_id: 101,
+                limit: 3,
+            },
         ];
         let res = ReservationSnapshot {
             job_id: 1,
@@ -372,14 +396,33 @@ mod tests {
         // Motivating example: two CleanRL(3) active, LLM(1) first in line,
         // five CleanRL(3) behind it.
         let active = vec![
-            ActiveLease { job_id: 100, limit: 3 },
-            ActiveLease { job_id: 101, limit: 3 },
+            ActiveLease {
+                job_id: 100,
+                limit: 3,
+            },
+            ActiveLease {
+                job_id: 101,
+                limit: 3,
+            },
         ];
-        let eligible = vec![cand(1, 1), cand(2, 3), cand(3, 3), cand(4, 3), cand(5, 3), cand(6, 3)];
+        let eligible = vec![
+            cand(1, 1),
+            cand(2, 3),
+            cand(3, 3),
+            cand(4, 3),
+            cand(5, 3),
+            cand(6, 3),
+        ];
         let outcome = plan_pass(&active, &eligible, None);
 
         // LLM protected; exactly one CleanRL backfills the empty third slot.
-        assert_eq!(outcome.starts, vec![Start { job_id: 2, bypasses: Some(1) }]);
+        assert_eq!(
+            outcome.starts,
+            vec![Start {
+                job_id: 2,
+                bypasses: Some(1)
+            }]
+        );
         let res = outcome.create_reservation.unwrap();
         assert_eq!(res.job_id, 1);
         assert_eq!(res.initial_consumed, BTreeSet::from([100, 101]));
@@ -392,8 +435,14 @@ mod tests {
         // initial blocker still runs the window is open and job 4 takes the
         // empty third slot.
         let active = vec![
-            ActiveLease { job_id: 100, limit: 3 },
-            ActiveLease { job_id: 101, limit: 3 },
+            ActiveLease {
+                job_id: 100,
+                limit: 3,
+            },
+            ActiveLease {
+                job_id: 101,
+                limit: 3,
+            },
         ];
         let res = ReservationSnapshot {
             job_id: 1,
@@ -402,7 +451,13 @@ mod tests {
         };
         let eligible = vec![cand(1, 1), cand(4, 3)];
         let outcome = plan_pass(&active, &eligible, Some(&res));
-        assert_eq!(outcome.starts, vec![Start { job_id: 4, bypasses: Some(1) }]);
+        assert_eq!(
+            outcome.starts,
+            vec![Start {
+                job_id: 4,
+                bypasses: Some(1)
+            }]
+        );
 
         // A consumed bypass stays consumed in the open window: a retry of
         // job 4 may not pass again.
@@ -420,8 +475,14 @@ mod tests {
         // Frontier frozen at cutoff 6; job 7 arrived later. A slot is open,
         // but job 7 must not take it and pre-cutoff job 3 may.
         let active = vec![
-            ActiveLease { job_id: 100, limit: 3 },
-            ActiveLease { job_id: 101, limit: 3 },
+            ActiveLease {
+                job_id: 100,
+                limit: 3,
+            },
+            ActiveLease {
+                job_id: 101,
+                limit: 3,
+            },
         ];
         let res = ReservationSnapshot {
             job_id: 1,
@@ -430,7 +491,13 @@ mod tests {
         };
         let eligible = vec![cand(1, 1), cand(3, 3), cand(7, 3)];
         let outcome = plan_pass(&active, &eligible, Some(&res));
-        assert_eq!(outcome.starts, vec![Start { job_id: 3, bypasses: Some(1) }]);
+        assert_eq!(
+            outcome.starts,
+            vec![Start {
+                job_id: 3,
+                bypasses: Some(1)
+            }]
+        );
 
         // Same but job 3's bypass is already consumed: nothing starts even
         // though a slot is open — post-cutoff job 7 still may not pass.
@@ -449,9 +516,24 @@ mod tests {
     fn frozen_frontier_uses_readiness_order_not_job_id() {
         let active = leases(&[3, 3]);
         let eligible = vec![
-            Candidate { job_id: 100, ready_seq: 1, limit: 1, priority: 0 },
-            Candidate { job_id: 200, ready_seq: 5, limit: 3, priority: 0 },
-            Candidate { job_id: 1, ready_seq: 11, limit: 3, priority: 0 },
+            Candidate {
+                job_id: 100,
+                ready_seq: 1,
+                limit: 1,
+                priority: 0,
+            },
+            Candidate {
+                job_id: 200,
+                ready_seq: 5,
+                limit: 3,
+                priority: 0,
+            },
+            Candidate {
+                job_id: 1,
+                ready_seq: 11,
+                limit: 3,
+                priority: 0,
+            },
         ];
         let reservation = ReservationSnapshot {
             job_id: 100,
@@ -470,10 +552,20 @@ mod tests {
     fn protected_job_starts_before_backfills_when_drained() {
         // Everything drained: the protected LLM(1) starts alone; eligible
         // CleanRL jobs must not start beside it.
-        let res = ReservationSnapshot { job_id: 1, cutoff_seq: Some(6), consumed: BTreeSet::new() };
+        let res = ReservationSnapshot {
+            job_id: 1,
+            cutoff_seq: Some(6),
+            consumed: BTreeSet::new(),
+        };
         let eligible = vec![cand(1, 1), cand(3, 3), cand(4, 3)];
         let outcome = plan_pass(&[], &eligible, Some(&res));
-        assert_eq!(outcome.starts, vec![Start { job_id: 1, bypasses: None }]);
+        assert_eq!(
+            outcome.starts,
+            vec![Start {
+                job_id: 1,
+                bypasses: None
+            }]
+        );
         assert!(outcome.satisfy_reservation);
         // After the exclusive job is admitted, the rest wait (head job 3
         // becomes the next protected job).
@@ -484,7 +576,11 @@ mod tests {
     fn satisfying_one_reservation_can_create_the_next() {
         // Protected job (2-wide) starts; one companion fits; the next head is
         // 1-wide and becomes the new protected job.
-        let res = ReservationSnapshot { job_id: 1, cutoff_seq: Some(5), consumed: BTreeSet::new() };
+        let res = ReservationSnapshot {
+            job_id: 1,
+            cutoff_seq: Some(5),
+            consumed: BTreeSet::new(),
+        };
         let eligible = vec![cand(1, 2), cand(2, 2), cand(3, 1)];
         let outcome = plan_pass(&[], &eligible, Some(&res));
         assert_eq!(start_ids(&outcome), vec![1, 2]);
@@ -496,7 +592,11 @@ mod tests {
 
     #[test]
     fn ineligible_protected_job_invalidates_reservation() {
-        let res = ReservationSnapshot { job_id: 1, cutoff_seq: Some(5), consumed: BTreeSet::new() };
+        let res = ReservationSnapshot {
+            job_id: 1,
+            cutoff_seq: Some(5),
+            consumed: BTreeSet::new(),
+        };
         let eligible = vec![cand(2, 3), cand(3, 3)];
         let outcome = plan_pass(&[], &eligible, Some(&res));
         assert!(outcome.invalidate_reservation.is_some());
@@ -585,7 +685,10 @@ mod tests {
                     protected_since = None;
                 }
                 for start in &outcome.starts {
-                    let pos = queued.iter().position(|c| c.job_id == start.job_id).unwrap();
+                    let pos = queued
+                        .iter()
+                        .position(|c| c.job_id == start.job_id)
+                        .unwrap();
                     let c = queued.remove(pos);
 
                     // Invariant: admission never violates any member's limit.
@@ -614,7 +717,10 @@ mod tests {
                         }
                     }
 
-                    active.push(ActiveLease { job_id: c.job_id, limit: c.limit });
+                    active.push(ActiveLease {
+                        job_id: c.job_id,
+                        limit: c.limit,
+                    });
                     if let Some(r) = &mut reservation
                         && start.consumes_bypass()
                     {
@@ -642,7 +748,10 @@ mod tests {
                 // Global invariant: current active set satisfies everyone.
                 let count = active.len() as u32;
                 for lease in &active {
-                    assert!(count <= lease.limit, "active set violates a member declaration");
+                    assert!(
+                        count <= lease.limit,
+                        "active set violates a member declaration"
+                    );
                 }
             }
         }

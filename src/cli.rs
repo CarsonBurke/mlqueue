@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
 use crate::client::{self, ClientError};
-use crate::domain::{AttemptState, DependencyCondition, JobId, JobState};
+use crate::domain::{AttemptState, DependencyCondition, JobId};
 use crate::paths::Paths;
 use crate::protocol::{
     DependencySpec, EventView, JobView, LogPathsView, Op, Reply, ResolveAs, StatusView,
@@ -22,8 +22,16 @@ use crate::protocol::{
 /// must be passed explicitly via `--env` or `--inherit-env`.
 const BASELINE_ENV: &[&str] = &["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TMPDIR"];
 
-const SENSITIVE_MARKERS: &[&str] =
-    &["TOKEN", "SECRET", "PASSWORD", "PASSWD", "APIKEY", "API_KEY", "CREDENTIAL", "PRIVATE"];
+const SENSITIVE_MARKERS: &[&str] = &[
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "APIKEY",
+    "API_KEY",
+    "CREDENTIAL",
+    "PRIVATE",
+];
 
 const STATUS_NAME_WIDTH: usize = 32;
 const STATUS_QUEUE_LIMIT: usize = 10;
@@ -93,17 +101,9 @@ enum Command {
         #[arg(long, short = 'f')]
         follow: bool,
     },
-    /// Block until a job reaches a terminal state, then exit with its
-    /// outcome: 0 on success, the command's exit code (or 128+signal) on
-    /// failure, 124 on --timeout.
-    Wait {
-        job: JobId,
-        /// Give up after this long (e.g. "90s", "2h") and exit 124.
-        #[arg(long, value_parser = humantime::parse_duration)]
-        timeout: Option<Duration>,
-        #[arg(long)]
-        json: bool,
-    },
+    /// Subscribe until terminal, printing only the final outcome by default.
+    /// Exit with the command's outcome (or 128+signal), or 124 on --timeout.
+    Follow(crate::follow::FollowArgs),
     /// Cancel a job. Running work receives SIGTERM; --force escalates to
     /// SIGKILL after the configured grace period.
     Cancel {
@@ -155,6 +155,22 @@ enum Command {
         /// Higher values run before lower values; equal priorities remain FIFO.
         #[arg(allow_hyphen_values = true)]
         priority: i64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change the per-attempt wall-clock limit of a queued or live job.
+    SetTimeLimit {
+        job: JobId,
+        /// New limit (e.g. "30m", "2h"), measured from command spawn.
+        #[arg(
+            value_parser = humantime::parse_duration,
+            required_unless_present = "clear",
+            conflicts_with = "clear"
+        )]
+        time_limit: Option<Duration>,
+        /// Remove the limit. The attempt runs until it exits or is cancelled.
+        #[arg(long)]
+        clear: bool,
         #[arg(long)]
         json: bool,
     },
@@ -273,16 +289,24 @@ pub fn main() -> Result<()> {
     let paths = Paths::resolve()?;
     // One key per invocation: transport retries inside `client::request` and
     // user-supplied reruns with an explicit key both stay idempotent.
-    let key = cli.idempotency_key.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let key = cli
+        .idempotency_key
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     match cli.command {
         Command::Submit(args) => submit(&paths, args, key),
-        Command::Status { watch, finished, json } => status(&paths, watch, finished, json),
+        Command::Status {
+            watch,
+            finished,
+            json,
+        } => status(&paths, watch, finished, json),
         Command::Subscribe => subscribe(&paths),
         Command::FollowTts { tts_backend } => follow_tts(&paths, tts_backend.as_deref()),
         Command::Show { job, json } => {
             let reply = send(&paths, Op::Show { job }, None)?;
-            let Reply::Job { job } = reply else { bail!(client::unexpected("job")) };
+            let Reply::Job { job } = reply else {
+                bail!(client::unexpected("job"))
+            };
             if json {
                 println!("{}", serde_json::to_string_pretty(&job)?);
             } else {
@@ -291,8 +315,19 @@ pub fn main() -> Result<()> {
             Ok(())
         }
         Command::See { job, json } => see(&paths, job, json),
-        Command::Logs { job, attempt, stderr, follow } => logs(&paths, job, attempt, stderr, follow),
-        Command::Wait { job, timeout, json } => wait(&paths, job, timeout, json),
+        Command::Logs {
+            job,
+            attempt,
+            stderr,
+            follow,
+        } => logs(&paths, job, attempt, stderr, follow),
+        Command::Follow(args) => {
+            let code = crate::follow::run(&paths, args)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
         Command::Cancel { job, force, json } => {
             mutate_job(&paths, Op::Cancel { job, force }, key, json)
         }
@@ -301,13 +336,45 @@ pub fn main() -> Result<()> {
         Command::Pause { json } => mutate_pause(&paths, Op::Pause, key, json),
         Command::Unpause { json } => mutate_pause(&paths, Op::Unpause, key, json),
         Command::Retry { job, json } => mutate_job(&paths, Op::Retry { job }, key, json),
-        Command::SetMaxParallelRuns { job, max_parallel_runs, json } => {
-            mutate_job(&paths, Op::SetMaxParallelRuns { job, max_parallel_runs }, key, json)
+        Command::SetMaxParallelRuns {
+            job,
+            max_parallel_runs,
+            json,
+        } => mutate_job(
+            &paths,
+            Op::SetMaxParallelRuns {
+                job,
+                max_parallel_runs,
+            },
+            key,
+            json,
+        ),
+        Command::SetPriority {
+            job,
+            priority,
+            json,
+        } => mutate_job(&paths, Op::SetPriority { job, priority }, key, json),
+        Command::SetTimeLimit {
+            job,
+            time_limit,
+            clear,
+            json,
+        } => {
+            let time_limit_ms = if clear {
+                None
+            } else {
+                let limit = time_limit.context("a duration or --clear is required")?;
+                let millis = u64::try_from(limit.as_millis()).context("time limit is too large")?;
+                if millis == 0 {
+                    bail!("time limit must be at least 1ms");
+                }
+                Some(millis)
+            };
+            mutate_job(&paths, Op::SetTimeLimit { job, time_limit_ms }, key, json)
         }
-        Command::SetPriority { job, priority, json } => {
-            mutate_job(&paths, Op::SetPriority { job, priority }, key, json)
-        }
-        Command::Daemon { command: DaemonCommand::Status { json } } => {
+        Command::Daemon {
+            command: DaemonCommand::Status { json },
+        } => {
             let reply = send(&paths, Op::DaemonStatus, None)?;
             let Reply::DaemonStatus(view) = reply else {
                 bail!(client::unexpected("daemon status"))
@@ -329,11 +396,15 @@ pub fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Daemon { command: DaemonCommand::Run } => daemon_run(),
-        Command::Daemon { command: DaemonCommand::Install { no_enable } } => {
-            daemon_install(no_enable)
-        }
-        Command::Daemon { command: DaemonCommand::Uninstall } => daemon_uninstall(),
+        Command::Daemon {
+            command: DaemonCommand::Run,
+        } => daemon_run(),
+        Command::Daemon {
+            command: DaemonCommand::Install { no_enable },
+        } => daemon_install(no_enable),
+        Command::Daemon {
+            command: DaemonCommand::Uninstall,
+        } => daemon_uninstall(),
         Command::Recover { command } => match command {
             RecoverCommand::List { json } => {
                 let reply = send(&paths, Op::RecoverList, None)?;
@@ -358,12 +429,26 @@ pub fn main() -> Result<()> {
                 }
                 Ok(())
             }
-            RecoverCommand::Resolve { job, attempt, resolve_as, json } => {
+            RecoverCommand::Resolve {
+                job,
+                attempt,
+                resolve_as,
+                json,
+            } => {
                 let resolve_as = match resolve_as {
                     ResolveAsArg::Lost => ResolveAs::Lost,
                     ResolveAsArg::Cancelled => ResolveAs::Cancelled,
                 };
-                mutate_job(&paths, Op::RecoverResolve { job, attempt, resolve_as }, key, json)
+                mutate_job(
+                    &paths,
+                    Op::RecoverResolve {
+                        job,
+                        attempt,
+                        resolve_as,
+                    },
+                    key,
+                    json,
+                )
             }
         },
     }
@@ -379,7 +464,9 @@ fn send(paths: &Paths, op: Op, key: Option<String>) -> Result<Reply> {
 
 fn mutate_job(paths: &Paths, op: Op, key: String, json: bool) -> Result<()> {
     let reply = send(paths, op.clone(), Some(key))?;
-    let Reply::Job { job } = reply else { bail!(client::unexpected("job")) };
+    let Reply::Job { job } = reply else {
+        bail!(client::unexpected("job"))
+    };
     if json {
         println!("{}", serde_json::to_string_pretty(&job)?);
     } else {
@@ -390,9 +477,14 @@ fn mutate_job(paths: &Paths, op: Op, key: String, json: bool) -> Result<()> {
 
 fn mutate_pause(paths: &Paths, op: Op, key: String, json: bool) -> Result<()> {
     let reply = send(paths, op.clone(), Some(key))?;
-    let Reply::Paused { paused } = reply else { bail!(client::unexpected("paused")) };
+    let Reply::Paused { paused } = reply else {
+        bail!(client::unexpected("paused"))
+    };
     if json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "paused": paused }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "paused": paused }))?
+        );
     } else if matches!(op, Op::Pause) {
         println!("queue paused");
     } else {
@@ -406,7 +498,10 @@ fn mutate_pause(paths: &Paths, op: Op, key: String, json: bool) -> Result<()> {
 /// reports intent rather than a false "is now running".
 fn format_mutation_message(op: &Op, job: &JobView) -> String {
     if let Op::Cancel { force, .. } = op
-        && matches!(job.state.as_str(), "starting" | "running" | "needs_attention")
+        && matches!(
+            job.state.as_str(),
+            "starting" | "running" | "needs_attention"
+        )
     {
         let force = if *force { " (force)" } else { "" };
         return format!("job {} [{}] cancel requested{force}", job.id, job.name);
@@ -426,12 +521,27 @@ fn format_mutation_message(op: &Op, job: &JobView) -> String {
         );
     }
 
+    if matches!(op, Op::SetTimeLimit { .. }) {
+        return match job.time_limit_ms {
+            Some(limit) => format!(
+                "job {} [{}] time limit is now {}",
+                job.id,
+                job.name,
+                humantime::format_duration(Duration::from_millis(limit))
+            ),
+            None => format!("job {} [{}] time limit cleared", job.id, job.name),
+        };
+    }
+
     let extra = match (&job.eligibility, &job.state_reason) {
         (_, Some(reason)) => format!(" ({reason})"),
         (Some(reason), _) => format!(" ({reason})"),
         _ => String::new(),
     };
-    format!("job {} [{}] is now {}{}", job.id, job.name, job.state, extra)
+    format!(
+        "job {} [{}] is now {}{}",
+        job.id, job.name, job.state, extra
+    )
 }
 
 fn submit(paths: &Paths, args: SubmitArgs, key: String) -> Result<()> {
@@ -467,7 +577,10 @@ fn submit(paths: &Paths, args: SubmitArgs, key: String) -> Result<()> {
     }
     for name in env.keys() {
         let upper = name.to_uppercase();
-        if SENSITIVE_MARKERS.iter().any(|marker| upper.contains(marker)) {
+        if SENSITIVE_MARKERS
+            .iter()
+            .any(|marker| upper.contains(marker))
+        {
             eprintln!(
                 "warning: environment variable {name} looks sensitive; it will be stored \
                  in plaintext in the queue database. Prefer a credential file read by the \
@@ -501,12 +614,18 @@ fn submit(paths: &Paths, args: SubmitArgs, key: String) -> Result<()> {
         max_parallel_runs: args.max_parallel_runs,
         priority: args.priority,
         max_attempts: args.max_attempts,
-        retry_delay_ms: args.retry_delay.map(|delay| delay.as_millis() as u64).unwrap_or(0),
+        retry_delay_ms: args
+            .retry_delay
+            .map(|delay| delay.as_millis() as u64)
+            .unwrap_or(0),
         time_limit_ms,
         dependencies: args
             .after_terminal
             .into_iter()
-            .map(|job| DependencySpec { job, condition: DependencyCondition::Terminal })
+            .map(|job| DependencySpec {
+                job,
+                condition: DependencyCondition::Terminal,
+            })
             .chain(args.after_success.into_iter().map(|job| DependencySpec {
                 job,
                 condition: DependencyCondition::Succeeded,
@@ -514,7 +633,9 @@ fn submit(paths: &Paths, args: SubmitArgs, key: String) -> Result<()> {
             .collect(),
     };
     let reply = send(paths, Op::Submit(params), Some(key))?;
-    let Reply::Submitted { job } = reply else { bail!(client::unexpected("submitted job")) };
+    let Reply::Submitted { job } = reply else {
+        bail!(client::unexpected("submitted job"))
+    };
     if args.json {
         println!("{}", serde_json::to_string_pretty(&job)?);
     } else {
@@ -529,7 +650,9 @@ fn submit(paths: &Paths, args: SubmitArgs, key: String) -> Result<()> {
 fn status(paths: &Paths, watch: bool, finished: bool, json: bool) -> Result<()> {
     loop {
         let reply = send(paths, Op::Status, None)?;
-        let Reply::Status(mut view) = reply else { bail!(client::unexpected("status")) };
+        let Reply::Status(mut view) = reply else {
+            bail!(client::unexpected("status"))
+        };
         if finished {
             view.jobs.retain(|job| job.finished_at.is_some());
         } else {
@@ -581,9 +704,8 @@ fn follow_tts(paths: &Paths, tts_backend: Option<&str>) -> Result<()> {
         .truncate(false)
         .open(paths.follow_tts_lock())
         .with_context(|| format!("opening {}", paths.follow_tts_lock().display()))?;
-    let lock_result = unsafe {
-        libc::flock(follower_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
-    };
+    let lock_result =
+        unsafe { libc::flock(follower_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if lock_result != 0 {
         let error = std::io::Error::last_os_error();
         if error.kind() == std::io::ErrorKind::WouldBlock {
@@ -612,7 +734,10 @@ fn follow_tts(paths: &Paths, tts_backend: Option<&str>) -> Result<()> {
     let body = if running.is_empty() {
         "Queue monitor started. No runs are currently active.".to_string()
     } else {
-        format!("Queue monitor started. Currently running: {}.", running.join(", "))
+        format!(
+            "Queue monitor started. Currently running: {}.",
+            running.join(", ")
+        )
     };
     speak_tts(tts_backend, "ML queue monitor", &body);
 
@@ -661,8 +786,17 @@ fn follow_tts_events(paths: &Paths, cursor: &mut i64) -> Result<Vec<EventView>> 
     let mut all = Vec::new();
     let mut next_cursor = *cursor;
     loop {
-        let reply = send(paths, Op::Events { after: next_cursor, limit: PAGE_SIZE }, None)?;
-        let Reply::Events { events } = reply else { bail!(client::unexpected("events")) };
+        let reply = send(
+            paths,
+            Op::Events {
+                after: next_cursor,
+                limit: PAGE_SIZE,
+            },
+            None,
+        )?;
+        let Reply::Events { events } = reply else {
+            bail!(client::unexpected("events"))
+        };
         let full_page = events.len() == PAGE_SIZE as usize;
         if let Some(last) = events.last() {
             next_cursor = last.id;
@@ -704,7 +838,10 @@ fn follow_tts_announcement(events: &[EventView]) -> Option<String> {
             "retry_scheduled" => {
                 outcomes.push(match event.attempt_number {
                     Some(attempt) => {
-                        format!("Attempt {attempt} for {} failed and a retry is queued", name())
+                        format!(
+                            "Attempt {attempt} for {} failed and a retry is queued",
+                            name()
+                        )
                     }
                     None => format!("An attempt for {} failed and a retry is queued", name()),
                 });
@@ -728,20 +865,23 @@ fn follow_tts_announcement(events: &[EventView]) -> Option<String> {
     const MAX_SPOKEN_STARTS: usize = 5;
 
     let omitted_outcomes = outcomes.len().saturating_sub(MAX_SPOKEN_OUTCOMES);
-    let mut sentences = outcomes.into_iter().take(MAX_SPOKEN_OUTCOMES).collect::<Vec<_>>();
+    let mut sentences = outcomes
+        .into_iter()
+        .take(MAX_SPOKEN_OUTCOMES)
+        .collect::<Vec<_>>();
     if omitted_outcomes > 0 {
         sentences.push(format!("{omitted_outcomes} more queue updates"));
     }
     if !started.is_empty() {
         let omitted_starts = started.len().saturating_sub(MAX_SPOKEN_STARTS);
-        let mut running = started.into_values().take(MAX_SPOKEN_STARTS).collect::<Vec<_>>();
+        let mut running = started
+            .into_values()
+            .take(MAX_SPOKEN_STARTS)
+            .collect::<Vec<_>>();
         if omitted_starts > 0 {
             running.push(format!("{omitted_starts} more"));
         }
-        sentences.push(format!(
-            "Now running: {}",
-            running.join(", ")
-        ));
+        sentences.push(format!("Now running: {}", running.join(", ")));
     }
     Some(format!("{}.", sentences.join(". ")))
 }
@@ -752,7 +892,11 @@ fn spoken_event_job(event: &EventView) -> String {
         (Some(id), None) => format!("job {id}"),
         (None, Some(name)) => {
             let name = normalized_spoken_name(name);
-            if name.is_empty() { "an unnamed job".to_string() } else { name }
+            if name.is_empty() {
+                "an unnamed job".to_string()
+            } else {
+                name
+            }
         }
         (None, None) => "an unknown job".to_string(),
     }
@@ -813,13 +957,17 @@ fn speak_tts(backend: Option<&str>, title: &str, body: &str) {
                 std::thread::sleep(Duration::from_millis(100));
             }
             Ok(None) => {
-                eprintln!("warning: tts timed out after 60 seconds; continuing to follow the queue");
+                eprintln!(
+                    "warning: tts timed out after 60 seconds; continuing to follow the queue"
+                );
                 let _ = child.kill();
                 let _ = child.wait();
                 return;
             }
             Err(error) => {
-                eprintln!("warning: could not wait for tts: {error}; continuing to follow the queue");
+                eprintln!(
+                    "warning: could not wait for tts: {error}; continuing to follow the queue"
+                );
                 let _ = child.kill();
                 let _ = child.wait();
                 return;
@@ -1014,10 +1162,14 @@ fn write_status_job(output: &mut String, job: &JobView) {
 
 fn print_job_detail(job: &JobView) {
     println!("job {} [{}]", job.id, job.name);
-    println!("  state:            {}{}", job.state, match &job.state_reason {
-        Some(reason) => format!(" ({reason})"),
-        None => String::new(),
-    });
+    println!(
+        "  state:            {}{}",
+        job.state,
+        match &job.state_reason {
+            Some(reason) => format!(" ({reason})"),
+            None => String::new(),
+        }
+    );
     if let Some(eligibility) = &job.eligibility {
         println!("  eligibility:      {eligibility}");
     }
@@ -1028,7 +1180,10 @@ fn print_job_detail(job: &JobView) {
     println!("  maxParallelRuns:  {}", job.max_parallel_runs);
     println!("  cwd:              {}", job.cwd);
     println!("  command:          {}", shell_join(&job.args));
-    println!("  attempts:         {}/{}", job.attempt_count, job.max_attempts);
+    println!(
+        "  attempts:         {}/{}",
+        job.attempt_count, job.max_attempts
+    );
     for dependency in &job.dependencies {
         let outcome = match (&dependency.resolution, &dependency.parent_outcome) {
             (Some(resolution), Some(parent_outcome)) => {
@@ -1076,7 +1231,9 @@ fn print_job_detail(job: &JobView) {
 
 fn see(paths: &Paths, job: Option<JobId>, json: bool) -> Result<()> {
     let reply = send(paths, Op::See { job }, None)?;
-    let Reply::Job { job } = reply else { bail!(client::unexpected("job")) };
+    let Reply::Job { job } = reply else {
+        bail!(client::unexpected("job"))
+    };
     if json {
         println!("{}", serde_json::to_string_pretty(&job)?);
         return Ok(());
@@ -1092,7 +1249,9 @@ fn see(paths: &Paths, job: Option<JobId>, json: bool) -> Result<()> {
 fn logs(paths: &Paths, job: JobId, attempt: Option<i64>, stderr: bool, follow: bool) -> Result<()> {
     let fetch = |attempt| -> Result<LogPathsView> {
         let reply = send(paths, Op::Logs { job, attempt }, None)?;
-        let Reply::LogPaths(view) = reply else { bail!(client::unexpected("log paths")) };
+        let Reply::LogPaths(view) = reply else {
+            bail!(client::unexpected("log paths"))
+        };
         Ok(view)
     };
     let view = fetch(attempt)?;
@@ -1125,8 +1284,10 @@ fn logs(paths: &Paths, job: JobId, attempt: Option<i64>, stderr: bool, follow: b
         let state = latest.attempt_state.parse::<AttemptState>().ok();
         // Orphaned/quarantined attempts may still have a live command
         // writing logs; keep following, but say why this never ends.
-        if matches!(state, Some(AttemptState::Orphaned | AttemptState::Quarantined))
-            && !recovery_notice_shown
+        if matches!(
+            state,
+            Some(AttemptState::Orphaned | AttemptState::Quarantined)
+        ) && !recovery_notice_shown
         {
             recovery_notice_shown = true;
             eprintln!(
@@ -1147,7 +1308,11 @@ fn logs(paths: &Paths, job: JobId, attempt: Option<i64>, stderr: bool, follow: b
                 "[mlq] attempt {} {}{}",
                 latest.attempt_number,
                 latest.attempt_state,
-                latest.message.as_deref().map(|message| format!(" — {message}")).unwrap_or_default()
+                latest
+                    .message
+                    .as_deref()
+                    .map(|message| format!(" — {message}"))
+                    .unwrap_or_default()
             );
             let code = outcome_exit_code(
                 state == Some(AttemptState::Succeeded),
@@ -1163,14 +1328,14 @@ fn logs(paths: &Paths, job: JobId, attempt: Option<i64>, stderr: bool, follow: b
     }
 }
 
-/// Exit code for waiting on a job that never reached a terminal state
-/// within `--timeout`, mirroring timeout(1).
-const EXIT_TIMED_OUT: i32 = 124;
-
 /// Map a terminal outcome onto a process exit code: 0 for success, 128+N
 /// for a death by signal N, the command's own non-zero exit code where one
 /// exists, and 1 otherwise (legacy skipped, lost, cancelled or failed pre-launch).
-fn outcome_exit_code(succeeded: bool, exit_code: Option<i32>, term_signal: Option<i32>) -> i32 {
+pub(crate) fn outcome_exit_code(
+    succeeded: bool,
+    exit_code: Option<i32>,
+    term_signal: Option<i32>,
+) -> i32 {
     if succeeded {
         return 0;
     }
@@ -1178,62 +1343,6 @@ fn outcome_exit_code(succeeded: bool, exit_code: Option<i32>, term_signal: Optio
         (Some(signal), _) => 128 + signal,
         (None, Some(code)) if code != 0 => code,
         _ => 1,
-    }
-}
-
-fn wait(paths: &Paths, job: JobId, timeout: Option<Duration>, json: bool) -> Result<()> {
-    // A deadline beyond Instant's range means "wait forever", which is what
-    // an absurdly large --timeout asks for anyway.
-    let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
-    let mut recovery_notice_shown = false;
-    loop {
-        let reply = send(paths, Op::Show { job }, None)?;
-        let Reply::Job { job: view } = reply else { bail!(client::unexpected("job")) };
-        let last = view.attempts.last();
-        let state = view.state.parse::<JobState>().ok();
-        if state.is_some_and(JobState::is_terminal) {
-            // Attempt data feeds the exit code only when that attempt produced
-            // the job's outcome — a job cancelled while queued for a retry
-            // still carries its predecessor's failed attempt.
-            let outcome_attempt = last.filter(|a| a.state == view.state);
-            let code = outcome_exit_code(
-                state == Some(JobState::Succeeded),
-                outcome_attempt.and_then(|a| a.exit_code),
-                outcome_attempt.and_then(|a| a.term_signal),
-            );
-            if json {
-                println!("{}", serde_json::to_string_pretty(&view)?);
-            } else {
-                let reason = view
-                    .state_reason
-                    .as_deref()
-                    .or(outcome_attempt.and_then(|a| a.message.as_deref()));
-                println!("job {} [{}] {}{}", view.id, view.name, view.state, match reason {
-                    Some(reason) => format!(" ({reason})"),
-                    None => String::new(),
-                });
-            }
-            std::process::exit(code);
-        }
-        // Orphaned/quarantined attempts resolve through an operator, not the
-        // scheduler; say so once rather than blocking silently.
-        if !recovery_notice_shown
-            && let Some(attempt) = last
-            && matches!(attempt.state.as_str(), "orphaned" | "quarantined")
-        {
-            recovery_notice_shown = true;
-            eprintln!(
-                "[mlq] attempt is {}: waiting on operator recovery (see `mlq recover list`)",
-                attempt.state
-            );
-        }
-        if let Some(deadline) = deadline
-            && Instant::now() >= deadline
-        {
-            eprintln!("[mlq] timed out waiting for job {job} (state: {})", view.state);
-            std::process::exit(EXIT_TIMED_OUT);
-        }
-        std::thread::sleep(Duration::from_millis(300));
     }
 }
 
@@ -1337,7 +1446,11 @@ fn daemon_install(no_enable: bool) -> Result<()> {
 fn daemon_uninstall() -> Result<()> {
     let unit_path = systemd_user_unit_path()?;
     if !unit_path.exists() {
-        bail!("{} is not installed (expected {})", SERVICE_NAME, unit_path.display());
+        bail!(
+            "{} is not installed (expected {})",
+            SERVICE_NAME,
+            unit_path.display()
+        );
     }
     // Stopping the daemon never kills workers (KillMode=process); a later
     // daemon start adopts anything still running. A unit that was installed
@@ -1423,17 +1536,28 @@ mod tests {
         job.name = "normuon_2k".into();
         job.cancel_requested = Some(true);
 
-        let msg = format_mutation_message(&Op::Cancel { job: 106, force: false }, &job);
+        let msg = format_mutation_message(
+            &Op::Cancel {
+                job: 106,
+                force: false,
+            },
+            &job,
+        );
         assert_eq!(msg, "job 106 [normuon_2k] cancel requested");
 
-        let force = format_mutation_message(&Op::Cancel { job: 106, force: true }, &job);
+        let force = format_mutation_message(
+            &Op::Cancel {
+                job: 106,
+                force: true,
+            },
+            &job,
+        );
         assert_eq!(force, "job 106 [normuon_2k] cancel requested (force)");
     }
 
     #[test]
     fn submit_accepts_negative_priority() {
-        let cli = Cli::try_parse_from(["mlq", "submit", "--priority", "-1", "--", "true"])
-            .unwrap();
+        let cli = Cli::try_parse_from(["mlq", "submit", "--priority", "-1", "--", "true"]).unwrap();
         let Command::Submit(args) = cli.command else {
             panic!("expected submit command")
         };
@@ -1442,10 +1566,8 @@ mod tests {
 
     #[test]
     fn submit_parses_a_wall_clock_time_limit() {
-        let cli = Cli::try_parse_from([
-            "mlq", "submit", "--time-limit", "1h 30m", "--", "true",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["mlq", "submit", "--time-limit", "1h 30m", "--", "true"]).unwrap();
         let Command::Submit(args) = cli.command else {
             panic!("expected submit command")
         };
@@ -1489,19 +1611,88 @@ mod tests {
         let mut job = status_job(7, "queued", None);
         job.name = "retune".into();
         job.priority = 3;
-        let msg = format_mutation_message(&Op::SetPriority { job: 7, priority: 3 }, &job);
+        let msg = format_mutation_message(
+            &Op::SetPriority {
+                job: 7,
+                priority: 3,
+            },
+            &job,
+        );
         assert_eq!(msg, "job 7 [retune] priority is now 3");
+    }
+
+    #[test]
+    fn set_time_limit_parses_a_duration_or_clear() {
+        let cli = Cli::try_parse_from(["mlq", "set-time-limit", "4", "1h 30m"]).unwrap();
+        let Command::SetTimeLimit {
+            job,
+            time_limit,
+            clear,
+            ..
+        } = cli.command
+        else {
+            panic!("expected set-time-limit command")
+        };
+        assert_eq!(job, 4);
+        assert_eq!(time_limit, Some(Duration::from_secs(90 * 60)));
+        assert!(!clear);
+
+        let cli = Cli::try_parse_from(["mlq", "set-time-limit", "4", "--clear"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::SetTimeLimit {
+                job: 4,
+                time_limit: None,
+                clear: true,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from(["mlq", "set-time-limit", "4"]).is_err());
+        assert!(Cli::try_parse_from(["mlq", "set-time-limit", "4", "90m", "--clear"]).is_err());
+    }
+
+    #[test]
+    fn set_time_limit_mutation_message_reports_the_new_bound() {
+        let mut job = status_job(7, "running", None);
+        job.name = "bounded".into();
+        job.time_limit_ms = Some(90 * 60 * 1_000);
+        let msg = format_mutation_message(
+            &Op::SetTimeLimit {
+                job: 7,
+                time_limit_ms: Some(90 * 60 * 1_000),
+            },
+            &job,
+        );
+        assert_eq!(msg, "job 7 [bounded] time limit is now 1h 30m");
+
+        job.time_limit_ms = None;
+        let cleared = format_mutation_message(
+            &Op::SetTimeLimit {
+                job: 7,
+                time_limit_ms: None,
+            },
+            &job,
+        );
+        assert_eq!(cleared, "job 7 [bounded] time limit cleared");
     }
 
     #[test]
     fn see_accepts_optional_job_id() {
         assert!(matches!(
             Cli::try_parse_from(["mlq", "see"]).unwrap().command,
-            Command::See { job: None, json: false }
+            Command::See {
+                job: None,
+                json: false
+            }
         ));
         assert!(matches!(
-            Cli::try_parse_from(["mlq", "see", "12", "--json"]).unwrap().command,
-            Command::See { job: Some(12), json: true }
+            Cli::try_parse_from(["mlq", "see", "12", "--json"])
+                .unwrap()
+                .command,
+            Command::See {
+                job: Some(12),
+                json: true
+            }
         ));
     }
 
@@ -1512,7 +1703,9 @@ mod tests {
             Command::Pause { json: false }
         ));
         assert!(matches!(
-            Cli::try_parse_from(["mlq", "unpause", "--json"]).unwrap().command,
+            Cli::try_parse_from(["mlq", "unpause", "--json"])
+                .unwrap()
+                .command,
             Command::Unpause { json: true }
         ));
     }
@@ -1559,7 +1752,13 @@ mod tests {
         job.name = "queued-cancel".into();
         job.state_reason = Some("cancelled before start".into());
 
-        let msg = format_mutation_message(&Op::Cancel { job: 7, force: false }, &job);
+        let msg = format_mutation_message(
+            &Op::Cancel {
+                job: 7,
+                force: false,
+            },
+            &job,
+        );
         assert_eq!(
             msg,
             "job 7 [queued-cancel] is now cancelled (cancelled before start)"
@@ -1601,7 +1800,10 @@ mod tests {
         };
 
         let (live, queued, held, finished) = status_sections(&view);
-        assert_eq!(live.iter().map(|job| job.id).collect::<Vec<_>>(), vec![3, 2, 1]);
+        assert_eq!(
+            live.iter().map(|job| job.id).collect::<Vec<_>>(),
+            vec![3, 2, 1]
+        );
         assert_eq!(
             queued.iter().map(|job| job.id).collect::<Vec<_>>(),
             (100..110).collect::<Vec<_>>()
@@ -1632,7 +1834,10 @@ mod tests {
 
         // -f is finished-only: no live queue rows or admission header.
         let finished_only = render_status(&view, true);
-        assert!(finished_only.starts_with("Finished Runs\n"), "{finished_only}");
+        assert!(
+            finished_only.starts_with("Finished Runs\n"),
+            "{finished_only}"
+        );
         assert!(!finished_only.contains("active leases:"), "{finished_only}");
         assert!(!finished_only.contains("running-3"), "{finished_only}");
         assert!(!finished_only.contains("queued-100"), "{finished_only}");
@@ -1641,7 +1846,11 @@ mod tests {
         assert!(finished_only.contains("succeeded-202"), "{finished_only}");
         assert!(!finished_only.contains("succeeded-200"));
         assert!(!finished_only.contains("succeeded-207"));
-        assert_eq!(finished_only.matches("JOB    NAME").count(), 1, "{finished_only}");
+        assert_eq!(
+            finished_only.matches("JOB    NAME").count(),
+            1,
+            "{finished_only}"
+        );
     }
 
     #[test]
@@ -1704,7 +1913,10 @@ mod tests {
     #[test]
     fn follow_tts_ignores_irrelevant_events_and_sanitizes_names() {
         assert!(follow_tts_announcement(&[event(1, 1, "secret", "job_submitted")]).is_none());
-        assert_eq!(spoken_job_name(7, "  odd\nname_with-control\t"), "job 7, odd name with control");
+        assert_eq!(
+            spoken_job_name(7, "  odd\nname_with-control\t"),
+            "job 7, odd name with control"
+        );
     }
 
     #[test]

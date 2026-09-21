@@ -14,11 +14,11 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::domain::now_ms;
+use crate::domain::{self, now_ms};
 use crate::process::artifacts::{
     self, CANCEL_FILE, COMMAND_FILE, CancelFile, CommandFile, ExecFile, IDENTITY_FILE,
-    IdentityFile, RESULT_FILE, RUNNER_LOCK_FILE, ResultFile, ResultOutcome, START_FILE,
-    STDERR_LOG_FILE, STDOUT_LOG_FILE, StartFile,
+    IdentityFile, LIMIT_FILE, LimitFile, RESULT_FILE, RUNNER_LOCK_FILE, ResultFile, ResultOutcome,
+    START_FILE, STDERR_LOG_FILE, STDOUT_LOG_FILE, StartFile, TIMEOUT_FILE, TimeoutFile,
 };
 use crate::process::identity;
 
@@ -62,7 +62,12 @@ fn run(dir: &Path) -> anyhow::Result<()> {
         .truncate(false)
         .mode(0o600)
         .open(dir.join(RUNNER_LOCK_FILE))?;
-    let rc = unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX | libc::LOCK_NB) };
+    let rc = unsafe {
+        libc::flock(
+            std::os::unix::io::AsRawFd::as_raw_fd(&lock),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+    };
     if rc != 0 {
         anyhow::bail!("another runner already owns this attempt directory");
     }
@@ -93,27 +98,54 @@ fn run(dir: &Path) -> anyhow::Result<()> {
         if let Some(cancel) = read_cancel(dir, &command.token) {
             let _ = cancel;
             log_line(dir, "cancelled before launch authorization");
-            return publish_result(dir, &command, ResultOutcome::Cancelled, None, None,
-                Some("cancelled before launch".to_string()));
+            return publish_result(
+                dir,
+                &command,
+                ResultOutcome::Cancelled,
+                None,
+                None,
+                Some("cancelled before launch".to_string()),
+            );
         }
         match artifacts::read_artifact::<StartFile>(&dir.join(START_FILE)) {
             Ok(Some(start)) if start.token == command.token => break,
             Ok(Some(_)) => {
-                return publish_result(dir, &command, ResultOutcome::LaunchFailed, None, None,
-                    Some("authorization token mismatch".to_string()));
+                return publish_result(
+                    dir,
+                    &command,
+                    ResultOutcome::LaunchFailed,
+                    None,
+                    None,
+                    Some("authorization token mismatch".to_string()),
+                );
             }
             Ok(None) => {}
             // A partially visible artifact is unexpected (writes are atomic);
             // treat as fatal rather than guessing.
             Err(err) => {
-                return publish_result(dir, &command, ResultOutcome::LaunchFailed, None, None,
-                    Some(format!("corrupt start artifact: {err}")));
+                return publish_result(
+                    dir,
+                    &command,
+                    ResultOutcome::LaunchFailed,
+                    None,
+                    None,
+                    Some(format!("corrupt start artifact: {err}")),
+                );
             }
         }
         if Instant::now() >= deadline {
             log_line(dir, "timed out waiting for launch authorization");
-            return publish_result(dir, &command, ResultOutcome::AuthorizationTimeout, None, None,
-                Some(format!("no authorization within {} ms", command.start_wait_ms)));
+            return publish_result(
+                dir,
+                &command,
+                ResultOutcome::AuthorizationTimeout,
+                None,
+                None,
+                Some(format!(
+                    "no authorization within {} ms",
+                    command.start_wait_ms
+                )),
+            );
         }
         std::thread::sleep(poll);
     }
@@ -143,8 +175,14 @@ fn run(dir: &Path) -> anyhow::Result<()> {
         Ok(child) => child,
         Err(err) => {
             log_line(dir, &format!("launch failed: {err}"));
-            return publish_result(dir, &command, ResultOutcome::LaunchFailed, None, None,
-                Some(format!("launch failed: {err}")));
+            return publish_result(
+                dir,
+                &command,
+                ResultOutcome::LaunchFailed,
+                None,
+                None,
+                Some(format!("launch failed: {err}")),
+            );
         }
     };
     // The limit starts when the command is successfully spawned. This
@@ -152,11 +190,17 @@ fn run(dir: &Path) -> anyhow::Result<()> {
     // submitted argv, while excluding time spent waiting in the queue.
     let command_started_at = now_ms();
     let command_started = Instant::now();
-    let time_limit = command.time_limit_ms.map(Duration::from_millis);
+    // Adopt a limit published while this runner was waiting for authorization.
+    // Later edits are read each poll until timeout termination begins.
+    let mut live_limit = observed_time_limit(dir, &command);
+    if live_limit.ms != command.time_limit_ms {
+        log_time_limit(dir, live_limit.ms);
+    }
     let child_pid = child.id() as i32;
     let pgid = child_pid;
-    let child_start_time =
-        identity::proc_stat(child_pid).map(|stat| stat.start_time).unwrap_or_default();
+    let child_start_time = identity::proc_stat(child_pid)
+        .map(|stat| stat.start_time)
+        .unwrap_or_default();
     artifacts::write_artifact(
         dir,
         artifacts::EXEC_FILE,
@@ -170,7 +214,10 @@ fn run(dir: &Path) -> anyhow::Result<()> {
         },
         true,
     )?;
-    log_line(dir, &format!("command running: pid {child_pid} pgid {pgid}"));
+    log_line(
+        dir,
+        &format!("command running: pid {child_pid} pgid {pgid}"),
+    );
 
     // Supervision loop. Linearization of cancellation against natural
     // completion: a signal delivered before the exit was observed makes the
@@ -212,8 +259,19 @@ fn run(dir: &Path) -> anyhow::Result<()> {
             empty_scans = 0;
         }
         let cancel = read_cancel(dir, &command.token);
+        // Once SIGTERM has been chosen because the deadline passed, the bound
+        // that fired stays in force. A later extension cannot revive a process
+        // group that has already been signaled.
+        if !timed_out {
+            let observed = observed_time_limit(dir, &command);
+            if observed.ms != live_limit.ms {
+                log_time_limit(dir, observed.ms);
+            }
+            live_limit = observed;
+        }
+        let time_limit = live_limit.ms.map(Duration::from_millis);
         let deadline_expired = time_limit.is_some_and(|limit| command_started.elapsed() >= limit);
-        let timeout_deadline = command.time_limit_ms.and_then(|limit| {
+        let timeout_deadline = live_limit.ms.and_then(|limit| {
             i64::try_from(limit)
                 .ok()
                 .and_then(|limit| command_started_at.checked_add(limit))
@@ -221,7 +279,9 @@ fn run(dir: &Path) -> anyhow::Result<()> {
         let timeout_classifies = deadline_expired
             && cancel.as_ref().is_none_or(|cancel| {
                 match (cancel.requested_at, timeout_deadline) {
-                    (Some(cancelled_at), Some(deadline)) => cancelled_at > deadline,
+                    (Some(cancelled_at), Some(deadline)) => {
+                        domain::timeout_wins_over_cancel(cancelled_at, deadline, live_limit.set_at)
+                    }
                     // Old cancellation artifacts predate time limits and
                     // retain cancellation precedence for compatibility.
                     _ => false,
@@ -230,11 +290,25 @@ fn run(dir: &Path) -> anyhow::Result<()> {
         if deadline_expired && !group_empty {
             if timeout_classifies && !timed_out {
                 timed_out = true;
+                if let Some(deadline) = timeout_deadline {
+                    // Exclusive: the first commitment is the one the daemon
+                    // continues if this runner dies mid-grace.
+                    let record = TimeoutFile {
+                        token: command.token.clone(),
+                        deadline,
+                        observed_at: now_ms(),
+                    };
+                    if let Err(err) = artifacts::write_artifact(dir, TIMEOUT_FILE, &record, true)
+                        && err.kind() != std::io::ErrorKind::AlreadyExists
+                    {
+                        log_line(dir, &format!("recording timeout commitment: {err}"));
+                    }
+                }
                 log_line(
                     dir,
                     &format!(
                         "time limit of {} ms exceeded; delivering SIGTERM to group {pgid}",
-                        command.time_limit_ms.expect("deadline requires a time limit")
+                        live_limit.ms.expect("deadline requires a time limit")
                     ),
                 );
             }
@@ -268,7 +342,10 @@ fn run(dir: &Path) -> anyhow::Result<()> {
         if let Some(at) = kill_at
             && Instant::now() >= at
         {
-            log_line(dir, &format!("grace expired; delivering SIGKILL to group {pgid}"));
+            log_line(
+                dir,
+                &format!("grace expired; delivering SIGKILL to group {pgid}"),
+            );
             signal_group(pgid, libc::SIGKILL);
             kill_sent = true;
             kill_at = None;
@@ -290,7 +367,7 @@ fn run(dir: &Path) -> anyhow::Result<()> {
             status.signal(),
             Some(format!(
                 "time limit of {} ms exceeded",
-                command.time_limit_ms.expect("timed out requires a time limit")
+                live_limit.ms.expect("timed out requires a time limit")
             )),
         )
     } else if cancelled_before_exit {
@@ -302,7 +379,12 @@ fn run(dir: &Path) -> anyhow::Result<()> {
         )
     } else {
         let message = cancel_too_late.then(|| "cancellation_too_late".to_string());
-        (ResultOutcome::Exited, status.code(), status.signal(), message)
+        (
+            ResultOutcome::Exited,
+            status.code(),
+            status.signal(),
+            message,
+        )
     };
     publish_result(dir, &command, outcome, exit_code, term_signal, message)
 }
@@ -338,7 +420,41 @@ fn peek_exit(pid: i32) -> std::io::Result<Option<std::process::ExitStatus>> {
 }
 
 fn log_file(dir: &Path, name: &str) -> std::io::Result<File> {
-    OpenOptions::new().create(true).append(true).mode(0o600).open(dir.join(name))
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(dir.join(name))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct LiveLimit {
+    ms: Option<u64>,
+    /// When the override was committed. None for the launch snapshot.
+    set_at: Option<i64>,
+}
+
+/// The limit the runner should enforce right now. `limit.json` wins over the
+/// launch snapshot in `command.json`, including an explicit clear. A missing,
+/// mismatched, or unreadable override keeps that snapshot.
+fn observed_time_limit(dir: &Path, command: &CommandFile) -> LiveLimit {
+    match artifacts::read_artifact::<LimitFile>(&dir.join(LIMIT_FILE)) {
+        Ok(Some(limit)) if limit.token == command.token => LiveLimit {
+            ms: limit.time_limit_ms,
+            set_at: limit.updated_at,
+        },
+        Ok(Some(_)) | Ok(None) | Err(_) => LiveLimit {
+            ms: command.time_limit_ms,
+            set_at: None,
+        },
+    }
+}
+
+fn log_time_limit(dir: &Path, limit: Option<u64>) {
+    match limit {
+        Some(ms) => log_line(dir, &format!("time limit is now {ms} ms")),
+        None => log_line(dir, "time limit cleared"),
+    }
 }
 
 fn read_cancel(dir: &Path, token: &str) -> Option<CancelFile> {
@@ -373,6 +489,81 @@ fn publish_result(
         finished_at: now_ms(),
     };
     artifacts::write_artifact(dir, RESULT_FILE, &result, true)?;
-    log_line(dir, &format!("result published: {outcome:?} code={exit_code:?} signal={term_signal:?}"));
+    log_line(
+        dir,
+        &format!("result published: {outcome:?} code={exit_code:?} signal={term_signal:?}"),
+    );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn command(limit: Option<u64>) -> CommandFile {
+        CommandFile {
+            attempt_id: 1,
+            job_id: 1,
+            token: "token".into(),
+            argv: vec!["true".into()],
+            cwd: "/tmp".into(),
+            env: BTreeMap::new(),
+            start_wait_ms: 1,
+            cancel_grace_ms: 1,
+            poll_ms: 10,
+            time_limit_ms: limit,
+        }
+    }
+
+    #[test]
+    fn observed_time_limit_prefers_a_matching_override_including_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let command = command(Some(1_000));
+        assert_eq!(observed_time_limit(dir.path(), &command).ms, Some(1_000));
+
+        artifacts::write_artifact(
+            dir.path(),
+            LIMIT_FILE,
+            &LimitFile {
+                token: "token".into(),
+                time_limit_ms: Some(50),
+                updated_at: Some(9),
+            },
+            false,
+        )
+        .unwrap();
+        let observed = observed_time_limit(dir.path(), &command);
+        assert_eq!(observed.ms, Some(50));
+        assert_eq!(observed.set_at, Some(9));
+
+        artifacts::write_artifact(
+            dir.path(),
+            LIMIT_FILE,
+            &LimitFile {
+                token: "token".into(),
+                time_limit_ms: None,
+                updated_at: Some(10),
+            },
+            false,
+        )
+        .unwrap();
+        assert_eq!(observed_time_limit(dir.path(), &command).ms, None);
+
+        artifacts::write_artifact(
+            dir.path(),
+            LIMIT_FILE,
+            &LimitFile {
+                token: "other".into(),
+                time_limit_ms: Some(1),
+                updated_at: Some(11),
+            },
+            false,
+        )
+        .unwrap();
+        assert_eq!(observed_time_limit(dir.path(), &command).ms, Some(1_000));
+
+        std::fs::write(dir.path().join(LIMIT_FILE), b"{ not json").unwrap();
+        assert_eq!(observed_time_limit(dir.path(), &command).ms, Some(1_000));
+    }
 }

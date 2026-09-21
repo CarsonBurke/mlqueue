@@ -52,7 +52,11 @@ impl Paths {
             },
         };
 
-        Ok(Self { runtime_dir, state_dir, config_file })
+        Ok(Self {
+            runtime_dir,
+            state_dir,
+            config_file,
+        })
     }
 
     pub fn socket(&self) -> PathBuf {

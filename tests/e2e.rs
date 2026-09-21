@@ -1,8 +1,8 @@
 //! End-to-end tests: a real daemon, real runners, and the real CLI, all
 //! isolated in a per-test state directory.
 
-use std::path::PathBuf;
 use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -53,7 +53,10 @@ impl TestQueue {
     fn with_config(runner_poll_ms: u64, extra: &str) -> Self {
         // Keep the tempdir shallow: the Unix socket path must stay under the
         // 108-byte sockaddr_un limit regardless of TMPDIR.
-        let dir = tempfile::Builder::new().prefix("mlq-e2e").tempdir_in("/tmp").unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("mlq-e2e")
+            .tempdir_in("/tmp")
+            .unwrap();
         std::fs::write(
             dir.path().join("config.toml"),
             format!(
@@ -96,9 +99,11 @@ impl TestQueue {
     fn start_daemon(&mut self) {
         assert!(self.daemon.is_none());
         self.daemon = Some(self.spawn_daemon());
-        wait_for("daemon to accept connections", Duration::from_secs(10), || {
-            self.try_cli(&["daemon", "status"]).status.success()
-        });
+        wait_for(
+            "daemon to accept connections",
+            Duration::from_secs(10),
+            || self.try_cli(&["daemon", "status"]).status.success(),
+        );
     }
 
     /// Simulate a crash: SIGKILL, so nothing shuts down cleanly.
@@ -146,7 +151,9 @@ impl TestQueue {
         args.push(cwd);
         args.push("--");
         args.extend_from_slice(command);
-        self.cli_json(&args)["id"].as_i64().expect("submit returns a job id")
+        self.cli_json(&args)["id"]
+            .as_i64()
+            .expect("submit returns a job id")
     }
 
     fn job(&self, id: i64) -> serde_json::Value {
@@ -158,7 +165,9 @@ impl TestQueue {
     }
 
     fn wait_state(&self, id: i64, state: &str, timeout: Duration) {
-        wait_for(&format!("job {id} to be {state}"), timeout, || self.job_state(id) == state);
+        wait_for(&format!("job {id} to be {state}"), timeout, || {
+            self.job_state(id) == state
+        });
     }
 
     fn status(&self) -> serde_json::Value {
@@ -170,7 +179,9 @@ impl TestQueue {
     fn subscribe(&self) -> Subscriber {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_mlq"));
         self.apply_env(&mut cmd);
-        cmd.arg("subscribe").stdout(Stdio::piped()).stderr(Stdio::null());
+        cmd.arg("subscribe")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
         let mut child = cmd.spawn().unwrap();
         let stdout = child.stdout.take().unwrap();
         let (tx, lines) = std::sync::mpsc::channel();
@@ -182,7 +193,10 @@ impl TestQueue {
                 }
             }
         });
-        Subscriber { child: KillOnDrop(Some(child)), lines }
+        Subscriber {
+            child: KillOnDrop(Some(child)),
+            lines,
+        }
     }
 }
 
@@ -203,7 +217,10 @@ struct Subscriber {
 
 impl Subscriber {
     fn next_snapshot(&self, timeout: Duration) -> serde_json::Value {
-        let line = self.lines.recv_timeout(timeout).expect("a snapshot before the deadline");
+        let line = self
+            .lines
+            .recv_timeout(timeout)
+            .expect("a snapshot before the deadline");
         serde_json::from_str(&line).expect("every snapshot line is valid JSON")
     }
 
@@ -219,10 +236,9 @@ impl Subscriber {
         let mut skipped = Vec::new();
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let line = self
-                .lines
-                .recv_timeout(remaining)
-                .unwrap_or_else(|err| panic!("no snapshot showed {what} ({err}); saw {skipped:#?}"));
+            let line = self.lines.recv_timeout(remaining).unwrap_or_else(|err| {
+                panic!("no snapshot showed {what} ({err}); saw {skipped:#?}")
+            });
             let snapshot: serde_json::Value =
                 serde_json::from_str(&line).expect("every snapshot line is valid JSON");
             if matches(&snapshot) {
@@ -260,7 +276,11 @@ impl Subscriber {
             assert!(Instant::now() < deadline, "mlq subscribe did not exit");
             std::thread::sleep(Duration::from_millis(20));
         };
-        assert_eq!(status.code(), Some(0), "a clean daemon shutdown is not a client error");
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "a clean daemon shutdown is not a client error"
+        );
     }
 }
 
@@ -291,9 +311,11 @@ fn subscribe_streams_snapshots_outlives_idle_and_ends_on_shutdown() {
 
     // Client-driven transitions arrive in order, each as a whole snapshot.
     let waiting = q.submit(&["--name", "waiting"], &["sh", "-c", "true"]);
-    subscriber.wait_snapshot("the second job queued", Duration::from_secs(10), |snapshot| {
-        job_in(snapshot, waiting)["state"] == "queued"
-    });
+    subscriber.wait_snapshot(
+        "the second job queued",
+        Duration::from_secs(10),
+        |snapshot| job_in(snapshot, waiting)["state"] == "queued",
+    );
     q.cli(&["hold", &waiting.to_string()]);
     subscriber.wait_snapshot("the job held", Duration::from_secs(10), |snapshot| {
         job_in(snapshot, waiting)["state"] == "held"
@@ -314,6 +336,32 @@ fn subscribe_streams_snapshots_outlives_idle_and_ends_on_shutdown() {
     // Shutting the daemon down closes the stream instead of hanging.
     q.stop_daemon();
     subscriber.expect_clean_end(Duration::from_secs(10));
+}
+
+#[test]
+fn subscribe_puts_running_jobs_before_finished_history() {
+    let q = TestQueue::new();
+    let finished = q.submit(&["--name", "finished"], &["sh", "-c", "true"]);
+    q.wait_state(finished, "succeeded", Duration::from_secs(10));
+
+    let subscriber = q.subscribe();
+    let initial = subscriber.next_snapshot(Duration::from_secs(10));
+    assert_eq!(
+        job_in(&initial, finished)["state"],
+        "succeeded",
+        "{initial}"
+    );
+
+    let running = q.submit(&["--name", "active"], &["sleep", "30"]);
+    let snapshot =
+        subscriber.wait_snapshot("the active job", Duration::from_secs(10), |snapshot| {
+            job_in(snapshot, running)["state"] == "running"
+        });
+    assert_eq!(snapshot["jobs"][0]["id"], running, "{snapshot}");
+    assert_eq!(snapshot["jobs"][0]["state"], "running", "{snapshot}");
+
+    q.cli(&["cancel", &running.to_string()]);
+    q.wait_state(running, "cancelled", Duration::from_secs(10));
 }
 
 /// The job with `id` in a status snapshot, or `null` when it is absent.
@@ -342,7 +390,9 @@ fn try_raw_subscribe(
     use mlqueue::protocol::{DEFAULT_MAX_FRAME_BYTES, read_frame_sync, write_frame_sync};
 
     let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
     write_frame_sync(&mut stream, RAW_SUBSCRIBE, DEFAULT_MAX_FRAME_BYTES).ok()?;
     let frame = read_frame_sync(&mut stream, DEFAULT_MAX_FRAME_BYTES).ok()??;
     let response = serde_json::from_slice(&frame).expect("frames carry JSON responses");
@@ -365,18 +415,27 @@ fn raw_subscribe_echoes_the_request_id_and_budgets_its_slot() {
     let q = TestQueue::with_config(20, "max_connections = 4\n");
 
     let (mut first_stream, initial) = raw_subscribe(&q.socket());
-    assert_eq!(initial["request_id"], "raw-1", "the subscribe request id is echoed");
+    assert_eq!(
+        initial["request_id"], "raw-1",
+        "the subscribe request id is echoed"
+    );
     assert_eq!(initial["reply"]["type"], "status", "{initial}");
     assert!(initial["error"].is_null(), "{initial}");
 
     let job = q.submit(&["--name", "raw"], &["sh", "-c", "true"]);
     let pushed = read_response(&mut first_stream);
-    assert_eq!(pushed["request_id"], "raw-1", "every frame echoes the same id");
+    assert_eq!(
+        pushed["request_id"], "raw-1",
+        "every frame echoes the same id"
+    );
     assert_eq!(job_in(&pushed["reply"], job)["id"], job, "{pushed}");
 
     // A second stream does not fit, and is told so instead of being dropped.
     let (_refused_stream, refused) = raw_subscribe(&q.socket());
-    assert_eq!(refused["error"]["code"], "too_many_subscriptions", "{refused}");
+    assert_eq!(
+        refused["error"]["code"], "too_many_subscriptions",
+        "{refused}"
+    );
     assert!(refused["reply"].is_null(), "{refused}");
     // Ordinary request/response clients still have headroom.
     assert!(q.try_cli(&["daemon", "status"]).status.success());
@@ -391,7 +450,10 @@ fn raw_subscribe_echoes_the_request_id_and_budgets_its_slot() {
             assert_eq!(response["reply"]["type"], "status", "{response}");
             break;
         }
-        assert!(Instant::now() < deadline, "the subscription slot was never released");
+        assert!(
+            Instant::now() < deadline,
+            "the subscription slot was never released"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -399,11 +461,17 @@ fn raw_subscribe_echoes_the_request_id_and_budgets_its_slot() {
 #[test]
 fn submit_runs_captures_logs_and_reports() {
     let q = TestQueue::new();
-    let job = q.submit(&["--name", "hello"], &["sh", "-c", "echo out-marker; echo err-marker >&2"]);
+    let job = q.submit(
+        &["--name", "hello"],
+        &["sh", "-c", "echo out-marker; echo err-marker >&2"],
+    );
     q.wait_state(job, "succeeded", Duration::from_secs(10));
 
     let detail = q.job(job);
-    assert_eq!(detail["maxParallelRuns"], 1, "default limit is the conservative 1");
+    assert_eq!(
+        detail["maxParallelRuns"], 1,
+        "default limit is the conservative 1"
+    );
     assert_eq!(detail["name"], "hello");
     let attempt = &detail["attempts"][0];
     assert_eq!(attempt["state"], "succeeded");
@@ -572,7 +640,10 @@ fn repeated_cancel_preserves_the_first_request_timestamp() {
     q.wait_state(job, "running", Duration::from_secs(10));
     q.cli(&["cancel", &job.to_string()]);
 
-    let attempt_dir = q.job(job)["attempts"][0]["logDir"].as_str().unwrap().to_string();
+    let attempt_dir = q.job(job)["attempts"][0]["logDir"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let cancel_path = PathBuf::from(&attempt_dir).join("cancel.json");
     let first: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&cancel_path).unwrap()).unwrap();
@@ -584,6 +655,268 @@ fn repeated_cancel_preserves_the_first_request_timestamp() {
     assert_eq!(second["force"], true);
 
     q.wait_state(job, "cancelled", Duration::from_secs(10));
+}
+
+#[test]
+fn set_time_limit_updates_queued_held_and_live_attempts() {
+    let q = TestQueue::new();
+
+    let blocker = q.submit(&["--name", "blocker"], &["sleep", "0.4"]);
+    let queued = q.submit(&["--name", "queued-retune"], &["sleep", "30"]);
+    let message = q.cli(&["set-time-limit", &queued.to_string(), "200ms"]);
+    assert!(message.contains("time limit is now"), "message: {message}");
+    assert_eq!(q.job(queued)["timeLimitMs"], 200);
+    // Reapplying the same value is a no-op and must not disturb the job.
+    q.cli(&["set-time-limit", &queued.to_string(), "200ms"]);
+    assert_eq!(q.job(queued)["timeLimitMs"], 200);
+    q.wait_state(blocker, "succeeded", Duration::from_secs(10));
+    q.wait_state(queued, "failed", Duration::from_secs(10));
+    assert!(
+        q.job(queued)["attempts"][0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("time limit of 200 ms exceeded")),
+        "queued detail: {}",
+        q.job(queued)
+    );
+
+    let held_blocker = q.submit(&["--name", "held-blocker"], &["sleep", "30"]);
+    q.wait_state(held_blocker, "running", Duration::from_secs(10));
+    let held = q.submit(&["--name", "held-retune"], &["sleep", "30"]);
+    q.cli(&["hold", &held.to_string()]);
+    q.cli(&["set-time-limit", &held.to_string(), "200ms"]);
+    assert_eq!(q.job(held)["timeLimitMs"], 200);
+    assert_eq!(q.job_state(held), "held");
+    q.cli(&["release", &held.to_string()]);
+    q.cli(&["cancel", &held_blocker.to_string()]);
+    q.wait_state(held_blocker, "cancelled", Duration::from_secs(10));
+    q.wait_state(held, "failed", Duration::from_secs(10));
+    assert!(
+        q.job(held)["attempts"][0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("time limit of 200 ms exceeded")),
+        "held detail: {}",
+        q.job(held)
+    );
+
+    // An unlimited live attempt adopts a bound shorter than its elapsed time.
+    let shorten = q.submit(&["--name", "live-shorten"], &["sleep", "30"]);
+    q.wait_state(shorten, "running", Duration::from_secs(10));
+    std::thread::sleep(Duration::from_millis(300));
+    let message = q.cli(&["set-time-limit", &shorten.to_string(), "200ms"]);
+    assert!(
+        message.contains("time limit is now 200ms"),
+        "message: {message}"
+    );
+    q.wait_state(shorten, "failed", Duration::from_secs(10));
+    assert!(
+        q.job(shorten)["attempts"][0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("time limit of 200 ms exceeded")),
+        "shorten detail: {}",
+        q.job(shorten)
+    );
+
+    // Extending before the original deadline lets the command finish.
+    let extend = q.submit(
+        &["--name", "live-extend", "--time-limit", "2s"],
+        &["sleep", "3"],
+    );
+    q.wait_state(extend, "running", Duration::from_secs(10));
+    q.cli(&["set-time-limit", &extend.to_string(), "30s"]);
+    q.wait_state(extend, "succeeded", Duration::from_secs(15));
+
+    // Clearing does too. The original bound would have fired during the sleep.
+    let cleared = q.submit(
+        &["--name", "live-clear", "--time-limit", "2s"],
+        &["sleep", "3"],
+    );
+    q.wait_state(cleared, "running", Duration::from_secs(10));
+    let message = q.cli(&["set-time-limit", &cleared.to_string(), "--clear"]);
+    assert!(message.contains("time limit cleared"), "message: {message}");
+    assert!(q.job(cleared)["timeLimitMs"].is_null());
+    q.wait_state(cleared, "succeeded", Duration::from_secs(15));
+
+    let finished = q.try_cli(&["set-time-limit", &cleared.to_string(), "1s"]);
+    assert!(!finished.status.success());
+    let stderr = String::from_utf8_lossy(&finished.stderr);
+    assert!(stderr.contains("cannot be changed"), "stderr: {stderr}");
+
+    let zero = q.try_cli(&["set-time-limit", "1", "0s"]);
+    assert!(!zero.status.success());
+    let stderr = String::from_utf8_lossy(&zero.stderr);
+    assert!(stderr.contains("at least 1ms"), "stderr: {stderr}");
+}
+
+#[test]
+fn updated_time_limit_survives_daemon_restart() {
+    let mut q = TestQueue::new();
+    let job = q.submit(
+        &["--name", "restart-retune", "--time-limit", "2s"],
+        &["sleep", "30"],
+    );
+    q.wait_state(job, "running", Duration::from_secs(10));
+    q.cli(&["set-time-limit", &job.to_string(), "30s"]);
+
+    q.kill_daemon();
+    // Past the launch snapshot. The detached runner has to be enforcing the
+    // updated limit, which no longer depends on the daemon staying up.
+    std::thread::sleep(Duration::from_millis(2_500));
+    q.start_daemon();
+    assert_eq!(q.job_state(job), "running", "detail: {}", q.job(job));
+    q.cli(&["cancel", &job.to_string()]);
+    q.wait_state(job, "cancelled", Duration::from_secs(10));
+}
+
+#[test]
+fn startup_reconciliation_publishes_a_time_limit_committed_while_down() {
+    let mut q = TestQueue::new();
+    let job = q.submit(
+        &["--name", "republish-limit", "--time-limit", "30s"],
+        &["sleep", "30"],
+    );
+    q.wait_state(job, "running", Duration::from_secs(10));
+    let attempt_dir = q.job(job)["attempts"][0]["logDir"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(!PathBuf::from(&attempt_dir).join("limit.json").exists());
+
+    q.kill_daemon();
+    // The commit lands with nobody awake to publish limit.json. The launch
+    // snapshot is still 30s, so the runner must not time out until reconciliation
+    // publishes the shorter bound.
+    let conn = mlqueue::db::open(&q.state_dir().join("mlqueue.db")).unwrap();
+    mlqueue::db::set_job_time_limit(&conn, job, Some(200), mlqueue::domain::now_ms()).unwrap();
+    drop(conn);
+
+    q.start_daemon();
+    q.wait_state(job, "failed", Duration::from_secs(10));
+    let limit: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(PathBuf::from(&attempt_dir).join("limit.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(limit["time_limit_ms"], 200, "republished limit: {limit}");
+    assert!(
+        q.job(job)["attempts"][0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("time limit of 200 ms exceeded")),
+        "detail: {}",
+        q.job(job)
+    );
+}
+
+#[test]
+fn set_time_limit_bounds_an_orphaned_attempt() {
+    let q = TestQueue::new();
+    let job = q.submit(
+        &["--name", "orphan-retune", "--time-limit", "30s"],
+        &["sh", "-c", "trap '' TERM; exec sleep 30"],
+    );
+    q.wait_state(job, "running", Duration::from_secs(10));
+    let attempt_dir = q.job(job)["attempts"][0]["logDir"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let identity: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(PathBuf::from(&attempt_dir).join("identity.json")).unwrap(),
+    )
+    .unwrap();
+    let runner_pid = identity["runner_pid"].as_i64().unwrap() as i32;
+    assert_eq!(unsafe { libc::kill(runner_pid, libc::SIGKILL) }, 0);
+    q.wait_state(job, "needs_attention", Duration::from_secs(10));
+    q.cli(&["set-time-limit", &job.to_string(), "200ms"]);
+    q.wait_state(job, "failed", Duration::from_secs(10));
+    assert!(
+        q.job(job)["attempts"][0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("time limit exceeded")),
+        "orphan detail: {}",
+        q.job(job)
+    );
+}
+
+#[test]
+fn shortening_a_limit_does_not_reclassify_an_earlier_cancel() {
+    let q = TestQueue::new();
+    let job = q.submit(
+        &["--name", "cancel-then-shorten", "--time-limit", "30s"],
+        &["sh", "-c", "trap '' TERM; exec sleep 30"],
+    );
+    q.wait_state(job, "running", Duration::from_secs(10));
+    q.cli(&["cancel", &job.to_string()]);
+    q.cli(&["set-time-limit", &job.to_string(), "200ms"]);
+    q.wait_state(job, "cancelled", Duration::from_secs(10));
+    assert_eq!(q.job(job)["attempts"][0]["state"], "cancelled");
+}
+
+#[test]
+fn a_backdated_orphan_limit_waits_out_the_grace_period() {
+    let q = TestQueue::new();
+    let job = q.submit(
+        &["--name", "orphan-grace", "--time-limit", "30s"],
+        &["sh", "-c", "trap '' TERM; exec sleep 30"],
+    );
+    q.wait_state(job, "running", Duration::from_secs(10));
+    let attempt_dir = q.job(job)["attempts"][0]["logDir"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let identity: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(PathBuf::from(&attempt_dir).join("identity.json")).unwrap(),
+    )
+    .unwrap();
+    let runner_pid = identity["runner_pid"].as_i64().unwrap() as i32;
+    assert_eq!(unsafe { libc::kill(runner_pid, libc::SIGKILL) }, 0);
+    q.wait_state(job, "needs_attention", Duration::from_secs(10));
+
+    let exec: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(PathBuf::from(&attempt_dir).join("exec.json")).unwrap(),
+    )
+    .unwrap();
+    let cmd_pid = exec["pid"].as_i64().unwrap() as i32;
+    q.cli(&["set-time-limit", &job.to_string(), "1ms"]);
+    std::thread::sleep(Duration::from_millis(250));
+    assert_eq!(
+        unsafe { libc::kill(cmd_pid, 0) },
+        0,
+        "SIGKILL must wait out the grace period"
+    );
+    q.wait_state(job, "failed", Duration::from_secs(10));
+}
+
+#[test]
+fn a_started_timeout_continues_after_the_runner_dies_and_the_limit_is_cleared() {
+    let q = TestQueue::new();
+    let job = q.submit(
+        &["--name", "committed-timeout", "--time-limit", "200ms"],
+        &["sh", "-c", "trap '' TERM; exec sleep 30"],
+    );
+    q.wait_state(job, "running", Duration::from_secs(10));
+    let attempt_dir = q.job(job)["attempts"][0]["logDir"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let timeout_path = PathBuf::from(&attempt_dir).join("timeout.json");
+    wait_for(
+        "the runner to commit the timeout",
+        Duration::from_secs(10),
+        || timeout_path.exists(),
+    );
+    let identity: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(PathBuf::from(&attempt_dir).join("identity.json")).unwrap(),
+    )
+    .unwrap();
+    let runner_pid = identity["runner_pid"].as_i64().unwrap() as i32;
+    assert_eq!(unsafe { libc::kill(runner_pid, libc::SIGKILL) }, 0);
+    q.cli(&["set-time-limit", &job.to_string(), "--clear"]);
+    q.wait_state(job, "failed", Duration::from_secs(10));
+    assert!(
+        q.job(job)["attempts"][0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("time limit exceeded")),
+        "detail: {}",
+        q.job(job)
+    );
 }
 
 #[test]
@@ -619,12 +952,13 @@ fn late_observation_of_a_drained_orphan_is_lost_not_timed_out() {
     std::thread::sleep(Duration::from_millis(1_200));
     q.start_daemon();
     q.wait_state(job, "lost", Duration::from_secs(10));
-    assert_eq!(q.job(job)["attemptCount"], 1, "lost work must not auto-retry");
     assert_eq!(
-        std::fs::read_to_string(&marker)
-            .unwrap()
-            .lines()
-            .count(),
+        q.job(job)["attemptCount"],
+        1,
+        "lost work must not auto-retry"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap().lines().count(),
         1,
         "the unknown command must not be duplicated"
     );
@@ -645,15 +979,27 @@ fn submit_resolves_relative_executables_against_the_job_cwd() {
     let job = q.submit(&["--name", "relative-exe"], &["bin/hello.sh"]);
     q.wait_state(job, "succeeded", Duration::from_secs(10));
     let stdout = q.cli(&["logs", &job.to_string()]);
-    assert!(stdout.contains("cwd-relative-marker"), "stdout log: {stdout:?}");
+    assert!(
+        stdout.contains("cwd-relative-marker"),
+        "stdout log: {stdout:?}"
+    );
 
     // A genuinely missing relative executable is still rejected, and the
     // message names the resolved path so the mistake is visible.
     let cwd = q.dir.path().to_str().unwrap();
     let rejected = q.try_cli(&[
-        "submit", "--name", "missing-exe", "--cwd", cwd, "--", "bin/nope.sh",
+        "submit",
+        "--name",
+        "missing-exe",
+        "--cwd",
+        cwd,
+        "--",
+        "bin/nope.sh",
     ]);
-    assert!(!rejected.status.success(), "missing executable must be rejected");
+    assert!(
+        !rejected.status.success(),
+        "missing executable must be rejected"
+    );
     let stderr = String::from_utf8_lossy(&rejected.stderr);
     assert!(
         stderr.contains("bin/nope.sh") && stderr.contains(cwd),
@@ -668,9 +1014,18 @@ fn status_displays_long_job_names() {
     q.submit(&["--name", name], &["sleep", "1"]);
 
     let status = q.cli(&["status"]);
-    assert!(status.contains(name), "long job name was truncated: {status}");
-    let header = status.lines().find(|line| line.starts_with("JOB ")).unwrap();
-    assert!(header.chars().count() <= 80, "status header is wider than 80 columns: {header}");
+    assert!(
+        status.contains(name),
+        "long job name was truncated: {status}"
+    );
+    let header = status
+        .lines()
+        .find(|line| line.starts_with("JOB "))
+        .unwrap();
+    assert!(
+        header.chars().count() <= 80,
+        "status header is wider than 80 columns: {header}"
+    );
 }
 
 #[test]
@@ -694,14 +1049,17 @@ fn follow_tts_announces_completion_and_the_next_running_job() {
         .env("MLQ_TTS_LOG", &tts_log)
         .env(
             "PATH",
-            format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap_or_default()),
+            format!(
+                "{}:{}",
+                fake_bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
         )
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let mut follower = KillOnDrop(Some(command.spawn().unwrap()));
     wait_for("initial TTS announcement", Duration::from_secs(5), || {
-        std::fs::read_to_string(&tts_log)
-            .is_ok_and(|text| text.contains("Queue monitor started"))
+        std::fs::read_to_string(&tts_log).is_ok_and(|text| text.contains("Queue monitor started"))
     });
     let duplicate = q.try_cli(&["follow-tts"]);
     assert!(!duplicate.status.success());
@@ -734,16 +1092,32 @@ fn follow_tts_announces_completion_and_the_next_running_job() {
     q.start_daemon();
     q.wait_state(next, "succeeded", Duration::from_secs(10));
     let expected_next_finished = format!("job {next}, tts next finished successfully");
-    wait_for("post-restart TTS announcement", Duration::from_secs(10), || {
-        std::fs::read_to_string(&tts_log)
-            .is_ok_and(|text| text.contains(&expected_next_finished))
-    });
+    wait_for(
+        "post-restart TTS announcement",
+        Duration::from_secs(10),
+        || {
+            std::fs::read_to_string(&tts_log)
+                .is_ok_and(|text| text.contains(&expected_next_finished))
+        },
+    );
 
     follower.stop();
-    assert!(spoken.contains(&expected_finished), "missing finish announcement:\n{spoken}");
-    assert!(spoken.contains(&expected_running), "missing running announcement:\n{spoken}");
-    assert!(spoken.contains("ARGS: speak --daemon --level status --text-stdin"), "{spoken}");
-    assert!(!spoken.contains("--backend"), "default TTS backend was overridden: {spoken}");
+    assert!(
+        spoken.contains(&expected_finished),
+        "missing finish announcement:\n{spoken}"
+    );
+    assert!(
+        spoken.contains(&expected_running),
+        "missing running announcement:\n{spoken}"
+    );
+    assert!(
+        spoken.contains("ARGS: speak --daemon --level status --text-stdin"),
+        "{spoken}"
+    );
+    assert!(
+        !spoken.contains("--backend"),
+        "default TTS backend was overridden: {spoken}"
+    );
 }
 
 #[test]
@@ -756,9 +1130,15 @@ fn default_limit_serializes_jobs() {
     // While the exclusive job runs, the second must wait. As the blocked
     // queue head it immediately becomes the protected job.
     let fast_view = q.job(fast);
-    assert_eq!(fast_view["state"], "queued", "second maxParallelRuns=1 job must wait");
+    assert_eq!(
+        fast_view["state"], "queued",
+        "second maxParallelRuns=1 job must wait"
+    );
     assert!(
-        fast_view["eligibility"].as_str().unwrap().starts_with("protected_drain"),
+        fast_view["eligibility"]
+            .as_str()
+            .unwrap()
+            .starts_with("protected_drain"),
         "unexpected eligibility: {fast_view}"
     );
 
@@ -771,9 +1151,15 @@ fn three_wide_jobs_share_and_a_fourth_waits() {
     let q = TestQueue::new();
     let jobs: Vec<i64> = (0..4)
         .map(|i| {
-            q.submit(&["--max-parallel-runs", "3", "--name", &format!("cleanrl-{i}")], &[
-                "sleep", "1.2",
-            ])
+            q.submit(
+                &[
+                    "--max-parallel-runs",
+                    "3",
+                    "--name",
+                    &format!("cleanrl-{i}"),
+                ],
+                &["sleep", "1.2"],
+            )
         })
         .collect();
 
@@ -782,7 +1168,13 @@ fn three_wide_jobs_share_and_a_fourth_waits() {
         q.status()["activeLeases"].as_u64() == Some(3)
     });
     let running: Vec<String> = jobs.iter().map(|&j| q.job_state(j)).collect();
-    assert_eq!(running.iter().filter(|s| *s == "running" || *s == "starting").count(), 3);
+    assert_eq!(
+        running
+            .iter()
+            .filter(|s| *s == "running" || *s == "starting")
+            .count(),
+        3
+    );
     assert_eq!(running.iter().filter(|s| *s == "queued").count(), 1);
 
     // The invariant holds throughout: never more than three leases.
@@ -802,17 +1194,28 @@ fn three_wide_jobs_share_and_a_fourth_waits() {
 fn restrictive_job_is_protected_and_the_backfill_window_stays_open() {
     let q = TestQueue::new();
     // Three permissive jobs fill the 3-wide set; `gate` finishes first.
-    let a = q.submit(&["--max-parallel-runs", "3", "--name", "a"], &["sleep", "4"]);
-    let b = q.submit(&["--max-parallel-runs", "3", "--name", "b"], &["sleep", "4"]);
-    let gate = q.submit(&["--max-parallel-runs", "3", "--name", "gate"], &["sleep", "1"]);
+    let a = q.submit(
+        &["--max-parallel-runs", "3", "--name", "a"],
+        &["sleep", "4"],
+    );
+    let b = q.submit(
+        &["--max-parallel-runs", "3", "--name", "b"],
+        &["sleep", "4"],
+    );
+    let gate = q.submit(
+        &["--max-parallel-runs", "3", "--name", "gate"],
+        &["sleep", "1"],
+    );
     for job in [a, b, gate] {
         q.wait_state(job, "running", Duration::from_secs(10));
     }
 
     // The exclusive job is the eligible head and cannot start beside the
     // 3-wide set: it becomes the protected job.
-    let exclusive =
-        q.submit(&["--max-parallel-runs", "1", "--name", "exclusive"], &["sh", "-c", "true"]);
+    let exclusive = q.submit(
+        &["--max-parallel-runs", "1", "--name", "exclusive"],
+        &["sh", "-c", "true"],
+    );
     wait_for("reservation to exist", Duration::from_secs(5), || {
         q.status()["reservation"]["protectedJob"].as_i64() == Some(exclusive)
     });
@@ -824,13 +1227,25 @@ fn restrictive_job_is_protected_and_the_backfill_window_stays_open() {
         &["--max-parallel-runs", "3", "--name", "backfill"],
         &["sleep", "1"],
     );
-    let late = q.submit(&["--max-parallel-runs", "3", "--name", "late"], &["sleep", "1"]);
+    let late = q.submit(
+        &["--max-parallel-runs", "3", "--name", "late"],
+        &["sleep", "1"],
+    );
     let status = q.status();
-    assert_eq!(status["reservation"]["backfillWindowOpen"], true, "window must be open: {status}");
-    assert!(status["reservation"]["backfillCutoff"].is_null(), "no cutoff while open: {status}");
+    assert_eq!(
+        status["reservation"]["backfillWindowOpen"], true,
+        "window must be open: {status}"
+    );
+    assert!(
+        status["reservation"]["backfillCutoff"].is_null(),
+        "no cutoff while open: {status}"
+    );
     let late_view = q.job(late);
     assert!(
-        late_view["eligibility"].as_str().unwrap().starts_with("backfill_window_open"),
+        late_view["eligibility"]
+            .as_str()
+            .unwrap()
+            .starts_with("backfill_window_open"),
         "late job must be bypass-eligible in the open window: {late_view}"
     );
 
@@ -861,19 +1276,30 @@ fn frontier_freezes_once_the_original_blockers_drain() {
     let q = TestQueue::new();
     // Long enough that both blockers are still running through the submits
     // below even on a loaded machine; the freeze is then deterministic.
-    let a = q.submit(&["--max-parallel-runs", "3", "--name", "a"], &["sleep", "4"]);
-    let b = q.submit(&["--max-parallel-runs", "3", "--name", "b"], &["sleep", "4"]);
+    let a = q.submit(
+        &["--max-parallel-runs", "3", "--name", "a"],
+        &["sleep", "4"],
+    );
+    let b = q.submit(
+        &["--max-parallel-runs", "3", "--name", "b"],
+        &["sleep", "4"],
+    );
     for job in [a, b] {
         q.wait_state(job, "running", Duration::from_secs(10));
     }
-    let exclusive =
-        q.submit(&["--max-parallel-runs", "1", "--name", "exclusive"], &["sh", "-c", "true"]);
+    let exclusive = q.submit(
+        &["--max-parallel-runs", "1", "--name", "exclusive"],
+        &["sh", "-c", "true"],
+    );
     wait_for("reservation to exist", Duration::from_secs(5), || {
         q.status()["reservation"]["protectedJob"].as_i64() == Some(exclusive)
     });
 
     // Open window: the post-protection job takes the third slot immediately.
-    let occupant = q.submit(&["--max-parallel-runs", "3", "--name", "occupant"], &["sleep", "20"]);
+    let occupant = q.submit(
+        &["--max-parallel-runs", "3", "--name", "occupant"],
+        &["sleep", "20"],
+    );
     q.wait_state(occupant, "running", Duration::from_secs(10));
 
     // The original blockers drain; the occupant (a mere backfill) does not
@@ -883,16 +1309,26 @@ fn frontier_freezes_once_the_original_blockers_drain() {
     wait_for("frontier to freeze", Duration::from_secs(5), || {
         q.status()["reservation"]["backfillWindowOpen"] == serde_json::json!(false)
     });
-    let cutoff = q.status()["reservation"]["backfillCutoff"].as_i64().unwrap();
-    assert!(cutoff >= occupant, "cutoff must cover everything submitted before the freeze");
+    let cutoff = q.status()["reservation"]["backfillCutoff"]
+        .as_i64()
+        .unwrap();
+    assert!(
+        cutoff >= occupant,
+        "cutoff must cover everything submitted before the freeze"
+    );
 
     // Submitted after the freeze: may no longer pass the protected job, even
     // though two slots are open beside the occupant.
-    let frozen_out =
-        q.submit(&["--max-parallel-runs", "3", "--name", "frozen-out"], &["sh", "-c", "true"]);
+    let frozen_out = q.submit(
+        &["--max-parallel-runs", "3", "--name", "frozen-out"],
+        &["sh", "-c", "true"],
+    );
     let frozen_view = q.job(frozen_out);
     assert!(
-        frozen_view["eligibility"].as_str().unwrap().starts_with("behind_backfill_cutoff"),
+        frozen_view["eligibility"]
+            .as_str()
+            .unwrap()
+            .starts_with("behind_backfill_cutoff"),
         "post-freeze submission must wait: {frozen_view}"
     );
     assert_eq!(q.job_state(exclusive), "queued");
@@ -910,20 +1346,36 @@ fn reservation_and_consumed_bypasses_survive_daemon_restart() {
     let mut q = TestQueue::new();
     // Same shape as the open-window test, but long enough to straddle a
     // daemon crash while the reservation and one consumed bypass exist.
-    let a = q.submit(&["--max-parallel-runs", "3", "--name", "a"], &["sleep", "8"]);
-    let b = q.submit(&["--max-parallel-runs", "3", "--name", "b"], &["sleep", "8"]);
-    let gate = q.submit(&["--max-parallel-runs", "3", "--name", "gate"], &["sleep", "1"]);
+    let a = q.submit(
+        &["--max-parallel-runs", "3", "--name", "a"],
+        &["sleep", "8"],
+    );
+    let b = q.submit(
+        &["--max-parallel-runs", "3", "--name", "b"],
+        &["sleep", "8"],
+    );
+    let gate = q.submit(
+        &["--max-parallel-runs", "3", "--name", "gate"],
+        &["sleep", "1"],
+    );
     for job in [a, b, gate] {
         q.wait_state(job, "running", Duration::from_secs(10));
     }
-    let exclusive =
-        q.submit(&["--max-parallel-runs", "1", "--name", "exclusive"], &["sh", "-c", "true"]);
+    let exclusive = q.submit(
+        &["--max-parallel-runs", "1", "--name", "exclusive"],
+        &["sh", "-c", "true"],
+    );
     wait_for("reservation to exist", Duration::from_secs(5), || {
         q.status()["reservation"]["protectedJob"].as_i64() == Some(exclusive)
     });
-    let backfill =
-        q.submit(&["--max-parallel-runs", "3", "--name", "backfill"], &["sleep", "2"]);
-    let late = q.submit(&["--max-parallel-runs", "3", "--name", "late"], &["sh", "-c", "true"]);
+    let backfill = q.submit(
+        &["--max-parallel-runs", "3", "--name", "backfill"],
+        &["sleep", "2"],
+    );
+    let late = q.submit(
+        &["--max-parallel-runs", "3", "--name", "late"],
+        &["sh", "-c", "true"],
+    );
 
     // The bypass is consumed, then the daemon crashes.
     q.wait_state(backfill, "running", Duration::from_secs(10));
@@ -934,8 +1386,14 @@ fn reservation_and_consumed_bypasses_survive_daemon_restart() {
     // from the database, and re-derives the open window from the still-live
     // initial blockers rather than recomputing fairness from events.
     let status = q.status();
-    assert_eq!(status["reservation"]["protectedJob"].as_i64(), Some(exclusive));
-    assert_eq!(status["reservation"]["backfillWindowOpen"], true, "blockers still run: {status}");
+    assert_eq!(
+        status["reservation"]["protectedJob"].as_i64(),
+        Some(exclusive)
+    );
+    assert_eq!(
+        status["reservation"]["backfillWindowOpen"], true,
+        "blockers still run: {status}"
+    );
     assert!(
         status["reservation"]["consumedBypasses"]
             .as_array()
@@ -945,7 +1403,10 @@ fn reservation_and_consumed_bypasses_survive_daemon_restart() {
     );
     assert_eq!(q.job_state(exclusive), "queued");
     assert!(
-        q.job(late)["eligibility"].as_str().unwrap().starts_with("backfill_window_open"),
+        q.job(late)["eligibility"]
+            .as_str()
+            .unwrap()
+            .starts_with("backfill_window_open"),
         "the window stays open across the restart"
     );
 
@@ -964,33 +1425,51 @@ fn reservation_and_consumed_bypasses_survive_daemon_restart() {
 #[test]
 fn cancelling_the_protected_job_invalidates_the_reservation() {
     let q = TestQueue::new();
-    let a = q.submit(&["--max-parallel-runs", "3", "--name", "a"], &["sleep", "6"]);
-    let b = q.submit(&["--max-parallel-runs", "3", "--name", "b"], &["sleep", "6"]);
+    let a = q.submit(
+        &["--max-parallel-runs", "3", "--name", "a"],
+        &["sleep", "6"],
+    );
+    let b = q.submit(
+        &["--max-parallel-runs", "3", "--name", "b"],
+        &["sleep", "6"],
+    );
     for job in [a, b] {
         q.wait_state(job, "running", Duration::from_secs(10));
     }
-    let exclusive =
-        q.submit(&["--max-parallel-runs", "1", "--name", "exclusive"], &["sleep", "5"]);
+    let exclusive = q.submit(
+        &["--max-parallel-runs", "1", "--name", "exclusive"],
+        &["sleep", "5"],
+    );
     wait_for("reservation to exist", Duration::from_secs(5), || {
         q.status()["reservation"]["protectedJob"].as_i64() == Some(exclusive)
     });
 
     // The open window admits the late job into the third slot; its bypass is
     // consumed under the standing reservation.
-    let late = q.submit(&["--max-parallel-runs", "3", "--name", "late"], &["sleep", "6"]);
+    let late = q.submit(
+        &["--max-parallel-runs", "3", "--name", "late"],
+        &["sleep", "6"],
+    );
     q.wait_state(late, "running", Duration::from_secs(10));
     assert_eq!(q.job_state(exclusive), "queued");
 
     // Cancelling the protected job invalidates the reservation entirely:
     // later submissions no longer answer to any frontier.
     q.cli(&["cancel", &exclusive.to_string()]);
-    wait_for("reservation to be invalidated", Duration::from_secs(5), || {
-        q.status()["reservation"].is_null()
-    });
-    let free = q.submit(&["--max-parallel-runs", "4", "--name", "free"], &["sh", "-c", "true"]);
+    wait_for(
+        "reservation to be invalidated",
+        Duration::from_secs(5),
+        || q.status()["reservation"].is_null(),
+    );
+    let free = q.submit(
+        &["--max-parallel-runs", "4", "--name", "free"],
+        &["sh", "-c", "true"],
+    );
     let free_view = q.job(free);
     assert!(
-        free_view["eligibility"].as_str().is_none_or(|reason| !reason.contains("backfill")),
+        free_view["eligibility"]
+            .as_str()
+            .is_none_or(|reason| !reason.contains("backfill")),
         "no reservation may constrain the queue after invalidation: {free_view}"
     );
     assert_eq!(q.job_state(a), "running");
@@ -1000,13 +1479,21 @@ fn cancelling_the_protected_job_invalidates_the_reservation() {
 #[test]
 fn unsupported_reservation_blocks_admission_until_resolved() {
     let mut q = TestQueue::new();
-    let a = q.submit(&["--max-parallel-runs", "3", "--name", "a"], &["sleep", "10"]);
-    let b = q.submit(&["--max-parallel-runs", "3", "--name", "b"], &["sleep", "10"]);
+    let a = q.submit(
+        &["--max-parallel-runs", "3", "--name", "a"],
+        &["sleep", "10"],
+    );
+    let b = q.submit(
+        &["--max-parallel-runs", "3", "--name", "b"],
+        &["sleep", "10"],
+    );
     for job in [a, b] {
         q.wait_state(job, "running", Duration::from_secs(10));
     }
-    let exclusive =
-        q.submit(&["--max-parallel-runs", "1", "--name", "exclusive"], &["sh", "-c", "true"]);
+    let exclusive = q.submit(
+        &["--max-parallel-runs", "1", "--name", "exclusive"],
+        &["sh", "-c", "true"],
+    );
     wait_for("reservation to exist", Duration::from_secs(5), || {
         q.status()["reservation"]["protectedJob"].as_i64() == Some(exclusive)
     });
@@ -1029,7 +1516,10 @@ fn unsupported_reservation_blocks_admission_until_resolved() {
     wait_for("admission to block", Duration::from_secs(5), || {
         q.status()["admissionBlocked"] == serde_json::json!(true)
     });
-    let stuck = q.submit(&["--max-parallel-runs", "3", "--name", "stuck"], &["sh", "-c", "true"]);
+    let stuck = q.submit(
+        &["--max-parallel-runs", "3", "--name", "stuck"],
+        &["sh", "-c", "true"],
+    );
     std::thread::sleep(Duration::from_millis(400));
     assert_eq!(q.job_state(stuck), "queued");
 
@@ -1063,11 +1553,10 @@ fn cancel_terminates_and_frees_the_lease() {
 fn force_cancel_escalates_to_sigkill_after_grace() {
     let q = TestQueue::new();
     // Ignores SIGTERM; only SIGKILL can end the shell loop.
-    let job = q.submit(&["--name", "stubborn"], &[
-        "sh",
-        "-c",
-        "trap '' TERM; while true; do sleep 0.2; done",
-    ]);
+    let job = q.submit(
+        &["--name", "stubborn"],
+        &["sh", "-c", "trap '' TERM; while true; do sleep 0.2; done"],
+    );
     q.wait_state(job, "running", Duration::from_secs(10));
 
     q.cli(&["cancel", &job.to_string(), "--force"]);
@@ -1099,12 +1588,19 @@ fn idempotency_key_replays_and_conflicts() {
         q.try_cli(&refs)
     };
     let parse = |output: &Output| -> serde_json::Value {
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         serde_json::from_slice(&output.stdout).unwrap()
     };
     let first = parse(&run("same"));
     let second = parse(&run("same"));
-    assert_eq!(first["id"], second["id"], "identical retry must not duplicate the job");
+    assert_eq!(
+        first["id"], second["id"],
+        "identical retry must not duplicate the job"
+    );
 
     // Same key, different payload: stable conflict, no third job.
     let output = run("different");
@@ -1117,12 +1613,22 @@ fn idempotency_key_replays_and_conflicts() {
 fn retry_policy_reattempts_then_fails() {
     let q = TestQueue::new();
     let job = q.submit(
-        &["--name", "flaky", "--max-attempts", "2", "--retry-delay", "100ms"],
+        &[
+            "--name",
+            "flaky",
+            "--max-attempts",
+            "2",
+            "--retry-delay",
+            "100ms",
+        ],
         &["sh", "-c", "exit 1"],
     );
     q.wait_state(job, "failed", Duration::from_secs(15));
     let detail = q.job(job);
-    assert_eq!(detail["attemptCount"], 2, "retry policy must run a second attempt");
+    assert_eq!(
+        detail["attemptCount"], 2,
+        "retry policy must run a second attempt"
+    );
     assert_eq!(detail["attempts"][1]["state"], "failed");
 
     // Manual retry grants one more attempt.
@@ -1135,7 +1641,14 @@ fn retry_policy_reattempts_then_fails() {
 fn failed_dependencies_cascade_skips_and_run_terminal_cleanup() {
     let q = TestQueue::new();
     let parent = q.submit(
-        &["--name", "parent", "--max-attempts", "2", "--retry-delay", "800ms"],
+        &[
+            "--name",
+            "parent",
+            "--max-attempts",
+            "2",
+            "--retry-delay",
+            "800ms",
+        ],
         &["sh", "-c", "exit 3"],
     );
     let child = q.submit(
@@ -1143,7 +1656,12 @@ fn failed_dependencies_cascade_skips_and_run_terminal_cleanup() {
         &["sh", "-c", "true"],
     );
     let grandchild = q.submit(
-        &["--name", "grandchild", "--after-success", &child.to_string()],
+        &[
+            "--name",
+            "grandchild",
+            "--after-success",
+            &child.to_string(),
+        ],
         &["sh", "-c", "true"],
     );
     let cleanup = q.submit(
@@ -1153,10 +1671,14 @@ fn failed_dependencies_cascade_skips_and_run_terminal_cleanup() {
 
     // The parent is not terminal between automatic attempts, so neither
     // dependency condition resolves during the retry window.
-    wait_for("parent retry to be scheduled", Duration::from_secs(10), || {
-        let view = q.job(parent);
-        view["state"] == "queued" && view["attemptCount"] == 1
-    });
+    wait_for(
+        "parent retry to be scheduled",
+        Duration::from_secs(10),
+        || {
+            let view = q.job(parent);
+            view["state"] == "queued" && view["attemptCount"] == 1
+        },
+    );
     assert_eq!(q.job_state(child), "queued");
     assert!(
         q.job(child)["eligibility"]
@@ -1171,7 +1693,7 @@ fn failed_dependencies_cascade_skips_and_run_terminal_cleanup() {
     q.wait_state(grandchild, "skipped", Duration::from_secs(10));
     q.wait_state(cleanup, "succeeded", Duration::from_secs(10));
     assert_eq!(
-        q.try_cli(&["wait", &child.to_string()]).status.code(),
+        q.try_cli(&["follow", &child.to_string()]).status.code(),
         Some(1),
         "waiting on a skipped job returns a stable generic failure"
     );
@@ -1310,7 +1832,10 @@ fn second_daemon_instance_is_refused() {
     let q = TestQueue::new();
     let mut second = q.spawn_daemon();
     let status = second.wait().unwrap();
-    assert!(!status.success(), "second daemon must refuse to start while the lock is held");
+    assert!(
+        !status.success(),
+        "second daemon must refuse to start while the lock is held"
+    );
 }
 
 #[test]
@@ -1420,10 +1945,7 @@ fn set_priority_updates_queued_jobs_and_rejects_running() {
 
     // Same value is a no-op that leaves the protected reservation alone.
     let message = q.cli(&["set-priority", &first.to_string(), "0"]);
-    assert!(
-        message.contains("priority is now 0"),
-        "message: {message}"
-    );
+    assert!(message.contains("priority is now 0"), "message: {message}");
     assert_eq!(
         q.status()["reservation"]["protectedJob"].as_i64(),
         Some(first)
@@ -1431,10 +1953,7 @@ fn set_priority_updates_queued_jobs_and_rejects_running() {
 
     // Raising a later job above the protected head supersedes the reservation.
     let message = q.cli(&["set-priority", &second.to_string(), "2"]);
-    assert!(
-        message.contains("priority is now 2"),
-        "message: {message}"
-    );
+    assert!(message.contains("priority is now 2"), "message: {message}");
     assert_eq!(q.job(second)["priority"], 2);
     assert_eq!(
         q.status()["reservation"]["protectedJob"].as_i64(),
@@ -1451,10 +1970,7 @@ fn set_priority_updates_queued_jobs_and_rejects_running() {
     let output = q.try_cli(&["set-priority", &blocker.to_string(), "9"]);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("queued or held"),
-        "stderr: {stderr}"
-    );
+    assert!(stderr.contains("queued or held"), "stderr: {stderr}");
     assert_eq!(q.job(blocker)["priority"], 0);
 
     // Negative priorities parse as a positional value.
@@ -1526,45 +2042,74 @@ fn signed_priorities_strictly_order_queued_jobs_without_preempting_running_work(
 }
 
 #[test]
-fn wait_blocks_until_terminal_and_exits_with_the_outcome() {
+fn follow_blocks_until_terminal_and_exits_with_the_outcome() {
     let q = TestQueue::new();
 
     let ok = q.submit(&["--name", "ok"], &["sh", "-c", "sleep 0.3; true"]);
-    let output = q.try_cli(&["wait", &ok.to_string()]);
-    assert!(output.status.success(), "wait on a succeeding job must exit 0");
+    let output = q.try_cli(&["follow", &ok.to_string()]);
+    assert!(
+        output.status.success(),
+        "follow on a succeeding job must exit 0"
+    );
     assert!(String::from_utf8_lossy(&output.stdout).contains("succeeded"));
 
     let bad = q.submit(&["--name", "bad"], &["sh", "-c", "exit 3"]);
-    let output = q.try_cli(&["wait", &bad.to_string()]);
-    assert_eq!(output.status.code(), Some(3), "wait must propagate the command's exit code");
+    let output = q.try_cli(&["follow", &bad.to_string()]);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "follow must propagate the command's exit code"
+    );
 
     let hurt = q.submit(&["--name", "hurt"], &["sh", "-c", "kill -SEGV $$"]);
-    let output = q.try_cli(&["wait", &hurt.to_string()]);
-    assert_eq!(output.status.code(), Some(128 + 11), "signal deaths map to 128+N");
+    let output = q.try_cli(&["follow", &hurt.to_string()]);
+    assert_eq!(
+        output.status.code(),
+        Some(128 + 11),
+        "signal deaths map to 128+N"
+    );
 
     let slow = q.submit(&["--name", "slow"], &["sleep", "5"]);
-    let output = q.try_cli(&["wait", &slow.to_string(), "--timeout", "300ms"]);
-    assert_eq!(output.status.code(), Some(124), "wait --timeout expiry must exit 124");
+    let output = q.try_cli(&["follow", &slow.to_string(), "--timeout", "300ms"]);
+    assert_eq!(
+        output.status.code(),
+        Some(124),
+        "follow --timeout expiry must exit 124"
+    );
     // Cancelling before launch would finalize without a signal; the 128+15
     // mapping is only defined for a delivered SIGTERM.
     q.wait_state(slow, "running", Duration::from_secs(10));
     q.cli(&["cancel", &slow.to_string()]);
-    let output = q.try_cli(&["wait", &slow.to_string()]);
-    assert_eq!(output.status.code(), Some(128 + 15), "cancellation by SIGTERM maps to 128+15");
+    let output = q.try_cli(&["follow", &slow.to_string()]);
+    assert_eq!(
+        output.status.code(),
+        Some(128 + 15),
+        "cancellation by SIGTERM maps to 128+15"
+    );
 }
 
 #[test]
 fn logs_follow_reports_the_terminal_outcome() {
     let q = TestQueue::new();
     // Tail a live job so the follow loop crosses the running→terminal edge.
-    let job = q.submit(&["--name", "tail-me"], &["sh", "-c", "echo body-marker; sleep 0.8; exit 7"]);
+    let job = q.submit(
+        &["--name", "tail-me"],
+        &["sh", "-c", "echo body-marker; sleep 0.8; exit 7"],
+    );
     q.wait_state(job, "running", Duration::from_secs(10));
 
     let output = q.try_cli(&["logs", &job.to_string(), "--follow"]);
-    assert_eq!(output.status.code(), Some(7), "follow must reflect the attempt outcome");
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "follow must reflect the attempt outcome"
+    );
     assert!(String::from_utf8_lossy(&output.stdout).contains("body-marker"));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("attempt 1 failed"), "missing terminal report: {stderr}");
+    assert!(
+        stderr.contains("attempt 1 failed"),
+        "missing terminal report: {stderr}"
+    );
 
     // Without --follow the command only prints current logs; a failed job
     // must not turn that read into a failure.
@@ -1572,7 +2117,10 @@ fn logs_follow_reports_the_terminal_outcome() {
     assert!(output.status.success());
 
     // Following a succeeding job drains, reports, and exits 0.
-    let fine = q.submit(&["--name", "tail-fine"], &["sh", "-c", "echo fine-marker; sleep 0.5"]);
+    let fine = q.submit(
+        &["--name", "tail-fine"],
+        &["sh", "-c", "echo fine-marker; sleep 0.5"],
+    );
     q.wait_state(fine, "running", Duration::from_secs(10));
     let output = q.try_cli(&["logs", &fine.to_string(), "--follow"]);
     assert!(output.status.success(), "follow on success must exit 0");
@@ -1623,4 +2171,507 @@ fn see_prints_detail_and_latest_stdout() {
         "missing job: {}",
         String::from_utf8_lossy(&missing.stderr)
     );
+}
+
+fn spawn_follower(q: &TestQueue, args: &[&str]) -> KillOnDrop {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mlq"));
+    q.apply_env(&mut command);
+    KillOnDrop(Some(
+        command
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    ))
+}
+
+fn follower_output(mut follower: KillOnDrop) -> Output {
+    follower.0.take().unwrap().wait_with_output().unwrap()
+}
+
+fn follow_events(output: &Output) -> Vec<serde_json::Value> {
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout.clone())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("compact NDJSON event"))
+        .collect()
+}
+
+// An explicitly enabled healthy check proves the CLI consumed a running
+// snapshot. Probing subscription quotas races the follower for its own slot.
+fn follow_barrier(q: &TestQueue, name: &str) -> (PathBuf, PathBuf) {
+    let marker = q.dir.path().join(format!("{name}-ready"));
+    let config = q.dir.path().join(format!("{name}.toml"));
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+events = ["warning"]
+[[checks]]
+id = "ready"
+command = ["sh", "-c", "touch '{}'; echo '{{\"findings\":[]}}'"]
+"#,
+            marker.display()
+        ),
+    )
+    .unwrap();
+    (config, marker)
+}
+
+#[test]
+fn follow_is_final_only_unless_selected_and_subscribes_through_retries() {
+    let q = TestQueue::new();
+    let job = q.submit(&["--max-attempts", "2", "--retry-delay", "100ms"],
+        &["sh", "-c", "while ! test -e proceed; do sleep 0.05; done; if test -e retried; then exit 7; else touch retried; exit 8; fi"]);
+    q.wait_state(job, "running", Duration::from_secs(5));
+    let marker = q.dir.path().join("must-not-execute");
+    let config = q.dir.path().join("follow.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+events = ["started", "warning", "retry", "attention"]
+[[checks]]
+id = "forbidden"
+command = ["touch", "{}"]
+every = "1s"
+[[hooks]]
+events = ["started", "warning", "retry", "attention"]
+command = ["touch", "{}"]
+"#,
+            marker.display(),
+            marker.display()
+        ),
+    )
+    .unwrap();
+    let id = job.to_string();
+    let (selected_config, selected_ready) = follow_barrier(&q, "selected");
+    let quiet = spawn_follower(&q, &["follow", &id, "--json", "--timeout", "10s"]);
+    let selected = spawn_follower(
+        &q,
+        &[
+            "follow",
+            &id,
+            "--config",
+            selected_config.to_str().unwrap(),
+            "--events",
+            "started,retry,warning",
+            "--json",
+            "--timeout",
+            "10s",
+        ],
+    );
+    let overridden = spawn_follower(
+        &q,
+        &[
+            "follow",
+            &id,
+            "--config",
+            config.to_str().unwrap(),
+            "--only-finish",
+            "--json",
+            "--timeout",
+            "10s",
+        ],
+    );
+    wait_for("selected follower attached", Duration::from_secs(5), || {
+        selected_ready.exists()
+    });
+    std::fs::write(q.dir.path().join("proceed"), "").unwrap();
+    let quiet = follower_output(quiet);
+    let selected = follower_output(selected);
+    let overridden = follower_output(overridden);
+    for result in [&quiet, &selected, &overridden] {
+        assert_eq!(result.status.code(), Some(7), "{result:?}");
+    }
+    for result in [&quiet, &overridden] {
+        let events = follow_events(result);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["event"], "finished");
+        assert_eq!(events[0]["state"], "failed");
+        assert_eq!(events[0]["exitCode"], 7);
+    }
+    let events = follow_events(&selected);
+    let kinds: Vec<_> = events
+        .iter()
+        .map(|event| event["event"].as_str().unwrap())
+        .collect();
+    // Attachment does not invent/replay attempt 1's start; attempt 2 is live.
+    assert_eq!(kinds, ["retry", "started", "finished"]);
+    assert_eq!(events[0]["attempt"], 1);
+    assert_eq!(events[1]["attempt"], 2);
+    assert!(
+        !marker.exists(),
+        "only-finish must prevent intermediate script execution"
+    );
+}
+
+#[test]
+fn follow_checks_deduplicate_before_invoking_notification_hooks() {
+    let q = TestQueue::new();
+    let job = q.submit(
+        &[],
+        &["sh", "-c", "while ! test -e finished; do sleep 0.1; done"],
+    );
+    let marker = q.dir.path().join("checked");
+    let notified = q.dir.path().join("notified");
+    let checker = q.dir.path().join("check");
+    std::fs::write(
+        &checker,
+        format!(
+            r#"#!/bin/sh
+cat >/dev/null
+echo checked >> '{}'
+echo '{{"findings":[{{"key":"ema-declining","message":"EMA declined"}}]}}'
+"#,
+            marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&checker, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let hook = q.dir.path().join("notify");
+    std::fs::write(
+        &hook,
+        format!(
+            r#"#!/bin/sh
+cat >> '{}'
+echo >> '{}'
+echo never-forward-hook-output
+"#,
+            notified.display(),
+            notified.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let config = q.dir.path().join("follow.toml");
+    std::fs::write(
+        &config,
+        r#"
+events = ["warning"]
+[[checks]]
+id = "training"
+command = ["./check"]
+every = "1s"
+[[hooks]]
+events = ["warning"]
+command = ["./notify"]
+"#,
+    )
+    .unwrap();
+    let follower = spawn_follower(
+        &q,
+        &[
+            "follow",
+            &job.to_string(),
+            "--config",
+            config.to_str().unwrap(),
+            "--json",
+            "--timeout",
+            "15s",
+        ],
+    );
+    wait_for("three local checks", Duration::from_secs(10), || {
+        std::fs::read_to_string(&marker).is_ok_and(|value| value.lines().count() >= 3)
+    });
+    std::fs::write(q.dir.path().join("finished"), "").unwrap();
+    let result = follower_output(follower);
+    assert!(result.status.success(), "{result:?}");
+    let events = follow_events(&result);
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events[0]["event"], "warning");
+    assert_eq!(events[0]["findings"][0]["key"], "ema-declining");
+    assert_eq!(events[1]["event"], "finished");
+    let notifications: Vec<serde_json::Value> = std::fs::read_to_string(notified)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(notifications.len(), 1, "{notifications:?}");
+    assert_eq!(notifications[0]["event"], "warning");
+}
+
+#[test]
+fn quiet_follow_timeout_and_disconnect_never_claim_completion_or_cancel_job() {
+    let mut q = TestQueue::new();
+    q.cli(&["pause"]);
+    let job = q.submit(&[], &["sleep", "30"]);
+    let result = q.try_cli(&["follow", &job.to_string(), "--timeout", "50ms", "--json"]);
+    assert_eq!(result.status.code(), Some(124), "{result:?}");
+    assert!(result.stdout.is_empty());
+    assert_eq!(q.job_state(job), "queued");
+    q.cli(&["unpause"]);
+    let (config, ready) = follow_barrier(&q, "disconnect");
+    let follower = spawn_follower(
+        &q,
+        &[
+            "follow",
+            &job.to_string(),
+            "--config",
+            config.to_str().unwrap(),
+            "--timeout",
+            "10s",
+            "--json",
+        ],
+    );
+    wait_for("attached quiet follower", Duration::from_secs(5), || {
+        ready.exists()
+    });
+    q.stop_daemon();
+    let result = follower_output(follower);
+    q.start_daemon();
+    q.cli(&["cancel", &job.to_string()]);
+    q.wait_state(job, "cancelled", Duration::from_secs(5));
+    assert_eq!(result.status.code(), Some(1));
+    assert!(result.stdout.is_empty(), "{result:?}");
+}
+
+#[test]
+fn follower_hook_cannot_replace_an_observed_terminal_outcome_with_timeout() {
+    let q = TestQueue::new();
+    let job = q.submit(&[], &["true"]);
+    q.wait_state(job, "succeeded", Duration::from_secs(5));
+    let config = q.dir.path().join("follow.toml");
+    std::fs::write(
+        &config,
+        r#"
+[[hooks]]
+events = ["finished"]
+command = ["sleep", "0.3"]
+timeout = "1s"
+"#,
+    )
+    .unwrap();
+    let result = q.try_cli(&[
+        "follow",
+        &job.to_string(),
+        "--config",
+        config.to_str().unwrap(),
+        "--json",
+        "--timeout",
+        "100ms",
+    ]);
+    assert_eq!(result.status.code(), Some(0), "{result:?}");
+    let events = follow_events(&result);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["exitCode"], 0);
+}
+
+#[test]
+fn follower_signals_clean_up_checker_and_hook_process_groups() {
+    let q = TestQueue::new();
+    for (kind, signal) in [("check", libc::SIGINT), ("hook", libc::SIGTERM)] {
+        let job = if kind == "check" {
+            q.submit(&[], &["sleep", "30"])
+        } else {
+            let job = q.submit(&[], &["true"]);
+            q.wait_state(job, "succeeded", Duration::from_secs(5));
+            job
+        };
+        let parent_path = q.dir.path().join(format!("{kind}-parent"));
+        let child_path = q.dir.path().join(format!("{kind}-child"));
+        let config = q.dir.path().join(format!("{kind}.toml"));
+        let section = if kind == "check" {
+            "events = [\"warning\"]\n[[checks]]\nid = \"long\""
+        } else {
+            "[[hooks]]\nevents = [\"finished\"]"
+        };
+        std::fs::write(
+            &config,
+            format!(
+                r#"{section}
+command = ["sh", "-c", "echo $$ > \"$1\"; sleep 30 & echo $! > \"$2\"; wait", "sh", "{}", "{}"]
+timeout = "30s"
+"#,
+                parent_path.display(),
+                child_path.display()
+            ),
+        )
+        .unwrap();
+        let follower = spawn_follower(
+            &q,
+            &[
+                "follow",
+                &job.to_string(),
+                "--config",
+                config.to_str().unwrap(),
+                "--json",
+                "--timeout",
+                "10s",
+            ],
+        );
+        wait_for(
+            "monitor subprocess and descendant",
+            Duration::from_secs(5),
+            || {
+                std::fs::read_to_string(&child_path)
+                    .is_ok_and(|text| text.trim().parse::<i32>().is_ok())
+            },
+        );
+        let parent: i32 = std::fs::read_to_string(parent_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let child: i32 = std::fs::read_to_string(child_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::kill(follower.0.as_ref().unwrap().id() as i32, signal) },
+            0
+        );
+        let result = follower_output(follower);
+        // Clean up the actual queued workload independently of the monitor.
+        if kind == "check" {
+            assert_eq!(
+                q.job_state(job),
+                "running",
+                "stopping a follower must not cancel its job"
+            );
+            q.cli(&["cancel", &job.to_string()]);
+            q.wait_state(job, "cancelled", Duration::from_secs(5));
+        }
+        let alive = |pid| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                !matches!(
+                    stat.rsplit_once(')').unwrap().1.split_whitespace().next(),
+                    Some("Z" | "X")
+                )
+            })
+        };
+        // Avoid leaking the reproduction processes if this regression returns.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while (alive(parent) || alive(child)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let leaked = alive(parent) || alive(child);
+        if leaked {
+            unsafe {
+                libc::killpg(parent, libc::SIGKILL);
+            }
+        }
+        assert!(
+            !leaked,
+            "{kind} subprocess group survived follower termination"
+        );
+        assert_eq!(result.status.code(), Some(128 + signal), "{result:?}");
+    }
+}
+
+#[test]
+fn follower_preempts_slow_intermediate_hooks_and_cleans_up_on_broken_pipe() {
+    use std::io::{BufRead, Read};
+    let q = TestQueue::new();
+    for close_pipe in [false, true] {
+        let marker = q.dir.path().join(format!("hook-{close_pipe}"));
+        let finished = q.dir.path().join(format!("finish-{close_pipe}"));
+        let job = q.submit(
+            &[],
+            &[
+                "sh",
+                "-c",
+                &format!(
+                    "while ! test -e '{}'; do sleep 0.05; done",
+                    finished.display()
+                ),
+            ],
+        );
+        let config = q.dir.path().join(format!("pipe-{close_pipe}.toml"));
+        std::fs::write(&config, format!(r#"
+events = ["warning"]
+[[checks]]
+id = "check"
+command = ["sh", "-c", "echo '{{\"findings\":[{{\"key\":\"warning\",\"message\":\"attention\"}}]}}'"]
+[[hooks]]
+events = ["warning"]
+command = ["sh", "-c", "echo $$ > '{}'; sleep 30 & wait"]
+timeout = "30s"
+"#, marker.display())).unwrap();
+        let mut follower = spawn_follower(
+            &q,
+            &[
+                "follow",
+                &job.to_string(),
+                "--config",
+                config.to_str().unwrap(),
+                "--json",
+                "--timeout",
+                "5s",
+            ],
+        );
+        let mut reader =
+            std::io::BufReader::new(follower.0.as_mut().unwrap().stdout.take().unwrap());
+        let mut first = String::new();
+        reader.read_line(&mut first).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&first).unwrap()["event"],
+            "warning"
+        );
+        wait_for(
+            "slow intermediate hook started",
+            Duration::from_secs(3),
+            || {
+                std::fs::read_to_string(&marker)
+                    .is_ok_and(|text| text.trim().parse::<i32>().is_ok())
+            },
+        );
+        let pid: i32 = std::fs::read_to_string(&marker)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mut remaining = if close_pipe {
+            drop(reader);
+            None
+        } else {
+            Some(reader)
+        };
+        std::fs::write(&finished, "").unwrap();
+        let result = follower_output(follower);
+        let alive = || {
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                !matches!(
+                    stat.rsplit_once(')').unwrap().1.split_whitespace().next(),
+                    Some("Z" | "X")
+                )
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while alive() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let leaked = alive();
+        if leaked {
+            unsafe {
+                libc::killpg(pid, libc::SIGKILL);
+            }
+        }
+        assert!(
+            !leaked,
+            "intermediate hook survived completion/pipe closure"
+        );
+        assert_eq!(
+            result.status.code(),
+            Some(if close_pipe { 141 } else { 0 }),
+            "{result:?}"
+        );
+        assert!(result.stderr.is_empty(), "{result:?}");
+        if let Some(reader) = &mut remaining {
+            let mut final_output = String::new();
+            reader.read_to_string(&mut final_output).unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(final_output.trim()).unwrap()["event"],
+                "finished"
+            );
+        }
+    }
 }

@@ -144,9 +144,46 @@ str_enum!(DependencyResolution {
     Violated => "violated",
 });
 
+/// Whether a cancellation timestamp loses to a time-limit deadline.
+///
+/// `limit_set_at` is when the current limit was installed. `None` means the
+/// attempt launched with it. A cancel that predates a later edit keeps the
+/// classification it had under the limit already in force: moving the
+/// deadline backward does not turn that cancel into a timeout.
+pub fn timeout_wins_over_cancel(
+    cancelled_at: i64,
+    deadline: i64,
+    limit_set_at: Option<i64>,
+) -> bool {
+    cancelled_at > deadline && limit_set_at.is_none_or(|set_at| cancelled_at > set_at)
+}
+
+/// When SIGKILL may follow a timeout's SIGTERM.
+///
+/// `observed_at` is the instant a supervisor already armed the grace. Without
+/// one, a limit installed after its own deadline starts grace at installation,
+/// while a limit that was already in force is measured from the deadline so a
+/// late enforcer still catches up.
+pub fn timeout_kill_anchor(
+    deadline: i64,
+    limit_set_at: Option<i64>,
+    observed_at: Option<i64>,
+) -> i64 {
+    if let Some(observed_at) = observed_at {
+        return observed_at;
+    }
+    match limit_set_at {
+        Some(set_at) if deadline < set_at => set_at,
+        _ => deadline,
+    }
+}
+
 impl AttemptState {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled | Self::Lost)
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Cancelled | Self::Lost
+        )
     }
 }
 
@@ -158,6 +195,24 @@ mod tests {
     fn max_parallel_runs_rejects_zero() {
         assert!(MaxParallelRuns::new(0).is_none());
         assert_eq!(MaxParallelRuns::new(3).unwrap().get(), 3);
+    }
+
+    #[test]
+    fn timeout_does_not_rewrite_a_cancel_that_predates_the_limit_edit() {
+        assert!(timeout_wins_over_cancel(12, 10, None));
+        assert!(!timeout_wins_over_cancel(8, 10, None));
+        // Cancel at 5, then the limit is moved so the deadline is 1.
+        assert!(!timeout_wins_over_cancel(5, 1, Some(6)));
+        // The edit happened first; the cancel came after the new deadline.
+        assert!(timeout_wins_over_cancel(8, 4, Some(6)));
+    }
+
+    #[test]
+    fn timeout_grace_starts_at_installation_when_the_deadline_was_backdated() {
+        assert_eq!(timeout_kill_anchor(1_000, None, None), 1_000);
+        assert_eq!(timeout_kill_anchor(1_000, Some(5_000), None), 5_000);
+        assert_eq!(timeout_kill_anchor(9_000, Some(5_000), None), 9_000);
+        assert_eq!(timeout_kill_anchor(1_000, Some(5_000), Some(7_000)), 7_000);
     }
 
     #[test]
@@ -176,7 +231,10 @@ mod tests {
         ] {
             assert_eq!(state.as_str().parse::<JobState>().unwrap(), state);
         }
-        assert_eq!("prepared".parse::<AttemptState>().unwrap(), AttemptState::Prepared);
+        assert_eq!(
+            "prepared".parse::<AttemptState>().unwrap(),
+            AttemptState::Prepared
+        );
         assert!("bogus".parse::<JobState>().is_err());
     }
 }

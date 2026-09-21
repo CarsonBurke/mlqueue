@@ -2,6 +2,8 @@
 //! declared limits, the effective limit, protection, and why each queued
 //! job is not running.
 
+use std::cmp::Ordering;
+
 use anyhow::Result;
 use rusqlite::Connection;
 
@@ -15,11 +17,31 @@ use crate::protocol::{
 
 const TTS_NAME_LIMIT: usize = 80;
 
+fn status_job_order(a: &JobView, b: &JobView) -> Ordering {
+    fn group(job: &JobView) -> u8 {
+        if job.finished_at.is_some() {
+            4
+        } else {
+            match job.state.as_str() {
+                "running" => 0,
+                "starting" => 1,
+                "needs_attention" => 2,
+                _ => 3,
+            }
+        }
+    }
+
+    group(a).cmp(&group(b)).then_with(|| a.id.cmp(&b.id))
+}
+
 fn tts_name(name: &str) -> String {
     if name.chars().count() <= TTS_NAME_LIMIT {
         name.to_string()
     } else {
-        format!("{}…", name.chars().take(TTS_NAME_LIMIT - 1).collect::<String>())
+        format!(
+            "{}…",
+            name.chars().take(TTS_NAME_LIMIT - 1).collect::<String>()
+        )
     }
 }
 
@@ -148,7 +170,9 @@ pub fn job_view(
                 condition: dependency.condition,
                 parent_state: dependency.parent_state.as_str().to_string(),
                 resolution: dependency.resolution,
-                parent_outcome: dependency.parent_outcome.map(|outcome| outcome.as_str().to_string()),
+                parent_outcome: dependency
+                    .parent_outcome
+                    .map(|outcome| outcome.as_str().to_string()),
                 resolved_at: dependency.resolved_at,
             })
             .collect()
@@ -180,13 +204,21 @@ pub fn job_view(
     })
 }
 
-pub fn status_view(conn: &Connection, paths: &Paths, admission_blocked: bool) -> Result<StatusView> {
+pub fn status_view(
+    conn: &Connection,
+    paths: &Paths,
+    admission_blocked: bool,
+) -> Result<StatusView> {
     let leases = db::active_leases(conn)?;
     let reservation = db::active_reservation(conn)?;
-    let jobs = db::status_jobs(conn, 25)?
+    let mut jobs = db::status_jobs(conn, 25)?
         .iter()
         .map(|job| job_view(conn, paths, job, false))
         .collect::<Result<Vec<_>>>()?;
+    // Keep operational work ahead of recent terminal history. The machine
+    // stream includes finished jobs for context, but a consumer inspecting the
+    // first entry should not mistake that history for the active run.
+    jobs.sort_by(status_job_order);
     Ok(StatusView {
         jobs,
         active_leases: leases.len() as u32,
@@ -226,9 +258,12 @@ pub fn follow_tts_snapshot(conn: &Connection) -> Result<FollowTtsSnapshotView> {
         TTS_NAME_LIMIT as u32,
         MAX_INITIAL_RUNNING as u32,
     )?
-        .into_iter()
-        .map(|(id, name)| FollowTtsJobView { id, name: tts_name(&name) })
-        .collect();
+    .into_iter()
+    .map(|(id, name)| FollowTtsJobView {
+        id,
+        name: tts_name(&name),
+    })
+    .collect();
     Ok(FollowTtsSnapshotView {
         running_jobs,
         additional_running_jobs,

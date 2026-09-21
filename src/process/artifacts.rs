@@ -19,6 +19,11 @@ pub const IDENTITY_FILE: &str = "identity.json";
 pub const START_FILE: &str = "start";
 pub const EXEC_FILE: &str = "exec.json";
 pub const CANCEL_FILE: &str = "cancel.json";
+/// Live override of the launch-time wall-clock limit. Absent means the
+/// runner keeps the limit snapshotted in `command.json`.
+pub const LIMIT_FILE: &str = "limit.json";
+/// Written once, when a supervisor commits to timeout termination.
+pub const TIMEOUT_FILE: &str = "timeout.json";
 pub const RESULT_FILE: &str = "result.json";
 pub const RUNNER_LOCK_FILE: &str = "runner.lock";
 pub const RUNNER_LOG_FILE: &str = "runner.log";
@@ -40,9 +45,32 @@ pub struct CommandFile {
     pub start_wait_ms: u64,
     pub cancel_grace_ms: u64,
     pub poll_ms: u64,
-    /// Absent on artifacts created before wall-clock limits were supported.
+    /// Launch snapshot. A later `limit.json` overrides this for a live runner;
+    /// absent on artifacts created before wall-clock limits were supported.
     #[serde(default)]
     pub time_limit_ms: Option<u64>,
+}
+
+/// Upgradable wall-clock limit for an attempt that is already supervised.
+/// `time_limit_ms: null` clears the bound.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LimitFile {
+    pub token: String,
+    pub time_limit_ms: Option<u64>,
+    /// When this override was committed. Absent means the file predates the field.
+    #[serde(default)]
+    pub updated_at: Option<i64>,
+}
+
+/// Durable commitment that timeout termination has started. The daemon
+/// continues it if the runner dies, even if the job's limit is edited later.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimeoutFile {
+    pub token: String,
+    /// Wall-clock deadline (`command_started_at + limit`) that fired.
+    pub deadline: i64,
+    /// When SIGTERM was armed. SIGKILL waits one grace period after this.
+    pub observed_at: i64,
 }
 
 /// Written by the runner immediately after starting.
@@ -142,7 +170,8 @@ pub fn read_artifact<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, Arti
 
 /// Atomically publish an artifact. `exclusive` refuses to replace an existing
 /// file (used for one-shot markers like `start` and `result.json`);
-/// non-exclusive replacement is used for upgradable intent like `cancel.json`.
+/// non-exclusive replacement is used for upgradable intent like `cancel.json`
+/// and `limit.json`.
 pub fn write_artifact<T: Serialize>(
     dir: &Path,
     name: &str,
@@ -224,16 +253,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let start = StartFile { token: "t".into() };
         write_artifact(dir.path(), START_FILE, &start, true).unwrap();
-        let read: StartFile = read_artifact(&dir.path().join(START_FILE)).unwrap().unwrap();
+        let read: StartFile = read_artifact(&dir.path().join(START_FILE))
+            .unwrap()
+            .unwrap();
         assert_eq!(read.token, "t");
         // One-shot markers cannot be replaced.
         assert!(write_artifact(dir.path(), START_FILE, &start, true).is_err());
         // Upgradable intent can.
-        let cancel = CancelFile { token: "t".into(), force: false, requested_at: Some(1) };
+        let cancel = CancelFile {
+            token: "t".into(),
+            force: false,
+            requested_at: Some(1),
+        };
         write_artifact(dir.path(), CANCEL_FILE, &cancel, false).unwrap();
-        let cancel = CancelFile { token: "t".into(), force: true, requested_at: Some(2) };
+        let cancel = CancelFile {
+            token: "t".into(),
+            force: true,
+            requested_at: Some(2),
+        };
         write_artifact(dir.path(), CANCEL_FILE, &cancel, false).unwrap();
-        let read: CancelFile = read_artifact(&dir.path().join(CANCEL_FILE)).unwrap().unwrap();
+        let read: CancelFile = read_artifact(&dir.path().join(CANCEL_FILE))
+            .unwrap()
+            .unwrap();
         assert!(read.force);
     }
 
