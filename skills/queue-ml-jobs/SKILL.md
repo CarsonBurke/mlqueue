@@ -7,8 +7,30 @@ description: Queue and manage local machine-learning workloads with mlq. Use for
 
 - Submit managed workloads with `mlq submit`; never run them directly or bypass
   the queue.
-- You may want to follow the job with `mlq wait JOB`.
+- Use `mlq follow JOB` instead of the removed `wait` command. It subscribes until
+  the final outcome or a 55-minute observation timeout, and exits with the
+  command's status (or `128 + signal`) on completion. Plain `follow` prints only
+  final output: no polling, heartbeats, log tails, hooks, checks, or LLM calls.
+  On timeout it prints `follow timed out after 55 minutes` and exits `124`;
+  the job is untouched. `--timeout DURATION` overrides the observation duration.
+- The 55-minute default leaves headroom for a 60-minute agent KV-cache TTL.
+  After timeout, reassess: reattach with `mlq follow JOB` only if waiting is still
+  useful; otherwise record the job ID and stop following. Never resubmit or retry
+  the workload solely because following timed out. Avoid an unattended shell
+  loop around `follow`: return control to the agent between observation windows.
+- Opt into intermediate events only when actionable: `--events started,retry`
+  or an explicit `--config follow.toml`. Checks require `warning` selection.
+  `--only-finish` overrides intermediate events/checks; `--no-hooks` also disables
+  explicitly configured finish notifications. `--json` emits compact NDJSON,
+  not full job history; use `show JOB --json` for detail. Never poll an LLM to
+  interpret metrics.
 - You may need to start `mlqd` if it fails.
+- When authorized to update this installation, build with `cargo build --release
+  --locked`, then `mlq-update stage --mlqd target/release/mlqd` before upgrading
+  the CLI with `cargo install --path . --locked --force --bin mlq`. The configured
+  updater activates only when no unfinished jobs or active leases remain.
+  Do not directly replace/restart a busy daemon or install both binaries.
+  `mlq-update status` shows the pending candidate; staging never fetches Git.
 - Keep each workload and its descendants foregrounded in the runner's process
   group. Restructure commands that daemonize or call `setsid`.
 - Choose `--max-parallel-runs N` explicitly for every submission. It asserts
@@ -35,9 +57,10 @@ mlq submit --name NAME --max-parallel-runs N \
 - For sequential or conditional work, use durable queue dependencies:
   `--after-success JOB` runs only after a successful prerequisite, while
   `--after-terminal JOB` runs after any terminal outcome. Repeat flags for an
-  AND gate. Use `mlq wait` in the submitter for metric gates, output-derived
-  commands, or other conditions the queue cannot express.
-- Don't waste tokens constantly polling.
+  AND gate. Use `mlq follow` in the submitter for output-derived commands, or
+  explicitly configure cheap local warning checks for metric conditions. Checks
+  notify; they never cancel/retry the job. Keep keys stable and advance metric
+  steps only for new observations so persistent findings do not waste tokens.
 - Pass required environment explicitly. Values supplied through `--env` are
   stored as plaintext; make workloads read secrets from credential files.
 - Change a queued or running job with
@@ -47,6 +70,12 @@ mlq submit --name NAME --max-parallel-runs N \
 - Change a queued or held job's order with `mlq set-priority JOB P`. Running
   jobs cannot change priority (no preemption). Do not raise priority merely to
   jump the queue for your own work.
+- Change a queued or running job's wall-clock bound with
+  `mlq set-time-limit JOB DURATION`, or remove it with `--clear`. The clock
+  stays anchored at command spawn. Shortening below the time already elapsed
+  stops that attempt; once termination has started, extending it does not
+  revive the attempt. An earlier cancellation stays cancelled. Later retries
+  use the updated limit.
 - Use `mlq status`, `show`, `see`, and `logs` to observe work, and `cancel` or
   `retry` to control it. Report the submitted job ID, chosen parallel limit,
   chosen time limit (or the decision to leave it unlimited), and any nonzero

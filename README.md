@@ -27,6 +27,48 @@ mlq --version
 mlq daemon status
 ```
 
+### Stage daemon updates for downtime
+
+`mlq` can be installed immediately. On a busy machine, stage `mlqd` instead of
+replacing it with `cargo install` while runs are active. The optional updater
+requires Python 3.11+ and a persistent systemd user daemon with `KillMode=process`.
+
+```bash
+./contrib/mlq-update install          # one-time: installs ~/.local/bin/mlq-update
+cargo build --release --locked
+mlq-update stage --mlqd target/release/mlqd
+cargo install --path . --locked --force --bin mlq
+mlq-update status
+```
+
+Stage before upgrading the CLI: staging saves a compatible observer alongside
+the immutable daemon candidate. No Git fetching, automatic builds, or unfinished
+source edits are installed. Staging another candidate replaces the pending one.
+
+The enabled `mlqd-update.path` unit starts an updater only when an update is
+pending. It subscribes quietly until there are **no unfinished jobs and no active
+leases**, including held jobs, delayed retries, and recovery states. It does not
+pause, cancel, or reorder work. At downtime it stops only the daemon, takes its
+singleton lock, rechecks the database, atomically replaces the executable, and
+starts the service again. A submission racing shutdown defers the replacement;
+existing workers survive. Clients may briefly disconnect during activation.
+
+Pending updates survive logout/reboot. Connection failures retry after 30 seconds;
+there is no queue polling while subscribed. Interrupted activation records
+restart intent so the updater can restore the service on its next start.
+The previous executable is retained at
+`~/.local/state/mlqueue-updates/previous-mlqd` (or under `$XDG_STATE_HOME`).
+Failed readiness retains the pending update for inspection; there is no automatic
+binary downgrade across potentially incompatible database migrations.
+
+```bash
+systemctl --user status mlqd-update.path mlqd-update.service
+journalctl --user -u mlqd-update.service
+# Disable automatic activation (the staged candidate remains available):
+systemctl --user disable --now mlqd-update.path
+systemctl --user stop mlqd-update.service
+```
+
 ## Quick start
 
 ```bash
@@ -51,7 +93,7 @@ mlq show 1
 mlq see 1                 # detail plus latest stdout
 mlq see                   # most recently submitted job
 mlq logs 1 --follow       # exit code matches the attempt
-mlq wait 1                # block until terminal; exit 0 / exit-code / 128+sig
+mlq follow 1              # subscribe; print only the final outcome
 mlq cancel 1              # SIGTERM; add --force for SIGKILL after grace
 mlq pause                 # no new starts; queued work waits; running work continues
 mlq unpause               # resume admission
@@ -126,13 +168,14 @@ mlq set-priority 12 2     # retune queued or held job only
 | `show JOB` | Full job detail and attempts |
 | `see [JOB]` | Job detail and latest stdout; latest job if omitted |
 | `logs JOB` | Stdout/stderr; `--follow` exits with attempt outcome |
-| `wait JOB` | Block until terminal (`--timeout`, exit codes below) |
+| `follow JOB` | Subscribe; final outcome only by default, opt-in events/checks/hooks |
 | `cancel JOB` | Cancel; `--force` escalates to SIGKILL after grace |
 | `hold` / `release` | Park and restore a queued job |
 | `pause` / `unpause` | Stop / resume new starts (running work continues) |
 | `retry JOB` | Requeue a failed or lost job |
 | `set-max-parallel-runs JOB N` | Change limit on queued **or live** jobs |
 | `set-priority JOB P` | Change priority on **queued/held** jobs only |
+| `set-time-limit JOB DURATION` | Change (`--clear` removes) the wall-clock limit on queued **or live** jobs |
 | `follow-tts` | Speak completions and newly running work via local `tts` |
 | `daemon …` | `status` / `run` / `install` / `uninstall` |
 | `recover …` | List or resolve orphaned/quarantined attempts |
@@ -155,8 +198,14 @@ period, and records a failed attempt; normal retry policy still applies.
 The detached runner enforces the limit across daemon restarts; if that runner
 dies, the daemon resumes enforcement from the persisted command start time.
 As with any failed attempt, a separate user cancellation suppresses retries.
+`mlq set-time-limit JOB DURATION` changes that bound for a queued job or one
+that is already running. The clock does not restart: shortening below the
+elapsed time begins termination, lengthening extends it, and `--clear`
+removes it. A termination that has already started is not reversed, including
+when the runner dies during its grace period. An earlier cancellation stays a
+cancellation. Automatic retries use the updated limit.
 
-### `wait` and `logs --follow` exit codes
+### `follow` and `logs --follow` exit codes
 
 | Outcome | Exit |
 |---|---|
@@ -164,7 +213,123 @@ As with any failed attempt, a separate user cancellation suppresses retries.
 | Command failed | command’s exit code |
 | Killed by signal | `128 + signal` |
 | Skipped, lost, cancelled, or failed before launch | `1` |
-| `--timeout` expired | `124` |
+| Observation timeout expired (`follow`: 55 minutes by default) | `124` |
+
+### Quiet job following
+
+```bash
+mlq follow 42                         # only final outcome; no scripts
+mlq follow 42 --json                  # one compact final NDJSON event
+mlq follow 42 --events started,retry   # opt into starts and retries too
+mlq follow 42 --config ./follow.toml   # explicitly selected configuration
+mlq follow 42 --config ./follow.toml --only-finish
+mlq follow 42 --config ./follow.toml --no-hooks --no-checks
+```
+
+`follow` replaces `wait`: it blocks on one job-scoped subscription until the job
+is terminal or 55 minutes elapse, preserving outcome exit codes without polling.
+Override the observation duration with `--timeout DURATION`. The default leaves
+five minutes of headroom for agents with a 60-minute KV-cache TTL.
+On expiry it prints only `follow timed out after 55 minutes` to stderr (using
+the configured duration in minutes) and exits `124`, including in JSON mode.
+The job stays queued or running. Reattach with `mlq follow JOB` if waiting is
+still useful; otherwise record the job ID and stop following. Do not resubmit
+or retry the workload just because observation timed out.
+No heartbeats, progress chatter, log tails, repeated snapshots, or LLM calls.
+Final output is always included. `--events` replaces the configuration's
+intermediate-event selection; `--only-finish` wins over both. No configuration
+is discovered automatically. Attaching to an already-running attempt does not
+replay its start. Retries do not finish the follower; a final job outcome does.
+`follow --json` emits compact NDJSON rather than the old `wait --json` full job
+detail; use `show JOB --json` when attempt history is needed.
+Daemon disconnection is an error, not success; neither a timeout nor
+stopping the follower cancels the job. Restarting the CLI starts a new monitoring
+session, without historical notification replay or persisted warning state.
+`--timeout` bounds waiting for the job, not finish-hook delivery after its outcome
+is known. Finish hooks retain their own configured timeouts and cannot change
+the job's exit status.
+
+Available opt-in events: `started` (actually running), `retry` (another attempt
+scheduled), `attention` (operator recovery required), and `warning` (local check
+finding). An existing recovery condition is reported once on attachment if
+`attention` is selected.
+
+Example explicit `follow.toml`:
+
+```toml
+events = ["warning", "attention"] # final outcome is always included
+
+[[checks]]
+id = "returns"
+command = ["./check-returns"]
+every = "60s"                    # default; runs only while actually running
+timeout = "5s"                   # default
+clear_after = 2                  # default: fresh healthy observations to rearm
+
+[[hooks]]
+events = ["warning", "finished"]
+command = ["./notify-supervisor"]
+timeout = "5s"
+```
+
+Checks run **only when `warning` is selected**. Merely listing a check does not
+enable it. Hooks run only for events selected by both the follower and the hook.
+`--only-finish` skips all checks and intermediate hooks; an explicitly configured
+finish hook still runs. Add `--no-hooks` to disable that too. Invalid/unknown
+configuration is rejected even when an override disables execution.
+Only use configurations and scripts you trust: commands execute with your user
+permissions, not in a security sandbox.
+
+Commands are argv arrays, not shell snippets. Executable paths containing `/`
+resolve relative to the configuration file; bare names use `PATH`. Arguments
+and working directory are not rewritten: commands inherit the follower's cwd
+and environment. Use JSON `cwd`/`logDir` to locate the job's artifacts. Commands
+receive one JSON object on stdin:
+
+- Checker context: `{"job":42,"attempt":1,"state":"running","cwd":"/project","logDir":"/state/attempts/7"}`.
+- Hook context: the same compact event printed by `follow --json`.
+
+A checker returns a JSON object on stdout; no findings means healthy:
+
+```json
+{"step":18400,"findings":[{"key":"returns-ema-declining","message":"Return EMA declined across 20 evaluations"}]}
+```
+
+Return `{"step":18500,"findings":[]}` for a healthy new observation. The optional
+top-level `step` must advance before a result counts as a new observation;
+re-reading the same step cannot trigger or clear a warning. A finding may also
+carry `step` as evidence. Metric parsing, EMA windows, and “higher is better”
+belong to the project checker, not the scheduler. Check only new metric records
+where possible; don't reread whole training logs or call an LLM every minute.
+
+Notification bounds:
+
+- Findings deduplicate by check ID and stable key within an attempt, regardless
+  of changed wording or numbers. Persistent conditions do not produce reminders.
+- A key rearms only after `clear_after` successful fresh observations omit it.
+  Failed checks do not clear active findings. A new attempt resets check state.
+- Across all checks, at most one warning batch per minute, with at most eight
+  findings. Excess findings are suppressed, not queued for a later burst; the
+  final event includes `suppressedWarnings` when nonzero.
+- Notification messages are capped at 240 characters. A broken checker reports
+  one diagnostic until it recovers; hook errors produce one stderr diagnostic
+  per follower session. Raw command stdout/stderr is never forwarded.
+- Config, command input, and stdout are bounded to 64 KiB each. There are at most
+  32 checks/hooks, 64 findings per check response, and 256 active keys per check.
+  Check intervals range from 1 second to 7 days; command timeouts are positive
+  and at most 5 minutes. Each check/hook stage runs serially; at most one check
+  and one notification command can execute concurrently.
+- Hooks have an eight-event mailbox and never block job observation. Overflow
+  is discarded and counted as `suppressedHooks` in the final output. Intermediate
+  hook delivery is best-effort: final output preempts queued/in-flight intermediate
+  hooks, then runs explicitly selected finish hooks.
+- A job transition interrupts in-flight checks. Timeouts, SIGINT, SIGTERM, and
+  closed output pipes clean up command process groups. SIGKILL cannot run cleanup;
+  scripts must not daemonize or escape their groups. Commands never run inside
+  `mlqd`; findings and hook failures never trigger automatic job mutations.
+
+Stdout updates only wake an LLM if its harness supports streaming notifications.
+For other harnesses, explicitly configure a hook targeting its notification API.
 
 ### `subscribe` for programmatic consumers
 
@@ -177,6 +342,9 @@ queue snapshot per line** (NDJSON, flushed immediately): the current state right
 away, then a new line whenever the queue changes — submission, state transition,
 lease change, priority or limit change. Each line is the daemon's raw `status`
 payload, which (unlike `mlq status --json`) still carries recently finished jobs.
+Jobs are ordered with running work first, then other live work, then recent
+finished history. Consumers should still select by `state` rather than relying
+on a particular job ID or assuming there is only one running job.
 Consumers never replay events; bursts are coalesced into the newest snapshot
 instead of a backlog, and a refresh identical to the previous line is skipped.
 
@@ -193,6 +361,11 @@ supervisor can restart it. Streams are budgeted at a quarter of
 atomically. Lowering a limit below the current number of active leases is
 allowed: existing work keeps running (no preemption), and the scheduler
 refuses new admissions until the active set drains to a compatible size.
+
+`set-time-limit` updates the job immediately and publishes the new bound to
+the live runner, which adopts it on its next poll. The same value is what a
+later attempt is launched with. Lowering a limit that has already expired
+stops that attempt. Other leases are left running.
 
 ### Pausing the queue
 

@@ -155,6 +155,7 @@ drained for the window so they cannot hold it open forever.
 |---|---|---|
 | `set-max-parallel-runs` | queued, held, starting, running, needs_attention | Live path updates job + attempt + lease atomically; lowering may leave the set temporarily oversubscribed until excess leases drain |
 | `set-priority` | queued, held only | No preemption; invalidates reservation if the protected job’s priority changes |
+| `set-time-limit` | queued, held, starting, running, needs_attention | Replaces the per-attempt wall-clock limit (`--clear` removes it). A live runner adopts the new deadline, still measured from command spawn, on its next poll. A limit already in the past begins termination; the runner records that commitment, and a later extension does not revive the attempt even if the runner then dies. An earlier cancellation stays a cancellation. On an orphan, a limit just moved into the past still gets the full SIGTERM grace; a limit that was already in force is enforced from its original deadline. Later attempts use the updated limit |
 | `hold` | queued | Invalidates reservation if protected |
 | `cancel` | most states | Before start → terminal; after start → signal process group |
 | `pause` / `unpause` | always | Durable operator gate. Submissions still enqueue; running leases continue; the scheduler issues no new leases until unpause. Pause survives daemon restart. |
@@ -225,6 +226,42 @@ being request/response and becomes a one-way stream of `status` replies.
 - Purely additive: no new reply type, no view change, so `PROTOCOL_VERSION`
   stays 8. An older daemon rejects `subscribe` as a malformed request.
 
+### Job event subscriptions and local following
+
+`{"op":{"type":"subscribe_job","job":42}}` opens a job-scoped stream of
+`job_update` replies. Its initial read transaction captures the current compact
+job snapshot (latest attempt only) and the global event head together, with no
+historical event replay. Supplying `after` resumes after that durable cursor.
+This additive operation does not change existing request/reply shapes; protocol
+version stays 8. Older daemons reject the new operation; update `mlqd` with `mlq`.
+
+Each update contains `job`, `cursor`, `events`, and `hasMore`. Event pages use the
+existing job index with a cursor seek, at most 256 records plus lookahead, and
+shrink further when needed to fit a frame. `hasMore` drains immediately; consumers
+must drain the backlog before treating the current snapshot as terminal. Unlike
+queue snapshots, job lifecycle events are not discarded when watch wakeups
+coalesce: even a brief running transition remains in the durable log.
+Unrelated queue revisions do not emit job frames. Subscription quotas, peer UID
+checks, framing, disconnect detection, and slow-reader timeouts are shared.
+
+`mlq follow` uses this stream with no job-state polling. Observation has a
+55-minute default deadline, overridable with `--timeout`; expiry exits `124`
+without mutating the job. The deadline spans queueing, execution, and retries,
+but not finish-hook delivery after a terminal outcome is known. The async
+client keeps an in-progress frame read pinned across local timer ticks; cancelling
+a partial `read_exact` would otherwise desynchronize framing. EOF before a terminal
+snapshot is an error. Final output uses the compact terminal snapshot; full
+attempt history is available separately through `show --json`.
+
+The follower owns explicitly selected TOML checks and notification hooks, never
+the daemon. Default output is only the final outcome. Checks are enabled only by
+selecting warning events, run only while running, and commit deduplication state
+after an async batch completes so an interrupted batch cannot consume unseen
+warnings. Stable keys, fresh-step clearance, and a per-session warning budget
+bound notifications before a hook or LLM sees them. A single-threaded Tokio runtime
+handles subscription I/O, opt-in timers, and bounded subprocesses. Neither command
+output nor queue snapshots are forwarded wholesale to an overseeing agent.
+
 ## Filesystem layout
 
 XDG conventions (overridable in tests):
@@ -239,6 +276,8 @@ $XDG_STATE_HOME/mlqueue/attempts/<id>/
   start                 # launch authorization marker
   exec.json             # command identity / running
   cancel.json
+  limit.json            # live time-limit override; absent means command.json still applies
+  timeout.json          # written once, when timeout termination starts
   result.json
 $XDG_CONFIG_HOME/mlqueue/config.toml
 ```
