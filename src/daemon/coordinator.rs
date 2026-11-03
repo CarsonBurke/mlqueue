@@ -89,10 +89,6 @@ enum PostAction {
         time_limit_ms: Option<u64>,
         updated_at: i64,
     },
-    SignalGroup {
-        pgid: i32,
-        signal: i32,
-    },
 }
 
 pub struct Coordinator {
@@ -492,9 +488,6 @@ impl Coordinator {
             } => {
                 publish_time_limit(&self.paths, attempt_id, &token, time_limit_ms, updated_at);
             }
-            PostAction::SignalGroup { pgid, signal } => unsafe {
-                libc::killpg(pgid, signal);
-            },
         }
     }
 
@@ -535,13 +528,17 @@ impl Coordinator {
             Ok(None) => {}
         }
 
-        // Republish committed cancellation intent (crash between commit and
-        // publication, or daemon restart).
+        // Republish the current committed intent, including force upgrades.
+        // An older valid artifact may survive a crash between the upgrade's
+        // database commit and its publication.
         if attempt.cancel_requested
             && !attempt.state.is_terminal()
             && !matches!(
                 artifacts::read_artifact::<CancelFile>(&dir.join(CANCEL_FILE)),
-                Ok(Some(_))
+                Ok(Some(cancel))
+                    if cancel.token == attempt.launch_token
+                        && cancel.force == attempt.cancel_force
+                        && cancel.requested_at == attempt.cancel_requested_at
             )
         {
             let _ = artifacts::write_artifact(
@@ -2050,16 +2047,10 @@ fn cancel_job(
                         requested_at,
                     }])
                 }
-                // No runner remains; the daemon delivers the signal itself
-                // and reconcile finalizes once the group drains.
-                AttemptState::Orphaned => Ok(attempt
-                    .cmd_pgid
-                    .map(|pgid| PostAction::SignalGroup {
-                        pgid,
-                        signal: libc::SIGTERM,
-                    })
-                    .into_iter()
-                    .collect()),
+                // Reconcile checks the group's boot and leader identity
+                // before signalling. A bare pgid here could already name an
+                // unrelated group that reused the original number.
+                AttemptState::Orphaned => Ok(Vec::new()),
                 AttemptState::Quarantined => Err(ApiError::new(
                     error_codes::UNSAFE_RESOLUTION,
                     format!(
@@ -2205,6 +2196,76 @@ mod tests {
             poll_ms: 10,
             time_limit_ms: limit,
         }
+    }
+
+    fn submission(cwd: &std::path::Path) -> SubmitParams {
+        SubmitParams {
+            name: "test-job".into(),
+            cwd: cwd.display().to_string(),
+            args: vec!["true".into()],
+            env: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
+            max_parallel_runs: 1,
+            priority: 0,
+            max_attempts: 1,
+            retry_delay_ms: 0,
+            time_limit_ms: None,
+            dependencies: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn cancelling_an_orphan_does_not_signal_a_reused_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            runtime_dir: dir.path().join("runtime"),
+            state_dir: dir.path().join("state"),
+            config_file: dir.path().join("config.toml"),
+        };
+        let conn = db::open_in_memory().unwrap();
+        let params = submission(dir.path());
+        let now = now_ms();
+        let job = db::insert_job(&conn, &params, now).unwrap();
+        let row = db::job_row(&conn, job).unwrap().unwrap();
+        let attempt = db::create_attempt_with_lease(&conn, &row, "token", now).unwrap();
+
+        // A new, unrelated group now owns the old numeric pgid. Its start
+        // time proves that it cannot be the command recorded by the attempt.
+        let mut unrelated = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = unrelated.id() as i32;
+        let stat = identity::proc_stat(pid).unwrap();
+        db::set_attempt_runner_identity(
+            &conn,
+            attempt.id,
+            pid,
+            stat.start_time,
+            &identity::boot_id().unwrap(),
+        )
+        .unwrap();
+        db::set_attempt_running(&conn, attempt.id, pid, pid, stat.start_time + 1, now, now)
+            .unwrap();
+        db::set_attempt_state(&conn, attempt.id, AttemptState::Orphaned, None).unwrap();
+        db::update_job_state(&conn, job, JobState::NeedsAttention, None, now).unwrap();
+
+        let mut coordinator = Coordinator::new(conn, Config::default(), paths).unwrap();
+        let result = coordinator.handle_mutation(&Op::Cancel { job, force: true }, "cancel");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let unrelated_status = unrelated.try_wait().unwrap();
+        let _ = unrelated.kill();
+        let _ = unrelated.wait();
+        result.unwrap();
+        assert!(
+            unrelated_status.is_none(),
+            "cancellation killed an unrelated group"
+        );
+        assert_eq!(
+            db::job_row(&coordinator.conn, job).unwrap().unwrap().state,
+            JobState::Cancelled
+        );
+        assert!(db::active_leases(&coordinator.conn).unwrap().is_empty());
     }
 
     #[test]

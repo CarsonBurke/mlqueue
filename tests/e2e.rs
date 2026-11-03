@@ -1603,6 +1603,53 @@ fn force_cancel_escalates_to_sigkill_after_grace() {
 }
 
 #[test]
+fn restart_republishes_a_force_upgrade_over_an_older_cancel_artifact() {
+    let mut q = TestQueue::new();
+    let job = q.submit(
+        &["--name", "force-upgrade-recovery"],
+        &[
+            "sh",
+            "-c",
+            "trap '' TERM; touch force-cancel-ready; exec sleep 30",
+        ],
+    );
+    q.wait_state(job, "running", Duration::from_secs(10));
+    wait_for("command to ignore TERM", Duration::from_secs(10), || {
+        q.dir.path().join("force-cancel-ready").exists()
+    });
+    q.cli(&["cancel", &job.to_string()]);
+    let detail = q.job(job);
+    let cancel_path =
+        PathBuf::from(detail["attempts"][0]["logDir"].as_str().unwrap()).join("cancel.json");
+    let original: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cancel_path).unwrap()).unwrap();
+    assert_eq!(original["force"], false);
+
+    // Model a crash after the force upgrade commits but before publication.
+    // The detached runner keeps supervising the TERM-ignoring command.
+    q.kill_daemon();
+    {
+        let conn = mlqueue::db::open(&q.state_dir().join("mlqueue.db")).unwrap();
+        assert_eq!(
+            conn.execute(
+                "UPDATE attempts SET cancel_force = 1 WHERE job_id = ?1",
+                [job],
+            )
+            .unwrap(),
+            1
+        );
+    }
+    q.start_daemon();
+
+    q.wait_state(job, "cancelled", Duration::from_secs(10));
+    let recovered: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cancel_path).unwrap()).unwrap();
+    assert_eq!(recovered["force"], true);
+    assert_eq!(recovered["requested_at"], original["requested_at"]);
+    assert_eq!(q.job(job)["attempts"][0]["termSignal"], libc::SIGKILL);
+}
+
+#[test]
 fn idempotency_key_replays_and_conflicts() {
     let q = TestQueue::new();
     let args = |name: &str| {
