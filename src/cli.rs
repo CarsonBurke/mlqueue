@@ -607,6 +607,11 @@ fn submit(paths: &Paths, args: SubmitArgs, key: String) -> Result<()> {
             Ok(millis)
         })
         .transpose()?;
+    let retry_delay_ms = args
+        .retry_delay
+        .map(|delay| u64::try_from(delay.as_millis()).context("--retry-delay is too large"))
+        .transpose()?
+        .unwrap_or(0);
     let params = SubmitParams {
         name,
         cwd: cwd.display().to_string(),
@@ -615,10 +620,7 @@ fn submit(paths: &Paths, args: SubmitArgs, key: String) -> Result<()> {
         max_parallel_runs: args.max_parallel_runs,
         priority: args.priority,
         max_attempts: args.max_attempts,
-        retry_delay_ms: args
-            .retry_delay
-            .map(|delay| delay.as_millis() as u64)
-            .unwrap_or(0),
+        retry_delay_ms,
         time_limit_ms,
         dependencies: args
             .after_terminal
@@ -1537,6 +1539,32 @@ fn shell_join(args: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn submit_rejects_a_retry_delay_that_overflows_milliseconds() {
+        let cli = Cli::try_parse_from([
+            "mlq",
+            "submit",
+            "--retry-delay",
+            "18446744073709551615s",
+            "--",
+            "true",
+        ])
+        .unwrap();
+        let Command::Submit(args) = cli.command else {
+            panic!("expected submit")
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            runtime_dir: temp.path().join("runtime"),
+            state_dir: temp.path().join("state"),
+            config_file: temp.path().join("config.toml"),
+        };
+        assert_eq!(
+            submit(&paths, args, "test".into()).unwrap_err().to_string(),
+            "--retry-delay is too large"
+        );
+    }
 
     fn event(id: i64, job: JobId, name: &str, event_type: &str) -> EventView {
         EventView {

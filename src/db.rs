@@ -483,7 +483,7 @@ pub fn insert_job(conn: &Connection, params: &SubmitParams, now: i64) -> Result<
             params.max_parallel_runs,
             params.priority,
             params.max_attempts,
-            params.retry_delay_ms as i64,
+            i64::try_from(params.retry_delay_ms)?,
             params.time_limit_ms.map(i64::try_from).transpose()?,
             now,
         ],

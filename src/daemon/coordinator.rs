@@ -1091,8 +1091,8 @@ impl Coordinator {
                     }
                     AttemptState::Failed => {
                         if job.attempt_count < job.max_attempts && !attempt.cancel_requested {
-                            let not_before =
-                                (job.retry_delay_ms > 0).then(|| now + job.retry_delay_ms);
+                            let not_before = (job.retry_delay_ms > 0)
+                                .then(|| now.saturating_add(job.retry_delay_ms));
                             db::update_job_state(&tx, job.id, JobState::Queued, message, now)?;
                             db::set_job_retry_not_before(&tx, job.id, not_before, now)?;
                             db::clear_job_readiness(&tx, job.id, now)?;
@@ -2104,6 +2104,9 @@ fn validate_submission_fs(params: &SubmitParams) -> ApiResult<()> {
     if params.max_attempts == 0 {
         return Err(invalid("maxAttempts must be a positive integer".into()));
     }
+    if i64::try_from(params.retry_delay_ms).is_err() {
+        return Err(invalid("retryDelayMs is too large".into()));
+    }
     if params.time_limit_ms == Some(0) {
         return Err(invalid("timeLimitMs must be a positive integer".into()));
     }
@@ -2151,9 +2154,11 @@ fn validate_submission_fs(params: &SubmitParams) -> ApiResult<()> {
             )));
         }
     } else {
-        let path = params.env.get("PATH").map(String::as_str).unwrap_or("");
-        let found = std::env::split_paths(path)
-            .any(|dir| !dir.as_os_str().is_empty() && dir.join(executable).is_file());
+        // The runner changes directory before exec. Relative PATH entries,
+        // including an empty component denoting '.', use that same cwd.
+        let found = params.env.get("PATH").is_some_and(|path| {
+            std::env::split_paths(path).any(|dir| cwd.join(dir).join(executable).is_file())
+        });
         if !found {
             return Err(invalid(format!(
                 "executable {executable} not found on the persisted PATH"
@@ -2211,6 +2216,55 @@ mod tests {
             time_limit_ms: None,
             dependencies: Vec::new(),
         }
+    }
+
+    #[test]
+    fn retry_delays_outside_the_persisted_range_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut params = submission(dir.path());
+        params.retry_delay_ms = i64::MAX as u64 + 1;
+        let error = validate_submission_fs(&params).unwrap_err();
+        assert_eq!(error.code, error_codes::INVALID_ARGUMENT);
+        assert!(error.message.contains("retryDelayMs"));
+        assert!(db::insert_job(&db::open_in_memory().unwrap(), &params, now_ms()).is_err());
+    }
+
+    #[test]
+    fn retry_deadlines_saturate_instead_of_overflowing_the_coordinator() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            runtime_dir: dir.path().join("runtime"),
+            state_dir: dir.path().join("state"),
+            config_file: dir.path().join("config.toml"),
+        };
+        let conn = db::open_in_memory().unwrap();
+        let mut params = submission(dir.path());
+        params.max_attempts = 2;
+        params.retry_delay_ms = i64::MAX as u64;
+        validate_submission_fs(&params).unwrap();
+        let now = now_ms();
+        let job = db::insert_job(&conn, &params, now).unwrap();
+        let row = db::job_row(&conn, job).unwrap().unwrap();
+        let attempt = db::create_attempt_with_lease(&conn, &row, "token", now).unwrap();
+        let mut coordinator = Coordinator::new(conn, Config::default(), paths).unwrap();
+        coordinator
+            .finalize_attempt_and_job(
+                &attempt,
+                AttemptState::Failed,
+                Some(1),
+                None,
+                None,
+                "runner",
+            )
+            .unwrap();
+        let row = db::job_row(&coordinator.conn, job).unwrap().unwrap();
+        assert_eq!(row.state, JobState::Queued);
+        assert_eq!(row.retry_not_before, Some(i64::MAX));
+        assert!(
+            db::eligible_candidates(&coordinator.conn, now_ms())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

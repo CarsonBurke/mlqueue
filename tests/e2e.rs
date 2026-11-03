@@ -1047,6 +1047,28 @@ fn submit_resolves_relative_executables_against_the_job_cwd() {
 }
 
 #[test]
+fn submit_resolves_relative_and_empty_path_entries_against_the_job_cwd() {
+    let q = TestQueue::new();
+    let bin = q.dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    for script in [
+        bin.join("mlq-path-command"),
+        q.dir.path().join("mlq-path-command"),
+    ] {
+        std::fs::write(&script, "#!/bin/sh\necho path-command-marker\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    for path in ["PATH=bin", "PATH=", "PATH=/does/not/exist:"] {
+        let job = q.submit(&["--env", path], &["mlq-path-command"]);
+        q.wait_state(job, "succeeded", Duration::from_secs(10));
+        assert!(
+            q.cli(&["logs", &job.to_string()])
+                .contains("path-command-marker")
+        );
+    }
+}
+
+#[test]
 fn status_displays_long_job_names() {
     let q = TestQueue::new();
     let name = "long-job-name-now-fits-in-status";
