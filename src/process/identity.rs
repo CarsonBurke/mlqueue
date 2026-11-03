@@ -18,6 +18,8 @@ pub struct ProcStat {
     pub pgrp: i32,
     /// Kernel `starttime` in clock ticks since boot (field 22).
     pub start_time: i64,
+    /// Exited but not yet reaped (state `Z`, or `X` while being torn down).
+    pub zombie: bool,
 }
 
 /// Parse `/proc/<pid>/stat`, robust to whitespace and parentheses in comm.
@@ -34,23 +36,31 @@ fn parse_stat(pid: i32, raw: &str) -> Option<ProcStat> {
     let fields: Vec<&str> = rest.split_whitespace().collect();
     Some(ProcStat {
         pid,
+        zombie: matches!(*fields.first()?, "Z" | "X"),
         pgrp: fields.get(2)?.parse().ok()?,
         start_time: fields.get(19)?.parse().ok()?,
     })
 }
 
 /// Whether a recorded (pid, start_time, boot_id) triple still names a live
-/// process. A recycled PID fails the start-time or boot comparison.
+/// process. A recycled PID fails the start-time or boot comparison, and an
+/// exited one awaiting reaping (a zombie, whose reaper may itself be hung) is
+/// not alive.
 pub fn identity_alive(pid: i32, start_time: i64, recorded_boot_id: &str) -> bool {
     match boot_id() {
         Ok(current) if current == recorded_boot_id => {}
         _ => return false,
     }
-    matches!(proc_stat(pid), Some(stat) if stat.start_time == start_time)
+    matches!(proc_stat(pid), Some(stat) if stat.start_time == start_time && !stat.zombie)
 }
 
-/// PIDs currently in the given process group, from a full `/proc` scan.
-/// Includes zombies: an unreaped member still pins the group.
+/// PIDs of the live processes in the given process group, from a full
+/// `/proc` scan. Zombies are left out: an exited member runs no code and holds
+/// no memory, files or devices, so a group of zombies has drained. Their
+/// reaping is up to their parent, which after an orphaning is the subreaper or
+/// init; waiting on it would let a hung init hold a lease forever. Leaving them
+/// out keeps the recycling guarantee below, since the kernel keeps a pgid
+/// allocated while any member, zombie or not, still belongs to the group.
 pub fn group_members(pgid: i32) -> Vec<i32> {
     let Ok(entries) = fs::read_dir("/proc") else {
         return Vec::new();
@@ -58,7 +68,7 @@ pub fn group_members(pgid: i32) -> Vec<i32> {
     entries
         .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<i32>().ok())
         .filter_map(proc_stat)
-        .filter(|stat| stat.pgrp == pgid)
+        .filter(|stat| stat.pgrp == pgid && !stat.zombie)
         .map(|stat| stat.pid)
         .collect()
 }
@@ -114,6 +124,34 @@ mod tests {
         let stat = parse_stat(1234, raw).unwrap();
         assert_eq!(stat.pgrp, 1234);
         assert_eq!(stat.start_time, 5555);
+        assert!(!stat.zombie);
+        let raw = "1234 (a Z b) Z 1 1234 1234 0 -1 4194304 100 0 0 0 0 0 0 0 20 0 1 0 5555 0 0";
+        assert!(parse_stat(1234, raw).unwrap().zombie);
+    }
+
+    #[test]
+    fn an_unreaped_process_is_not_alive_and_does_not_keep_its_group_alive() {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("true")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        // Unreaped until `wait` below: it turns into a zombie in its own group.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !proc_stat(pid).unwrap().zombie {
+            assert!(std::time::Instant::now() < deadline, "child never exited");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(proc_stat(pid).unwrap().pgrp, pid);
+        assert!(group_empty(pid));
+        let boot = boot_id().unwrap();
+        assert!(!identity_alive(
+            pid,
+            proc_stat(pid).unwrap().start_time,
+            &boot
+        ));
+        child.wait().unwrap();
     }
 
     #[test]
