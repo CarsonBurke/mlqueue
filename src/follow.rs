@@ -18,6 +18,8 @@ use crate::follow_checks::{self, CheckRunner, FollowConfig, HookConfig};
 use crate::paths::Paths;
 use crate::protocol::JobView;
 
+mod output;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub(crate) enum EventKind {
     Started,
@@ -105,20 +107,27 @@ pub(crate) fn run(paths: &Paths, args: FollowArgs) -> Result<i32> {
         // subprocess groups, so a closed output pipe must run cleanup too.
         let mut pipe = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::pipe())?;
         let following = async {
-            let watching = follow(paths, &args, config);
-            // Timeout bounds observation, not notification delivery after a
-            // terminal outcome is already known.
+            let watching = async {
+                let (job, mut output) = follow(paths, &args, config).await?;
+                let (code, event) = finish(&mut output, job).await?;
+                Ok::<_, anyhow::Error>((code, event, output))
+            };
+            // The deadline includes printing the outcome; explicitly selected
+            // finish hooks may complete after it has been delivered.
             let deadline = Instant::now()
                 .checked_add(args.timeout)
                 .ok_or_else(|| anyhow::anyhow!("follow timeout is too large"))?;
-            let (job, mut output) = match tokio::time::timeout_at(deadline.into(), watching).await {
+            let (code, event, mut output) = match tokio::time::timeout_at(deadline.into(), watching).await {
                 Ok(result) => result?,
                 Err(_) => {
-                    eprintln!("follow timed out after {} minutes", args.timeout.as_secs_f64() / 60.0);
-                    return Ok(124);
+                    output::diagnostic(&format!("follow timed out after {} minutes\n", args.timeout.as_secs_f64() / 60.0)).await;
+                    return Ok::<i32, anyhow::Error>(124);
                 }
             };
-            finish(&mut output, job).await
+            if let Some(hooks) = &mut output.hooks {
+                hooks.finish(&event).await;
+            }
+            Ok(code)
         };
         tokio::select! {
             biased;
@@ -142,6 +151,7 @@ async fn follow(
     let mut subscription = JobSubscription::connect(paths, args.job, None).await?;
     let mut checks = CheckRunner::new(config.checks);
     let mut output = Output {
+        writer: output::EventWriter::stdout()?,
         json: args.json,
         events: config.events.unwrap_or_default(),
         hooks: HookWorker::new(config.hooks),
@@ -169,25 +179,29 @@ async fn follow(
             if !output.selected(kind) {
                 continue;
             }
-            output.emit(
-                kind,
-                &json!({
-                    "event": kind.name(), "job": args.job, "attempt": event.attempt_number,
-                    "eventId": event.id,
-                }),
-            )?;
+            output
+                .emit(
+                    kind,
+                    &json!({
+                        "event": kind.name(), "job": args.job, "attempt": event.attempt_number,
+                        "eventId": event.id,
+                    }),
+                )
+                .await?;
         }
         if initial
             && output.selected(EventKind::Attention)
             && attempt.is_some_and(|a| matches!(a.state.as_str(), "orphaned" | "quarantined"))
         {
-            output.emit(
-                EventKind::Attention,
-                &json!({
-                    "event": "attention", "job": args.job, "attempt": attempt.map(|a| a.number),
-                    "message": "operator recovery required",
-                }),
-            )?;
+            output
+                .emit(
+                    EventKind::Attention,
+                    &json!({
+                        "event": "attention", "job": args.job, "attempt": attempt.map(|a| a.number),
+                        "message": "operator recovery required",
+                    }),
+                )
+                .await?;
         }
         initial = false;
         if !update.has_more && terminal(&update.job) {
@@ -226,7 +240,7 @@ async fn follow(
                             "attempt": update.job.attempts.last().map(|a| a.number),
                             "findings": findings,
                             "suppressed": suppressed,
-                        }))?;
+                        })).await?;
                     }
                 }
             }
@@ -255,7 +269,7 @@ fn check_context(job: &JobView) -> Value {
     })
 }
 
-async fn finish(output: &mut Output, job: JobView) -> Result<i32> {
+async fn finish(output: &mut Output, job: JobView) -> Result<(i32, Value)> {
     // Cancellation while queued for a retry must not inherit the previous
     // attempt's failure code or signal.
     let attempt = job
@@ -282,14 +296,12 @@ async fn finish(output: &mut Output, job: JobView) -> Result<i32> {
     if output.suppressed_hooks != 0 {
         event["suppressedHooks"] = json!(output.suppressed_hooks);
     }
-    output.emit(EventKind::Finished, &event)?;
-    if let Some(hooks) = &mut output.hooks {
-        hooks.finish(&event).await;
-    }
-    Ok(code)
+    output.emit(EventKind::Finished, &event).await?;
+    Ok((code, event))
 }
 
 struct Output {
+    writer: output::EventWriter,
     json: bool,
     events: Vec<String>,
     hooks: Option<HookWorker>,
@@ -302,12 +314,12 @@ impl Output {
         self.events.iter().any(|event| event == kind.name())
     }
 
-    fn emit(&mut self, kind: EventKind, payload: &Value) -> Result<()> {
+    async fn emit(&mut self, kind: EventKind, payload: &Value) -> Result<()> {
         if !self.selected(kind) {
             return Ok(());
         }
         {
-            let mut out = std::io::stdout().lock();
+            let mut out = Vec::new();
             if self.json {
                 serde_json::to_writer(&mut out, payload)?;
                 writeln!(out)?;
@@ -339,7 +351,7 @@ impl Output {
                 }
                 writeln!(out)?;
             }
-            out.flush()?;
+            self.writer.write_all(&out).await?;
         }
         if kind != EventKind::Finished
             && let Some(hooks) = &self.hooks
@@ -377,7 +389,7 @@ impl HookWorker {
         let task = tokio::spawn(async move {
             while let Some((kind, payload)) = receiver.recv().await {
                 let errors = follow_checks::run_hooks(&worker_hooks, kind.name(), &payload).await;
-                report_hook_errors(&worker_errors, &errors);
+                report_hook_errors(&worker_errors, &errors).await;
             }
         });
         Some(Self {
@@ -394,7 +406,7 @@ impl HookWorker {
             let _ = task.await;
         }
         let errors = follow_checks::run_hooks(&self.hooks, "finished", payload).await;
-        report_hook_errors(&self.error_shown, &errors);
+        report_hook_errors(&self.error_shown, &errors).await;
     }
 }
 
@@ -406,14 +418,15 @@ impl Drop for HookWorker {
     }
 }
 
-fn report_hook_errors(shown: &AtomicBool, errors: &[String]) {
+async fn report_hook_errors(shown: &AtomicBool, errors: &[String]) {
     if let Some(error) = errors.first()
         && !shown.swap(true, Ordering::Relaxed)
     {
-        eprintln!(
-            "[mlq] notification hook failed: {}; further hook errors suppressed",
+        output::diagnostic(&format!(
+            "[mlq] notification hook failed: {}; further hook errors suppressed\n",
             one_line(error, 240)
-        );
+        ))
+        .await;
     }
 }
 
