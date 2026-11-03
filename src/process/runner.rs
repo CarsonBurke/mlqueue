@@ -2,8 +2,8 @@
 //!
 //! The daemon spawns one runner per attempt in a fresh session. The runner
 //! waits for durable launch authorization, forks the command into its own
-//! process group, supervises it, delivers cancellation signals from outside
-//! that group, and publishes an atomic terminal result only once the whole
+//! process group, supervises it, delivers cancellation and yield signals from
+//! outside that group, and publishes an atomic terminal result only once the whole
 //! command process group is provably empty.
 
 use std::fs::{File, OpenOptions};
@@ -18,7 +18,8 @@ use crate::domain::{self, now_ms};
 use crate::process::artifacts::{
     self, CANCEL_FILE, COMMAND_FILE, CancelFile, CommandFile, ExecFile, IDENTITY_FILE,
     IdentityFile, LIMIT_FILE, LimitFile, RESULT_FILE, RUNNER_LOCK_FILE, ResultFile, ResultOutcome,
-    START_FILE, STDERR_LOG_FILE, STDOUT_LOG_FILE, StartFile, TIMEOUT_FILE, TimeoutFile,
+    START_FILE, STDERR_LOG_FILE, STDOUT_LOG_FILE, StartFile, TIMEOUT_FILE, TimeoutFile, YIELD_FILE,
+    YIELD_SENT_FILE, YieldFile, YieldSentFile,
 };
 use crate::process::identity;
 
@@ -230,6 +231,8 @@ fn run(dir: &Path) -> anyhow::Result<()> {
     let mut kill_at: Option<Instant> = None;
     let mut kill_sent = false;
     let mut timed_out = false;
+    let mut yield_sent = false;
+    let mut yield_record_failed = false;
     let mut empty_scans = 0u32;
     let grace = Duration::from_millis(command.cancel_grace_ms);
     loop {
@@ -339,6 +342,58 @@ fn run(dir: &Path) -> anyhow::Result<()> {
                 kill_at = Some(Instant::now() + grace);
             }
         }
+        // A yield is a request the command may honor at its next checkpoint,
+        // or never: deliver it once and never escalate. Termination that has
+        // already begun (cancel or timeout) makes a yield meaningless.
+        //
+        // Unlike cancellation, only the leader is signalled. It owns the
+        // checkpoint; launchers and forked workers would die of the signal's
+        // default action or run the trainer's inherited handler themselves.
+        // The unreaped leader keeps its PID pinned, so it cannot name another
+        // process while `exit_status` is unset.
+        if let Some(policy) = command.yield_policy
+            && !yield_sent
+            && !term_sent
+            && exit_status.is_none()
+            && read_yield(dir, &command.token).is_some()
+        {
+            // The record must exist before the signal: if this runner dies
+            // afterwards, it is what tells the daemon the command may have
+            // checkpointed and exited on request, so the job is held rather
+            // than lost. Without it, retry on the next poll.
+            let record = YieldSentFile {
+                token: command.token.clone(),
+                sent_at: now_ms(),
+            };
+            let recorded = match artifacts::write_artifact(dir, YIELD_SENT_FILE, &record, true) {
+                Ok(()) => true,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => true,
+                Err(err) => {
+                    if !yield_record_failed {
+                        log_line(dir, &format!("recording yield delivery: {err}; will retry"));
+                        yield_record_failed = true;
+                    }
+                    false
+                }
+            };
+            // Re-check right before signalling: a leader that exited since
+            // the top of this poll must not have its own exit code read as
+            // an answer to a signal it never received. The window between
+            // this peek and kill() is the only one left.
+            if recorded && peek_exit(child_pid)?.is_none() {
+                log_line(
+                    dir,
+                    &format!(
+                        "yield requested; delivering {} to command leader {child_pid}",
+                        policy.signal
+                    ),
+                );
+                unsafe {
+                    libc::kill(child_pid, policy.signal.number());
+                }
+                yield_sent = true;
+            }
+        }
         if let Some(at) = kill_at
             && Instant::now() >= at
         {
@@ -376,6 +431,26 @@ fn run(dir: &Path) -> anyhow::Result<()> {
             status.code(),
             status.signal(),
             Some("cancelled by request".to_string()),
+        )
+    } else if let Some(policy) = command.yield_policy
+        && yield_sent
+        && status.code() == Some(i32::from(policy.exit_code.get()))
+    {
+        // A cancel that arrived after the exit cannot undo the yield here;
+        // the daemon still honors it when it finalizes the job.
+        let late_cancel = if cancel_too_late {
+            " (cancellation_too_late)"
+        } else {
+            ""
+        };
+        (
+            ResultOutcome::Yielded,
+            status.code(),
+            None,
+            Some(format!(
+                "yielded: exited with code {} after {}{late_cancel}",
+                policy.exit_code, policy.signal
+            )),
         )
     } else {
         let message = cancel_too_late.then(|| "cancellation_too_late".to_string());
@@ -464,6 +539,13 @@ fn read_cancel(dir: &Path, token: &str) -> Option<CancelFile> {
     }
 }
 
+fn read_yield(dir: &Path, token: &str) -> Option<YieldFile> {
+    match artifacts::read_artifact::<YieldFile>(&dir.join(YIELD_FILE)) {
+        Ok(Some(request)) if request.token == token => Some(request),
+        _ => None,
+    }
+}
+
 fn signal_group(pgid: i32, signal: i32) {
     // ESRCH (already empty) is fine; anything else is unexpected but the
     // /proc scan remains the source of truth for emptiness.
@@ -513,6 +595,7 @@ mod tests {
             cancel_grace_ms: 1,
             poll_ms: 10,
             time_limit_ms: limit,
+            yield_policy: None,
         }
     }
 

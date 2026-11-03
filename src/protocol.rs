@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::domain::{AttemptId, DependencyCondition, DependencyResolution, JobId};
+use crate::domain::{AttemptId, DependencyCondition, DependencyResolution, JobId, YieldPolicy};
 
 pub const PROTOCOL_VERSION: u32 = 8;
 pub const DEFAULT_MAX_FRAME_BYTES: u32 = 1 << 20;
@@ -79,6 +79,20 @@ pub enum Op {
         job: JobId,
         force: bool,
     },
+    /// Ask an opted-in running job to checkpoint and exit with its yield code,
+    /// returning it to the queue under the same job ID.
+    Yield {
+        job: JobId,
+        /// Recorded in the event log and on the attempt for audit.
+        reason: String,
+        /// Requeue held instead of queued.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        hold: bool,
+        /// The client ran on a terminal. The daemon refuses non-interactive
+        /// yields unless its config allows them.
+        #[serde(default)]
+        interactive: bool,
+    },
     Hold {
         job: JobId,
     },
@@ -120,6 +134,7 @@ impl Op {
             self,
             Op::Submit(_)
                 | Op::Cancel { .. }
+                | Op::Yield { .. }
                 | Op::Hold { .. }
                 | Op::Release { .. }
                 | Op::Pause
@@ -144,6 +159,7 @@ impl Op {
             Op::See { .. } => "see",
             Op::Logs { .. } => "logs",
             Op::Cancel { .. } => "cancel",
+            Op::Yield { .. } => "yield",
             Op::Hold { .. } => "hold",
             Op::Release { .. } => "release",
             Op::Pause => "pause",
@@ -196,7 +212,7 @@ impl Op {
         let Self::Submit(params) = self else {
             return None;
         };
-        if params.time_limit_ms.is_some() {
+        if params.time_limit_ms.is_some() || params.yield_policy.is_some() {
             return None;
         }
         let after_success: Vec<_> = params
@@ -272,6 +288,10 @@ pub struct SubmitParams {
     /// Immutable prerequisite edges. All conditions are ANDed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dependencies: Vec<DependencySpec>,
+    /// Opt-in cooperative yield. Omitted when absent, so request hashes of
+    /// submissions that predate it are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yield_policy: Option<YieldPolicy>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -359,6 +379,29 @@ pub struct JobView {
     pub attempts: Vec<AttemptView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cancel_requested: Option<bool>,
+    /// The job's opt-in yield contract; absent when it cannot be yielded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yield_policy: Option<YieldPolicy>,
+    /// Attempts that ended by yielding; they do not count toward `maxAttempts`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub yield_count: i64,
+    /// The live attempt's yield request, if one was made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yield_request: Option<YieldRequestView>,
+}
+
+/// A live attempt's standing yield request. The first request's choices
+/// stand; repeating `yield` neither changes them nor signals again.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct YieldRequestView {
+    pub reason: String,
+    pub requested_at: i64,
+    pub hold: bool,
+    /// The runner has signalled the command. It is sent at most once per
+    /// attempt, so a command that kept running owes the yield at its next
+    /// checkpoint.
+    pub delivered: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -429,6 +472,10 @@ pub struct AttemptView {
     pub created_at: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yield_requested_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yield_reason: Option<String>,
     pub log_dir: String,
 }
 
@@ -621,6 +668,7 @@ mod tests {
                 retry_delay_ms: 0,
                 time_limit_ms: None,
                 dependencies: vec![],
+                yield_policy: None,
             })
         };
         assert_eq!(mk(1, 0).request_hash(), mk(1, 0).request_hash());
@@ -688,6 +736,20 @@ mod tests {
             "{limited_json}"
         );
 
+        // Opting out of yield serializes exactly as before the field existed.
+        assert!(!default_json.contains("yield"), "{default_json}");
+        let mut yielding_params = match mk(1, 0) {
+            Op::Submit(params) => params,
+            _ => unreachable!(),
+        };
+        yielding_params.yield_policy = Some(crate::domain::YieldPolicy {
+            signal: crate::domain::YieldSignal::Usr1,
+            exit_code: crate::domain::DEFAULT_YIELD_EXIT_CODE,
+        });
+        let yielding = Op::Submit(yielding_params);
+        assert_ne!(mk(1, 0).request_hash(), yielding.request_hash());
+        assert!(yielding.legacy_v5_request_hash().is_none());
+
         let current = mk(1, 0);
         let legacy_json = concat!(
             r#"{"type":"submit","name":"x","cwd":"/tmp","args":["true"],"env":{},"maxParallelRuns":1,"maxAttempts":1,"retryDelayMs":0,"#,
@@ -750,6 +812,31 @@ mod tests {
         // distinct from the other read ops.
         assert_ne!(Op::Subscribe.request_hash(), Op::Status.request_hash());
         assert!(Op::Subscribe.legacy_v5_request_hash().is_none());
+    }
+
+    #[test]
+    fn yield_is_a_mutation_whose_hold_flag_is_omitted_by_default() {
+        let op = Op::Yield {
+            job: 7,
+            reason: "drain".into(),
+            hold: false,
+            interactive: true,
+        };
+        assert!(op.is_mutation());
+        assert_eq!(op.kind(), "yield");
+        assert_eq!(
+            serde_json::to_string(&op).unwrap(),
+            r#"{"type":"yield","job":7,"reason":"drain","interactive":true}"#
+        );
+        let parsed: Op = serde_json::from_str(r#"{"type":"yield","job":7,"reason":"r"}"#).unwrap();
+        assert!(matches!(
+            parsed,
+            Op::Yield {
+                hold: false,
+                interactive: false,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -887,6 +974,8 @@ mod tests {
             message: None,
             created_at: 0,
             finished_at: None,
+            yield_requested_at: None,
+            yield_reason: None,
             log_dir: "/x".into(),
         };
         let json = serde_json::to_string(&view).unwrap();

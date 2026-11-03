@@ -12,13 +12,17 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::domain::{AttemptId, JobId};
+use crate::domain::{AttemptId, JobId, YieldPolicy};
 
 pub const COMMAND_FILE: &str = "command.json";
 pub const IDENTITY_FILE: &str = "identity.json";
 pub const START_FILE: &str = "start";
 pub const EXEC_FILE: &str = "exec.json";
 pub const CANCEL_FILE: &str = "cancel.json";
+/// Operator request that the command checkpoint and exit with its yield code.
+pub const YIELD_FILE: &str = "yield.json";
+/// Written once, by the runner, just before it delivers the yield signal.
+pub const YIELD_SENT_FILE: &str = "yield_sent.json";
 /// Live override of the launch-time wall-clock limit. Absent means the
 /// runner keeps the limit snapshotted in `command.json`.
 pub const LIMIT_FILE: &str = "limit.json";
@@ -49,6 +53,9 @@ pub struct CommandFile {
     /// absent on artifacts created before wall-clock limits were supported.
     #[serde(default)]
     pub time_limit_ms: Option<u64>,
+    /// The job's cooperative-yield contract; absent for jobs that did not opt in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yield_policy: Option<YieldPolicy>,
 }
 
 /// Upgradable wall-clock limit for an attempt that is already supervised.
@@ -112,6 +119,23 @@ pub struct CancelFile {
     pub requested_at: Option<i64>,
 }
 
+/// Durable yield request, published by the daemon. The runner delivers the
+/// job's declared signal once; it never escalates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct YieldFile {
+    pub token: String,
+    pub requested_at: i64,
+}
+
+/// Durable record that the yield signal was (about to be) delivered. If the
+/// runner then dies, the daemon knows the command may have yielded, so it
+/// does not report the job lost and strand its dependents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct YieldSentFile {
+    pub token: String,
+    pub sent_at: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResultOutcome {
@@ -125,6 +149,9 @@ pub enum ResultOutcome {
     TimedOut,
     /// The runner gave up waiting for launch authorization.
     AuthorizationTimeout,
+    /// The command exited with its declared yield code after the runner
+    /// delivered a requested yield signal.
+    Yielded,
 }
 
 /// Terminal record: published only after the command process group is proven

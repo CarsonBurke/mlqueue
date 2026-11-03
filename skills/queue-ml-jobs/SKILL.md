@@ -76,6 +76,19 @@ mlq submit --name NAME --max-parallel-runs N \
   stops that attempt; once termination has started, extending it does not
   revive the attempt. An earlier cancellation stays cancelled. Later retries
   use the updated limit.
+- Add `--yield-signal SIGUSR1` only when the command itself handles it: on the
+  signal its leader process saves a checkpoint and exits with code 75 (or
+  `--yield-exit-code`), and a rerun of the same command resumes from that
+  checkpoint (`MLQ_ATTEMPT` says which attempt is running). The signal arrives
+  once, so a command with nothing to save yet must remember it and yield after
+  its next checkpoint. Wrapper scripts must `exec` the trainer or forward the
+  signal. Never opt in work that cannot checkpoint: a yield would lose it.
+- Never run `mlq yield` unless the user explicitly asked you to yield that
+  specific job. Do not yield jobs to get your own work scheduled sooner. The
+  daemon normally refuses non-interactive yields and asks for confirmation on
+  a terminal; do not work around either (for example by running it in a
+  pseudo-terminal or answering the prompt yourself), and do not change its
+  config.
 - Use `mlq status`, `show`, `see`, and `logs` to observe work, and `cancel` or
   `retry` to control it. Report the submitted job ID, chosen parallel limit,
   chosen time limit (or the decision to leave it unlimited), and any nonzero
