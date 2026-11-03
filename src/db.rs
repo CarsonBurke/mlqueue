@@ -237,6 +237,8 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE jobs ADD COLUMN time_limit_set_at INTEGER;
     "#,
+    // v8: immutable repository/checkout context, discovered outside transactions.
+    "ALTER TABLE jobs ADD COLUMN context TEXT;",
 ];
 
 pub fn open(path: &Path) -> Result<Connection> {
@@ -283,6 +285,7 @@ pub struct JobRow {
     pub name: String,
     pub state: JobState,
     pub cwd: String,
+    pub context: Option<crate::job_context::JobContext>,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub max_parallel_runs: u32,
@@ -365,7 +368,7 @@ pub struct EventRow {
 
 const JOB_COLUMNS: &str = "id, name, state, cwd, args, env, max_parallel_runs, priority, \
      max_attempts, retry_delay_ms, time_limit_ms, time_limit_set_at, retry_not_before, ready_seq, \
-     attempt_count, state_reason, created_at, updated_at, finished_at";
+     attempt_count, state_reason, created_at, updated_at, finished_at, context";
 
 fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRow> {
     let state: String = row.get(2)?;
@@ -391,6 +394,9 @@ fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRow> {
         created_at: row.get(16)?,
         updated_at: row.get(17)?,
         finished_at: row.get(18)?,
+        context: row.get::<_, Option<String>>(19)?.and_then(|encoded| {
+            serde_json::from_str(&encoded).expect("valid context JSON in database")
+        }),
     })
 }
 
@@ -432,6 +438,36 @@ fn attempt_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttemptRow> {
 // ---------------------------------------------------------------------------
 // Jobs
 // ---------------------------------------------------------------------------
+
+/// Store a discovery result, including JSON null for directories outside Git.
+pub fn set_job_context(
+    conn: &Connection,
+    job: JobId,
+    context: Option<&crate::job_context::JobContext>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE jobs SET context = ?1 WHERE id = ?2",
+        params![serde_json::to_string(&context)?, job],
+    )?;
+    Ok(())
+}
+
+/// Upgrade legacy jobs once per cwd. Discovery happens before each short write,
+/// never while a database transaction is open. Missing checkouts stay unknown.
+pub fn backfill_job_context(conn: &Connection) -> Result<()> {
+    let directories: Vec<String> = conn
+        .prepare("SELECT DISTINCT cwd FROM jobs WHERE context IS NULL")?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for cwd in directories {
+        let context = crate::job_context::discover(Path::new(&cwd));
+        conn.execute(
+            "UPDATE jobs SET context = ?1 WHERE cwd = ?2 AND context IS NULL",
+            params![serde_json::to_string(&context)?, cwd],
+        )?;
+    }
+    Ok(())
+}
 
 pub fn insert_job(conn: &Connection, params: &SubmitParams, now: i64) -> Result<JobId> {
     conn.execute(
@@ -1395,6 +1431,36 @@ mod tests {
     use super::*;
     use crate::protocol::DependencySpec;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn context_survives_checkout_removal_and_legacy_backfill_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("project");
+        std::fs::create_dir(&repo).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let conn = open_in_memory().unwrap();
+        let mut params = submit_params("legacy", 1);
+        params.cwd = repo.to_str().unwrap().into();
+        let job = insert_job(&conn, &params, 10).unwrap();
+        assert!(job_row(&conn, job).unwrap().unwrap().context.is_none());
+        backfill_job_context(&conn).unwrap();
+        let context = job_row(&conn, job).unwrap().unwrap().context.unwrap();
+        assert_eq!(context.label(), "project");
+        std::fs::remove_dir_all(&repo).unwrap();
+        backfill_job_context(&conn).unwrap();
+        assert_eq!(job_row(&conn, job).unwrap().unwrap().context, Some(context));
+        let unknown = insert_job(&conn, &params, 11).unwrap();
+        backfill_job_context(&conn).unwrap();
+        assert!(job_row(&conn, unknown).unwrap().unwrap().context.is_none());
+        assert_eq!(job_row(&conn, job).unwrap().unwrap().name, "legacy");
+    }
 
     fn submit_params(name: &str, limit: u32) -> SubmitParams {
         SubmitParams {

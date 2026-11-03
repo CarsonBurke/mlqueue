@@ -6,6 +6,7 @@ pub mod db;
 pub mod domain;
 mod follow;
 mod follow_checks;
+pub mod job_context;
 pub mod paths;
 pub mod process;
 pub mod protocol;

@@ -209,6 +209,45 @@ impl Drop for TestQueue {
     }
 }
 
+#[test]
+fn repository_context_is_persisted_independent_of_the_job_name_and_checkout_lifetime() {
+    let mut q = TestQueue::new();
+    q.cli(&["pause"]);
+    let repo = q.dir.path().join("project");
+    std::fs::create_dir(&repo).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let nested = repo.join("experiments");
+    std::fs::create_dir(&nested).unwrap();
+    let submitted = q.cli_json(&[
+        "submit",
+        "--json",
+        "--name",
+        "deep-tests",
+        "--cwd",
+        nested.to_str().unwrap(),
+        "--",
+        "true",
+    ]);
+    assert_eq!(submitted["context"]["repository"], repo.to_str().unwrap());
+    assert_eq!(submitted["context"]["subdirectory"], "experiments");
+    let id = submitted["id"].as_i64().unwrap();
+    std::fs::remove_dir_all(&repo).unwrap();
+    q.stop_daemon();
+    q.start_daemon();
+    let job = q.job(id);
+    assert_eq!(job["context"], submitted["context"]);
+    assert_eq!(job["name"], "deep-tests");
+    let status = q.cli(&["status"]);
+    assert!(status.contains("project · experiments"), "{status}");
+}
+
 /// A live `mlq subscribe` process plus its decoded snapshot stream.
 struct Subscriber {
     child: KillOnDrop,

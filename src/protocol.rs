@@ -334,6 +334,9 @@ pub struct JobView {
     #[serde(default)]
     pub priority: i64,
     pub cwd: String,
+    /// Git repository and checkout captured independently of the display name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<crate::job_context::JobContext>,
     pub args: Vec<String>,
     pub max_attempts: u32,
     pub retry_delay_ms: u64,

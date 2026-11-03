@@ -188,6 +188,7 @@ pub fn job_view(
         max_parallel_runs: job.max_parallel_runs,
         priority: job.priority,
         cwd: job.cwd.clone(),
+        context: job.context.clone(),
         args: job.args.clone(),
         max_attempts: job.max_attempts as u32,
         retry_delay_ms: job.retry_delay_ms as u64,

@@ -123,6 +123,7 @@ impl Coordinator {
         // Fail fast if /proc identity primitives are unavailable; every
         // recovery decision depends on them.
         identity::boot_id().context("reading boot id")?;
+        db::backfill_job_context(&conn)?;
         let published_revision = db::latest_event_id(&conn)?;
         // Receivers are handed out by `revisions()`; the initial one is
         // dropped because a daemon with no subscribers is the normal case.
@@ -431,10 +432,14 @@ impl Coordinator {
             validate_submission_fs(params)?;
         }
 
+        let context = match op {
+            Op::Submit(params) => crate::job_context::discover(std::path::Path::new(&params.cwd)),
+            _ => None,
+        };
         let now = now_ms();
         let (reply, actions) = {
             let tx = self.conn.transaction().map_err(ApiError::from)?;
-            let (reply, actions) = apply_mutation(&tx, &self.paths, op, now)?;
+            let (reply, actions) = apply_mutation(&tx, &self.paths, op, now, context.as_ref())?;
             let encoded = serde_json::to_string(&reply)
                 .map_err(|err| ApiError::new(error_codes::INTERNAL, err.to_string()))?;
             db::insert_operation(&tx, key, op.kind(), &hash, &encoded, now)?;
@@ -1583,11 +1588,13 @@ fn apply_mutation(
     paths: &Paths,
     op: &Op,
     now: i64,
+    context: Option<&crate::job_context::JobContext>,
 ) -> ApiResult<(Reply, Vec<PostAction>)> {
     match op {
         Op::Submit(params) => {
             validate_submission_parents(tx, params)?;
             let job = db::insert_job(tx, params, now)?;
+            db::set_job_context(tx, job, context)?;
             db::append_event(
                 tx,
                 Some(job),

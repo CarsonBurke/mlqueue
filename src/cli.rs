@@ -2,7 +2,7 @@
 //! generation, and human/JSON rendering of daemon replies.
 
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -304,9 +304,10 @@ pub fn main() -> Result<()> {
         Command::FollowTts { tts_backend } => follow_tts(&paths, tts_backend.as_deref()),
         Command::Show { job, json } => {
             let reply = send(&paths, Op::Show { job }, None)?;
-            let Reply::Job { job } = reply else {
+            let Reply::Job { mut job } = reply else {
                 bail!(client::unexpected("job"))
             };
+            ContextCache::default().enrich(&mut job);
             if json {
                 println!("{}", serde_json::to_string_pretty(&job)?);
             } else {
@@ -633,9 +634,10 @@ fn submit(paths: &Paths, args: SubmitArgs, key: String) -> Result<()> {
             .collect(),
     };
     let reply = send(paths, Op::Submit(params), Some(key))?;
-    let Reply::Submitted { job } = reply else {
+    let Reply::Submitted { mut job } = reply else {
         bail!(client::unexpected("submitted job"))
     };
+    ContextCache::default().enrich(&mut job);
     if args.json {
         println!("{}", serde_json::to_string_pretty(&job)?);
     } else {
@@ -643,11 +645,41 @@ fn submit(paths: &Paths, args: SubmitArgs, key: String) -> Result<()> {
             "submitted job {} [{}] maxParallelRuns={} priority={}",
             job.id, job.name, job.max_parallel_runs, job.priority
         );
+        if let Some(context) = &job.context {
+            println!("  {}", context.label());
+        }
     }
     Ok(())
 }
 
+/// Older daemons have only cwd. Resolve those snapshots locally and cache each
+/// directory for the lifetime of a watch/stream; persisted context wins.
+#[derive(Default)]
+struct ContextCache(HashMap<String, Option<crate::job_context::JobContext>>);
+
+impl ContextCache {
+    fn enrich_jobs(&mut self, jobs: &mut [JobView]) {
+        let current: std::collections::HashSet<_> =
+            jobs.iter().map(|job| job.cwd.clone()).collect();
+        self.0.retain(|cwd, _| current.contains(cwd));
+        for job in jobs {
+            self.enrich(job);
+        }
+    }
+
+    fn enrich(&mut self, job: &mut JobView) {
+        if job.context.is_none() {
+            job.context = self
+                .0
+                .entry(job.cwd.clone())
+                .or_insert_with(|| crate::job_context::discover(std::path::Path::new(&job.cwd)))
+                .clone();
+        }
+    }
+}
+
 fn status(paths: &Paths, watch: bool, finished: bool, json: bool) -> Result<()> {
+    let mut contexts = ContextCache::default();
     loop {
         let reply = send(paths, Op::Status, None)?;
         let Reply::Status(mut view) = reply else {
@@ -658,6 +690,7 @@ fn status(paths: &Paths, watch: bool, finished: bool, json: bool) -> Result<()> 
         } else {
             view.jobs.retain(|job| job.finished_at.is_none());
         }
+        contexts.enrich_jobs(&mut view.jobs);
         if json {
             println!("{}", serde_json::to_string_pretty(&view)?);
         } else {
@@ -679,7 +712,9 @@ fn status(paths: &Paths, watch: bool, finished: bool, json: bool) -> Result<()> 
 /// no colours, ending with exit 0 when the daemon shuts down cleanly.
 fn subscribe(paths: &Paths) -> Result<()> {
     let mut out = std::io::stdout().lock();
-    let result = client::subscribe(paths, |view| {
+    let mut contexts = ContextCache::default();
+    let result = client::subscribe(paths, |mut view| {
+        contexts.enrich_jobs(&mut view.jobs);
         serde_json::to_writer(&mut out, &view)?;
         out.write_all(b"\n")?;
         // A consumer must see each snapshot as it happens, not per block.
@@ -1158,6 +1193,12 @@ fn write_status_job(output: &mut String, job: &JobView) {
         width = STATUS_NAME_WIDTH,
     )
     .unwrap();
+    let context = job
+        .context
+        .as_ref()
+        .map(|context| context.label())
+        .unwrap_or_else(|| format!("cwd {}", job.cwd));
+    writeln!(output, "       {context}").unwrap();
 }
 
 fn print_job_detail(job: &JobView) {
@@ -1178,6 +1219,10 @@ fn print_job_detail(job: &JobView) {
     }
     println!("  priority:         {}", job.priority);
     println!("  maxParallelRuns:  {}", job.max_parallel_runs);
+    if let Some(context) = &job.context {
+        println!("  repository:       {}", context.repository);
+        println!("  worktree:         {}", context.worktree);
+    }
     println!("  cwd:              {}", job.cwd);
     println!("  command:          {}", shell_join(&job.args));
     println!(
@@ -1231,9 +1276,10 @@ fn print_job_detail(job: &JobView) {
 
 fn see(paths: &Paths, job: Option<JobId>, json: bool) -> Result<()> {
     let reply = send(paths, Op::See { job }, None)?;
-    let Reply::Job { job } = reply else {
+    let Reply::Job { mut job } = reply else {
         bail!(client::unexpected("job"))
     };
+    ContextCache::default().enrich(&mut job);
     if json {
         println!("{}", serde_json::to_string_pretty(&job)?);
         return Ok(());
@@ -1504,6 +1550,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn status_keeps_repository_and_worktree_separate_from_the_job_name() {
+        let mut job = status_job(42, "running", None);
+        job.name = "deep-tests".into();
+        job.context = Some(crate::job_context::JobContext {
+            repository: "/repos/cb-bc2".into(),
+            worktree: "/repos/cb-bc2/.worktrees/deep".into(),
+            subdirectory: "tests/gpu".into(),
+        });
+        let mut output = String::new();
+        write_status_job(&mut output, &job);
+        assert!(output.contains("deep-tests"));
+        assert!(output.contains("cb-bc2 · worktree deep · tests/gpu"));
+        job.context = None;
+        let mut unknown = String::new();
+        write_status_job(&mut unknown, &job);
+        assert!(unknown.contains("cwd /tmp"));
+    }
+
     fn status_job(id: JobId, state: &str, finished_at: Option<i64>) -> JobView {
         JobView {
             id,
@@ -1514,6 +1579,7 @@ mod tests {
             max_parallel_runs: 1,
             priority: 0,
             cwd: "/tmp".into(),
+            context: None,
             args: vec!["true".into()],
             max_attempts: 1,
             retry_delay_ms: 0,
