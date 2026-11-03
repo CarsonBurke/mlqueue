@@ -266,6 +266,13 @@ fn configure(conn: &Connection) -> Result<()> {
 
 pub fn migrate(conn: &Connection) -> Result<()> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    // A newer schema can hold states this binary cannot parse.
+    ensure!(
+        current <= MIGRATIONS.len() as i64,
+        "database schema version {current} is newer than this mlqd supports ({}); \
+         run the newer mlqd",
+        MIGRATIONS.len()
+    );
     for (idx, migration) in MIGRATIONS.iter().enumerate() {
         let version = idx as i64 + 1;
         if version <= current {
@@ -1486,6 +1493,15 @@ mod tests {
         assert_eq!(version, MIGRATIONS.len() as i64);
         // Idempotent.
         migrate(&conn).unwrap();
+    }
+
+    #[test]
+    fn a_database_from_a_newer_mlqd_is_refused() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "user_version", MIGRATIONS.len() as i64 + 1)
+            .unwrap();
+        let error = migrate(&conn).unwrap_err().to_string();
+        assert!(error.contains("newer than this mlqd supports"), "{error}");
     }
 
     #[test]
