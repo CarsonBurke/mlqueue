@@ -66,6 +66,9 @@ impl Config {
                 CONFIG_VERSION
             );
         }
+        if config.max_connections == 0 {
+            bail!("max_connections must be positive in {}", path.display());
+        }
         Ok(config)
     }
 }
@@ -95,5 +98,18 @@ mod tests {
         let path = dir.path().join("config.toml");
         fs::write(&path, "version = 999\n").unwrap();
         assert!(Config::load(&path).is_err());
+    }
+
+    #[test]
+    fn zero_connection_budget_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "max_connections = 0\n").unwrap();
+        assert!(
+            Config::load(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("max_connections")
+        );
     }
 }

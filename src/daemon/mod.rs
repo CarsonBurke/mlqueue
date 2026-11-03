@@ -168,7 +168,9 @@ struct Serving {
 /// Streams get a strict quarter of the connection budget, leaving headroom for
 /// request/response clients whatever a crowd of subscribers does.
 fn max_subscriptions(config: &Config) -> usize {
-    (config.max_connections / 4).max(1)
+    (config.max_connections / 4)
+        .max(1)
+        .min(config.max_connections.saturating_sub(1))
 }
 
 async fn handle_connection(stream: UnixStream, serving: Serving) -> Result<()> {
@@ -370,5 +372,22 @@ async fn stream_updates(
                 return Ok(());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subscription_budget_always_reserves_a_control_connection() {
+        for max_connections in [1, 2, 3, 4, 64] {
+            let config = Config {
+                max_connections,
+                ..Config::default()
+            };
+            assert!(max_subscriptions(&config) < max_connections);
+        }
+        assert_eq!(max_subscriptions(&Config::default()), 16);
     }
 }
