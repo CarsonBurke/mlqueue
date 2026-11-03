@@ -1313,15 +1313,7 @@ fn logs(paths: &Paths, job: JobId, attempt: Option<i64>, stderr: bool, follow: b
     loop {
         if path.exists() {
             let mut file = std::fs::File::open(&path)?;
-            let len = file.metadata()?.len();
-            if len > offset {
-                file.seek(SeekFrom::Start(offset))?;
-                let mut chunk = Vec::new();
-                file.read_to_end(&mut chunk)?;
-                offset = len;
-                stdout.lock().write_all(&chunk)?;
-                stdout.lock().flush()?;
-            }
+            copy_log_snapshot(&mut file, &mut offset, &mut stdout.lock())?;
         }
         if !follow {
             return Ok(());
@@ -1374,6 +1366,22 @@ fn logs(paths: &Paths, job: JobId, attempt: Option<i64>, stderr: bool, follow: b
         }
         std::thread::sleep(Duration::from_millis(300));
     }
+}
+
+/// Drain a fixed snapshot with bounded memory. Writes arriving while we copy
+/// belong to the next pass, and the offset records bytes actually delivered.
+fn copy_log_snapshot(
+    file: &mut std::fs::File,
+    offset: &mut u64,
+    output: &mut impl Write,
+) -> std::io::Result<()> {
+    let available = file.metadata()?.len().saturating_sub(*offset);
+    if available > 0 {
+        file.seek(SeekFrom::Start(*offset))?;
+        *offset += std::io::copy(&mut file.take(available), output)?;
+        output.flush()?;
+    }
+    Ok(())
 }
 
 /// Map a terminal outcome onto a process exit code: 0 for success, 128+N
@@ -1564,6 +1572,44 @@ mod tests {
             submit(&paths, args, "test".into()).unwrap_err().to_string(),
             "--retry-delay is too large"
         );
+    }
+
+    #[test]
+    fn log_snapshot_defers_concurrent_appends_without_repeating_bytes() {
+        struct AppendingWriter {
+            log: std::fs::File,
+            bytes: Vec<u8>,
+        }
+        impl Write for AppendingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.bytes.is_empty() {
+                    self.log.write_all(b"later\n")?;
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stdout.log");
+        std::fs::write(&path, b"first\n").unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let mut output = AppendingWriter {
+            log: std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            bytes: Vec::new(),
+        };
+        let mut offset = 0;
+        copy_log_snapshot(&mut file, &mut offset, &mut output).unwrap();
+        assert_eq!(output.bytes, b"first\n");
+        copy_log_snapshot(&mut file, &mut offset, &mut output).unwrap();
+        copy_log_snapshot(&mut file, &mut offset, &mut output).unwrap();
+        assert_eq!(output.bytes, b"first\nlater\n");
+        assert_eq!(offset, 12);
     }
 
     fn event(id: i64, job: JobId, name: &str, event_type: &str) -> EventView {
