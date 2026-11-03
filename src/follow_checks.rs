@@ -19,7 +19,14 @@ const MAX_FINDINGS: usize = 64;
 const MAX_ACTIVE: usize = 256;
 const MAX_MESSAGE_BYTES: usize = 2048;
 const ERROR_KEY: &str = "__mlq_check_error";
-const EVENTS: &[&str] = &["started", "warning", "retry", "attention", "finished"];
+const EVENTS: &[&str] = &[
+    "started",
+    "warning",
+    "retry",
+    "yielded",
+    "attention",
+    "finished",
+];
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]

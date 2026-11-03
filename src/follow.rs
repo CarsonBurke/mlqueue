@@ -25,6 +25,8 @@ pub(crate) enum EventKind {
     Started,
     Warning,
     Retry,
+    /// The command yielded and the job is queued (or held) again.
+    Yielded,
     Attention,
     Finished,
 }
@@ -35,6 +37,7 @@ impl EventKind {
             Self::Started => "started",
             Self::Warning => "warning",
             Self::Retry => "retry",
+            Self::Yielded => "yielded",
             Self::Attention => "attention",
             Self::Finished => "finished",
         }
@@ -172,6 +175,7 @@ async fn follow(
             let kind = match event.event_type.as_str() {
                 "attempt_running" => EventKind::Started,
                 "retry_scheduled" => EventKind::Retry,
+                "job_yielded" => EventKind::Yielded,
                 "attempt_orphaned" | "attempt_quarantined" => EventKind::Attention,
                 // Final output comes from the snapshot, once the event backlog is drained.
                 _ => continue,

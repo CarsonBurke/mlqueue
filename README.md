@@ -56,6 +56,24 @@ mlqueue does not look at GPU memory or CPU load, and it doesn't count work
 started outside it. Choose N for what is safe next to any other job, and leave
 it at 1 when that depends on what else is running.
 
+## Yielding a long job
+
+A job that can checkpoint and resume can opt in to being stopped and requeued:
+
+```bash
+mlq submit --yield-signal SIGUSR1 -- python train.py --resume auto
+mlq yield 42 --reason "let the eval queue drain"    # from a terminal
+```
+
+On SIGUSR1 the command should save a checkpoint and exit with code 75. mlq
+sends the signal once, to the command's own process, and never forces it, so a
+command with nothing to save yet should note the request and exit 75 after its
+next checkpoint. `mlq yield` asks for confirmation and refuses to run without
+a terminal unless the daemon config sets `allow_noninteractive_yield = true`. On exit 75 the job goes to the
+back of the queue with the same ID, so jobs waiting on it with
+`--after-success` still wait, and it doesn't use up a `--max-attempts`
+attempt. Every attempt gets `MLQ_JOB_ID` and `MLQ_ATTEMPT` in its environment.
+
 Agents can use the [queue-ml-jobs skill](skills/queue-ml-jobs/SKILL.md).
 [ARCHITECTURE.md](ARCHITECTURE.md) covers admission and priority, crash
 recovery, storage, and configuration.

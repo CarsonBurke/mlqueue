@@ -24,7 +24,8 @@ use crate::paths::Paths;
 use crate::process::artifacts::{
     self, CANCEL_FILE, COMMAND_FILE, CancelFile, CommandFile, EXEC_FILE, ExecFile, IDENTITY_FILE,
     IdentityFile, LIMIT_FILE, LimitFile, RESULT_FILE, RUNNER_LOG_FILE, ResultFile, ResultOutcome,
-    START_FILE, StartFile, TIMEOUT_FILE, TimeoutFile,
+    START_FILE, StartFile, TIMEOUT_FILE, TimeoutFile, YIELD_FILE, YIELD_SENT_FILE, YieldFile,
+    YieldSentFile,
 };
 use crate::process::identity;
 use crate::protocol::{
@@ -76,18 +77,23 @@ type ApiResult<T> = Result<T, ApiError>;
 /// Side effects that must happen after (never inside) the mutation
 /// transaction. They are idempotently re-derived from committed state by
 /// reconcile, so a crash between commit and action loses nothing.
-enum PostAction {
-    PublishCancel {
+enum Publish {
+    Cancel {
         attempt_id: AttemptId,
         token: String,
         force: bool,
         requested_at: i64,
     },
-    PublishTimeLimit {
+    TimeLimit {
         attempt_id: AttemptId,
         token: String,
         time_limit_ms: Option<u64>,
         updated_at: i64,
+    },
+    Yield {
+        attempt_id: AttemptId,
+        token: String,
+        requested_at: i64,
     },
 }
 
@@ -427,6 +433,21 @@ impl Coordinator {
         if let Op::Submit(params) = op {
             validate_submission_fs(params)?;
         }
+        // Agents share this UID with the operator, so nothing here can prove
+        // who is asking. Requiring a terminal keeps yield an operator action
+        // by default; bypassing it takes a deliberate choice.
+        if let Op::Yield {
+            interactive: false, ..
+        } = op
+            && !self.config.allow_noninteractive_yield
+        {
+            return Err(ApiError::new(
+                error_codes::INVALID_ARGUMENT,
+                "yield is an operator action and requires an interactive terminal; \
+                 ask the operator to run `mlq yield`, or set \
+                 allow_noninteractive_yield = true in the daemon config",
+            ));
+        }
 
         let context = match op {
             Op::Submit(params) => crate::job_context::discover(std::path::Path::new(&params.cwd)),
@@ -450,9 +471,9 @@ impl Coordinator {
         Ok(reply)
     }
 
-    fn perform(&mut self, action: PostAction) {
+    fn perform(&mut self, action: Publish) {
         match action {
-            PostAction::PublishCancel {
+            Publish::Cancel {
                 attempt_id,
                 token,
                 force,
@@ -480,7 +501,7 @@ impl Coordinator {
                     tracing::warn!("publishing cancel for attempt {attempt_id}: {err}");
                 }
             }
-            PostAction::PublishTimeLimit {
+            Publish::TimeLimit {
                 attempt_id,
                 token,
                 time_limit_ms,
@@ -488,6 +509,11 @@ impl Coordinator {
             } => {
                 publish_time_limit(&self.paths, attempt_id, &token, time_limit_ms, updated_at);
             }
+            Publish::Yield {
+                attempt_id,
+                token,
+                requested_at,
+            } => publish_yield(&self.paths, attempt_id, &token, requested_at),
         }
     }
 
@@ -503,10 +529,30 @@ impl Coordinator {
             attempts.iter().map(|attempt| attempt.id).collect();
         self.spawned.retain(|id, _| live.contains(id));
         self.orphan_term_sent.retain(|id| live.contains(id));
-        for attempt in attempts {
+        for mut attempt in attempts {
+            if let Err(err) = self.observe_yield_delivery(&mut attempt) {
+                tracing::warn!("reading yield delivery of attempt {}: {err:#}", attempt.id);
+            }
             if let Err(err) = self.reconcile_attempt(&attempt) {
                 tracing::error!("reconciling attempt {}: {err:#}", attempt.id);
             }
+        }
+        Ok(())
+    }
+
+    /// Persist the runner's record that it delivered a yield signal, so
+    /// finalization knows the command may have yielded even if the runner
+    /// died before publishing a result.
+    fn observe_yield_delivery(&mut self, attempt: &mut AttemptRow) -> Result<()> {
+        if attempt.yield_requested_at.is_none() || attempt.yield_delivered_at.is_some() {
+            return Ok(());
+        }
+        let path = self.paths.attempt_dir(attempt.id).join(YIELD_SENT_FILE);
+        if let Some(sent) = artifacts::read_artifact::<YieldSentFile>(&path)?
+            && sent.token == attempt.launch_token
+        {
+            db::set_attempt_yield_delivered(&self.conn, attempt.id, sent.sent_at)?;
+            attempt.yield_delivered_at = Some(sent.sent_at);
         }
         Ok(())
     }
@@ -551,6 +597,20 @@ impl Coordinator {
                 },
                 false,
             );
+        }
+
+        // Likewise for a committed yield request. Only a supervising runner
+        // delivers yields, so there is nothing to publish for an orphan.
+        if let Some(requested_at) = attempt.yield_requested_at
+            && attempt.state == AttemptState::Running
+            && !matches!(
+                artifacts::read_artifact::<YieldFile>(&dir.join(YIELD_FILE)),
+                Ok(Some(request))
+                    if request.token == attempt.launch_token
+                        && request.requested_at == requested_at
+            )
+        {
+            publish_yield(&self.paths, attempt.id, &attempt.launch_token, requested_at);
         }
 
         // A crash between the limit commit and its publication, or a daemon
@@ -1037,6 +1097,7 @@ impl Coordinator {
             }
             ResultOutcome::TimedOut => (AttemptState::Failed, result.message.clone()),
             ResultOutcome::Cancelled => (AttemptState::Cancelled, result.message.clone()),
+            ResultOutcome::Yielded => (AttemptState::Yielded, result.message.clone()),
         };
         self.finalize_attempt_and_job(
             attempt,
@@ -1074,6 +1135,16 @@ impl Coordinator {
                     .map(|m| json!({ "message": m }).to_string())
                     .as_deref(),
             )?;
+            if attempt.yield_requested_at.is_some() && state != AttemptState::Yielded {
+                db::append_event(
+                    &tx,
+                    Some(attempt.job_id),
+                    Some(attempt.id),
+                    "yield_unfulfilled",
+                    actor,
+                    Some(&json!({ "delivered": attempt.yield_delivered_at.is_some() }).to_string()),
+                )?;
+            }
             let job = db::job_row(&tx, attempt.job_id)?.context("job of finalized attempt")?;
             if !job.state.is_terminal() {
                 match state {
@@ -1085,12 +1156,72 @@ impl Coordinator {
                         db::update_job_state(&tx, job.id, JobState::Cancelled, message, now)?;
                         db::append_event(&tx, Some(job.id), None, "job_cancelled", actor, None)?;
                     }
+                    // The runner died after delivering a yield, so the command
+                    // may well have checkpointed and yielded. Reporting the job
+                    // lost would permanently skip its dependents; hold it for
+                    // the operator to release or cancel instead.
+                    AttemptState::Lost
+                        if attempt.yield_delivered_at.is_some() && !attempt.cancel_requested =>
+                    {
+                        db::update_job_state(
+                            &tx,
+                            job.id,
+                            JobState::Held,
+                            Some(
+                                "runner died after delivering a yield request; the command's \
+                                 outcome is unknown (release to resume, or cancel)",
+                            ),
+                            now,
+                        )?;
+                        db::set_job_retry_not_before(&tx, job.id, None, now)?;
+                        db::clear_job_readiness(&tx, job.id, now)?;
+                        db::append_event(&tx, Some(job.id), None, "job_held", actor, None)?;
+                    }
                     AttemptState::Lost => {
                         db::update_job_state(&tx, job.id, JobState::Lost, message, now)?;
                         db::append_event(&tx, Some(job.id), None, "job_lost", actor, None)?;
                     }
+                    // A cancel committed before the runner saw it still ends
+                    // the job: it is the operator's latest intent.
+                    AttemptState::Yielded if attempt.cancel_requested => {
+                        db::update_job_state(&tx, job.id, JobState::Cancelled, message, now)?;
+                        db::append_event(&tx, Some(job.id), None, "job_cancelled", actor, None)?;
+                    }
+                    AttemptState::Yielded => {
+                        // Back of the line: a fresh readiness sequence puts the
+                        // job behind work that was already waiting at its
+                        // priority, and behind any frozen backfill frontier.
+                        let state = if attempt.yield_hold {
+                            JobState::Held
+                        } else {
+                            JobState::Queued
+                        };
+                        let reason = match &attempt.yield_reason {
+                            Some(reason) => format!("yielded: {reason}"),
+                            None => "yielded".to_string(),
+                        };
+                        db::update_job_state(&tx, job.id, state, Some(&reason), now)?;
+                        db::set_job_retry_not_before(&tx, job.id, None, now)?;
+                        db::clear_job_readiness(&tx, job.id, now)?;
+                        db::append_event(
+                            &tx,
+                            Some(job.id),
+                            Some(attempt.id),
+                            "job_yielded",
+                            actor,
+                            Some(
+                                &json!({
+                                    "reason": attempt.yield_reason,
+                                    "hold": attempt.yield_hold,
+                                })
+                                .to_string(),
+                            ),
+                        )?;
+                    }
                     AttemptState::Failed => {
-                        if job.attempt_count < job.max_attempts && !attempt.cancel_requested {
+                        // Yielded attempts do not consume the retry budget.
+                        let attempts_used = job.attempt_count - job.yield_count;
+                        if attempts_used < job.max_attempts && !attempt.cancel_requested {
                             let not_before = (job.retry_delay_ms > 0)
                                 .then(|| now.saturating_add(job.retry_delay_ms));
                             db::update_job_state(&tx, job.id, JobState::Queued, message, now)?;
@@ -1104,7 +1235,7 @@ impl Coordinator {
                                 "daemon",
                                 Some(
                                     &json!({
-                                        "attemptsUsed": job.attempt_count,
+                                        "attemptsUsed": attempts_used,
                                         "maxAttempts": job.max_attempts,
                                         "notBefore": not_before,
                                     })
@@ -1415,6 +1546,16 @@ impl Coordinator {
                 .create(&dir)?;
         }
 
+        // Attempt context lets an unchanged command resume idempotently from
+        // its own run directory. These names are reserved: they override any
+        // submitted value.
+        let mut env = job.env.clone();
+        env.insert("MLQ_JOB_ID".into(), job.id.to_string());
+        env.insert("MLQ_ATTEMPT".into(), attempt.number.to_string());
+        if let Some(policy) = job.yield_policy {
+            env.insert("MLQ_YIELD_SIGNAL".into(), policy.signal.to_string());
+            env.insert("MLQ_YIELD_EXIT_CODE".into(), policy.exit_code.to_string());
+        }
         match artifacts::read_artifact::<CommandFile>(&dir.join(COMMAND_FILE)) {
             // Crash-recovery respawn of the same attempt: reuse the identical
             // command record.
@@ -1439,11 +1580,12 @@ impl Coordinator {
                         token: attempt.launch_token.clone(),
                         argv: job.args.clone(),
                         cwd: job.cwd.clone(),
-                        env: job.env.clone(),
+                        env,
                         start_wait_ms: self.config.runner_start_wait_ms,
                         cancel_grace_ms: self.config.cancel_grace_ms,
                         poll_ms: self.config.runner_poll_ms,
                         time_limit_ms: job.time_limit_ms.map(|value| value as u64),
+                        yield_policy: job.yield_policy,
                     },
                     true,
                 )?;
@@ -1547,6 +1689,22 @@ fn published_time_limit_is_current(
     }
 }
 
+fn publish_yield(paths: &Paths, attempt_id: AttemptId, token: &str, requested_at: i64) {
+    let dir = paths.attempt_dir(attempt_id);
+    if let Err(err) = artifacts::write_artifact(
+        &dir,
+        YIELD_FILE,
+        &YieldFile {
+            token: token.to_string(),
+            requested_at,
+        },
+        false,
+    ) {
+        // Reconcile republishes the committed request on a later tick.
+        tracing::warn!("publishing yield for attempt {attempt_id}: {err}");
+    }
+}
+
 fn api_not_found(job: JobId) -> ApiError {
     ApiError::new(error_codes::NOT_FOUND, format!("job {job} not found"))
 }
@@ -1586,7 +1744,7 @@ fn apply_mutation(
     op: &Op,
     now: i64,
     context: Option<&crate::job_context::JobContext>,
-) -> ApiResult<(Reply, Vec<PostAction>)> {
+) -> ApiResult<(Reply, Vec<Publish>)> {
     match op {
         Op::Submit(params) => {
             validate_submission_parents(tx, params)?;
@@ -1620,6 +1778,15 @@ fn apply_mutation(
         Op::Cancel { job, force } => {
             let actions = cancel_job(tx, *job, *force, now)?;
             Ok((job_reply(tx, paths, *job)?, actions))
+        }
+        Op::Yield {
+            job,
+            reason,
+            hold,
+            interactive,
+        } => {
+            let action = yield_job(tx, *job, reason, *hold, *interactive, now)?;
+            Ok((job_reply(tx, paths, *job)?, vec![action]))
         }
         Op::Hold { job } => {
             let row = db::job_row(tx, *job)?.ok_or_else(|| api_not_found(*job))?;
@@ -1850,7 +2017,7 @@ fn apply_mutation(
                 ),
             )?;
             let actions = publish
-                .map(|(attempt_id, token)| PostAction::PublishTimeLimit {
+                .map(|(attempt_id, token)| Publish::TimeLimit {
                     attempt_id,
                     token,
                     time_limit_ms: *time_limit_ms,
@@ -1969,12 +2136,7 @@ fn apply_mutation(
     }
 }
 
-fn cancel_job(
-    tx: &Transaction<'_>,
-    job: JobId,
-    force: bool,
-    now: i64,
-) -> ApiResult<Vec<PostAction>> {
+fn cancel_job(tx: &Transaction<'_>, job: JobId, force: bool, now: i64) -> ApiResult<Vec<Publish>> {
     let row = db::job_row(tx, job)?.ok_or_else(|| api_not_found(job))?;
     match row.state {
         JobState::Queued | JobState::Held => {
@@ -2032,21 +2194,19 @@ fn cancel_job(
                     )?;
                     db::append_event(tx, Some(row.id), None, "job_cancelled", "client", None)?;
                     db::advance_dependency_graph(tx, now)?;
-                    Ok(vec![PostAction::PublishCancel {
+                    Ok(vec![Publish::Cancel {
                         attempt_id: attempt.id,
                         token: attempt.launch_token.clone(),
                         force: publish_force,
                         requested_at,
                     }])
                 }
-                AttemptState::Authorized | AttemptState::Running => {
-                    Ok(vec![PostAction::PublishCancel {
-                        attempt_id: attempt.id,
-                        token: attempt.launch_token.clone(),
-                        force: publish_force,
-                        requested_at,
-                    }])
-                }
+                AttemptState::Authorized | AttemptState::Running => Ok(vec![Publish::Cancel {
+                    attempt_id: attempt.id,
+                    token: attempt.launch_token.clone(),
+                    force: publish_force,
+                    requested_at,
+                }]),
                 // Reconcile checks the group's boot and leader identity
                 // before signalling. A bare pgid here could already name an
                 // unrelated group that reused the original number.
@@ -2074,6 +2234,101 @@ fn cancel_job(
             format!("job {} is {state} and cannot be cancelled", row.id),
         )),
     }
+}
+
+/// Longest accepted yield reason, in characters. Reasons are an audit note,
+/// not a log.
+const MAX_YIELD_REASON_CHARS: usize = 500;
+
+fn yield_job(
+    tx: &Transaction<'_>,
+    job: JobId,
+    reason: &str,
+    hold: bool,
+    interactive: bool,
+    now: i64,
+) -> ApiResult<Publish> {
+    let reason = reason.trim();
+    if reason.is_empty() || reason.contains('\0') || reason.chars().count() > MAX_YIELD_REASON_CHARS
+    {
+        return Err(ApiError::new(
+            error_codes::INVALID_ARGUMENT,
+            format!("a yield reason is required (at most {MAX_YIELD_REASON_CHARS} characters)"),
+        ));
+    }
+    let row = db::job_row(tx, job)?.ok_or_else(|| api_not_found(job))?;
+    let invalid = |message: String| ApiError::new(error_codes::INVALID_STATE, message);
+    // The daemon only sends a signal the workload declared it understands.
+    let Some(policy) = row.yield_policy else {
+        return Err(invalid(format!(
+            "job {} did not opt into cooperative yield at submission (--yield-signal)",
+            row.id
+        )));
+    };
+    if row.state != JobState::Running {
+        return Err(invalid(format!(
+            "only running jobs can yield; job {} is {}",
+            row.id, row.state
+        )));
+    }
+    let attempt = db::live_attempt_for_job(tx, row.id)?
+        .filter(|attempt| attempt.state == AttemptState::Running)
+        .ok_or_else(|| {
+            invalid(format!(
+                "job {} has no supervised running attempt to yield",
+                row.id
+            ))
+        })?;
+    if attempt.cancel_requested {
+        return Err(invalid(format!(
+            "job {} already has a cancellation in progress",
+            row.id
+        )));
+    }
+    // The first request stands; the runner delivers the signal only once.
+    if let Some(requested_at) = attempt.yield_requested_at {
+        return Ok(Publish::Yield {
+            attempt_id: attempt.id,
+            token: attempt.launch_token,
+            requested_at,
+        });
+    }
+    // Requeueing goes to the back of the job's priority class. With nothing
+    // eligible at that priority or above, the job would simply restart from
+    // its checkpoint, so the yield would cost work and free nothing.
+    if !hold
+        && !db::eligible_candidates(tx, now)?
+            .iter()
+            .any(|candidate| candidate.job_id != row.id && candidate.priority >= row.priority)
+    {
+        return Err(invalid(format!(
+            "no queued job would run ahead of job {} if it yielded now; \
+             pass --hold to park it until `mlq release`",
+            row.id
+        )));
+    }
+    db::set_attempt_yield_requested(tx, attempt.id, reason, hold, now)?;
+    db::append_event(
+        tx,
+        Some(row.id),
+        Some(attempt.id),
+        "yield_requested",
+        "client",
+        Some(
+            &json!({
+                "reason": reason,
+                "hold": hold,
+                "signal": policy.signal,
+                "interactive": interactive,
+            })
+            .to_string(),
+        ),
+    )?;
+    Ok(Publish::Yield {
+        attempt_id: attempt.id,
+        token: attempt.launch_token,
+        requested_at: now,
+    })
 }
 
 fn validate_time_limit(limit: Option<u64>) -> ApiResult<Option<i64>> {
@@ -2106,6 +2361,15 @@ fn validate_submission_fs(params: &SubmitParams) -> ApiResult<()> {
     }
     if i64::try_from(params.retry_delay_ms).is_err() {
         return Err(invalid("retryDelayMs is too large".into()));
+    }
+    if let Some(policy) = params.yield_policy
+        && !domain::YIELD_EXIT_CODES.contains(&policy.exit_code.get())
+    {
+        return Err(invalid(format!(
+            "yieldExitCode must be between {} and {}",
+            domain::YIELD_EXIT_CODES.start(),
+            domain::YIELD_EXIT_CODES.end()
+        )));
     }
     if params.time_limit_ms == Some(0) {
         return Err(invalid("timeLimitMs must be a positive integer".into()));
@@ -2200,6 +2464,7 @@ mod tests {
             cancel_grace_ms: 1,
             poll_ms: 10,
             time_limit_ms: limit,
+            yield_policy: None,
         }
     }
 
@@ -2215,6 +2480,7 @@ mod tests {
             retry_delay_ms: 0,
             time_limit_ms: None,
             dependencies: Vec::new(),
+            yield_policy: None,
         }
     }
 
@@ -2411,6 +2677,7 @@ mod tests {
             retry_delay_ms: 0,
             time_limit_ms: None,
             dependencies: Vec::new(),
+            yield_policy: None,
         };
         let job = db::insert_job(&conn, &params, 1000).unwrap();
         let other = db::insert_job(&conn, &params, 1000).unwrap();

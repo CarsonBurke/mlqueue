@@ -1,7 +1,7 @@
 //! Core identifiers, states, and invariant-bearing value types.
 
 use std::fmt;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU8, NonZeroU32};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -132,6 +132,9 @@ str_enum!(AttemptState {
     Failed => "failed",
     Cancelled => "cancelled",
     Lost => "lost",
+    // The command honored an operator yield request by exiting with its
+    // declared yield code. The job returns to the queue.
+    Yielded => "yielded",
 });
 
 str_enum!(DependencyCondition {
@@ -182,9 +185,82 @@ impl AttemptState {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Succeeded | Self::Failed | Self::Cancelled | Self::Lost
+            Self::Succeeded | Self::Failed | Self::Cancelled | Self::Lost | Self::Yielded
         )
     }
+}
+
+/// Signals a job may declare for cooperative yield. Only the user-defined
+/// signals qualify: cancellation and time limits send SIGTERM, and the others
+/// already mean something to shells and runtimes (SIGINT raises
+/// KeyboardInterrupt in Python), so a workload could not tell a yield apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum YieldSignal {
+    #[serde(rename = "SIGUSR1")]
+    Usr1,
+    #[serde(rename = "SIGUSR2")]
+    Usr2,
+}
+
+impl YieldSignal {
+    const ALL: [Self; 2] = [Self::Usr1, Self::Usr2];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Usr1 => "SIGUSR1",
+            Self::Usr2 => "SIGUSR2",
+        }
+    }
+
+    pub fn number(self) -> i32 {
+        match self {
+            Self::Usr1 => libc::SIGUSR1,
+            Self::Usr2 => libc::SIGUSR2,
+        }
+    }
+}
+
+impl FromStr for YieldSignal {
+    type Err = String;
+
+    /// Accepts `SIGUSR1`, `USR1`, or `usr1`.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let upper = s.to_ascii_uppercase();
+        let name = upper.strip_prefix("SIG").unwrap_or(&upper);
+        Self::ALL
+            .into_iter()
+            .find(|signal| &signal.as_str()[3..] == name)
+            .ok_or_else(|| {
+                format!(
+                    "unsupported yield signal {s:?}; expected one of {}",
+                    Self::ALL.map(Self::as_str).join(", ")
+                )
+            })
+    }
+}
+
+impl fmt::Display for YieldSignal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// EX_TEMPFAIL from sysexits.h: "try again later".
+pub const DEFAULT_YIELD_EXIT_CODE: NonZeroU8 = NonZeroU8::new(75).unwrap();
+
+/// Exit codes a job may declare as its yield code. 1 and 2 are what crashing
+/// interpreters and shells exit with, and 126 and up mean "cannot execute" or
+/// "killed by a signal"; treating any of them as a yield would requeue a crash.
+pub const YIELD_EXIT_CODES: std::ops::RangeInclusive<u8> = 3..=125;
+
+/// A job's opt-in cooperative-yield contract: on `signal`, the command saves
+/// a checkpoint when it can and then exits with `exit_code`. The daemon never
+/// sends the signal on its own initiative and never escalates it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct YieldPolicy {
+    pub signal: YieldSignal,
+    pub exit_code: NonZeroU8,
 }
 
 #[cfg(test)]
@@ -236,5 +312,28 @@ mod tests {
             AttemptState::Prepared
         );
         assert!("bogus".parse::<JobState>().is_err());
+        assert_eq!(
+            "yielded".parse::<AttemptState>().unwrap(),
+            AttemptState::Yielded
+        );
+        assert!(AttemptState::Yielded.is_terminal());
+    }
+
+    #[test]
+    fn yield_signals_parse_with_or_without_prefix_and_reject_the_rest() {
+        assert_eq!("SIGUSR1".parse(), Ok(YieldSignal::Usr1));
+        assert_eq!("usr2".parse(), Ok(YieldSignal::Usr2));
+        for rejected in ["TERM", "SIGINT", "KILL", "SIGSTOP", "CHLD", "10", ""] {
+            assert!(rejected.parse::<YieldSignal>().is_err(), "{rejected}");
+        }
+        assert_eq!(YieldSignal::Usr1.number(), libc::SIGUSR1);
+        assert_eq!(
+            serde_json::to_string(&YieldPolicy {
+                signal: YieldSignal::Usr1,
+                exit_code: DEFAULT_YIELD_EXIT_CODE,
+            })
+            .unwrap(),
+            r#"{"signal":"SIGUSR1","exitCode":75}"#
+        );
     }
 }

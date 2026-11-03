@@ -30,6 +30,10 @@ pub struct Config {
     pub max_frame_bytes: u32,
     /// Idle client connections are closed after this long.
     pub idle_timeout_ms: u64,
+    /// Accept `mlq yield` from clients without a terminal, such as agents'
+    /// shell tools. Off by default so yielding someone's job stays an
+    /// operator decision.
+    pub allow_noninteractive_yield: bool,
 }
 
 impl Default for Config {
@@ -44,6 +48,7 @@ impl Default for Config {
             max_connections: 64,
             max_frame_bytes: 1 << 20,
             idle_timeout_ms: 60_000,
+            allow_noninteractive_yield: false,
         }
     }
 }

@@ -4,6 +4,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::num::NonZeroU8;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -11,7 +12,9 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
 use crate::client::{self, ClientError};
-use crate::domain::{AttemptState, DependencyCondition, JobId};
+use crate::domain::{
+    AttemptState, DEFAULT_YIELD_EXIT_CODE, DependencyCondition, JobId, YieldPolicy, YieldSignal,
+};
 use crate::paths::Paths;
 use crate::protocol::{
     DependencySpec, EventView, JobView, LogPathsView, Op, Reply, ResolveAs, StatusView,
@@ -110,6 +113,22 @@ enum Command {
         job: JobId,
         #[arg(long)]
         force: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ask a running job that opted in with --yield-signal to checkpoint and
+    /// exit, returning it to the back of its priority class under the same
+    /// job ID. The command chooses when to exit (or not to); mlq never
+    /// escalates. An operator action: requires a terminal unless the daemon
+    /// config sets allow_noninteractive_yield.
+    Yield {
+        job: JobId,
+        /// Why the job is being yielded; recorded in the job's history.
+        #[arg(long)]
+        reason: String,
+        /// Requeue the job held, so it resumes only after `mlq release`.
+        #[arg(long)]
+        hold: bool,
         #[arg(long)]
         json: bool,
     },
@@ -265,6 +284,16 @@ struct SubmitArgs {
     /// compilation are included.
     #[arg(long, value_parser = humantime::parse_duration)]
     time_limit: Option<Duration>,
+    /// Opt into cooperative yield: on this signal (SIGUSR1 or SIGUSR2), the
+    /// command's leader process saves a checkpoint when it can and then exits
+    /// with --yield-exit-code. Only `mlq yield` sends it, at most once per
+    /// attempt, and never escalates.
+    #[arg(long, value_parser = parse_yield_signal)]
+    yield_signal: Option<YieldSignal>,
+    /// Exit code meaning "checkpointed and yielded": 3 to 125 (default 75,
+    /// EX_TEMPFAIL).
+    #[arg(long, requires = "yield_signal", value_parser = parse_yield_exit_code)]
+    yield_exit_code: Option<NonZeroU8>,
     /// Start only after this job terminally succeeds (repeatable).
     #[arg(long = "after-success")]
     after_success: Vec<JobId>,
@@ -282,6 +311,26 @@ struct SubmitArgs {
     /// The command to run, after `--`.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
     command: Vec<String>,
+}
+
+fn parse_yield_signal(value: &str) -> Result<YieldSignal, String> {
+    value.parse()
+}
+
+fn parse_yield_exit_code(value: &str) -> Result<NonZeroU8, String> {
+    let range = crate::domain::YIELD_EXIT_CODES;
+    value
+        .parse::<u8>()
+        .ok()
+        .filter(|code| range.contains(code))
+        .and_then(NonZeroU8::new)
+        .ok_or_else(|| {
+            format!(
+                "expected an exit code from {} to {}, got {value:?}",
+                range.start(),
+                range.end()
+            )
+        })
 }
 
 pub fn main() -> Result<()> {
@@ -331,6 +380,28 @@ pub fn main() -> Result<()> {
         }
         Command::Cancel { job, force, json } => {
             mutate_job(&paths, Op::Cancel { job, force }, key, json)
+        }
+        Command::Yield {
+            job,
+            reason,
+            hold,
+            json,
+        } => {
+            let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+            if interactive && !confirm_yield(&paths, job, hold)? {
+                bail!("yield not confirmed; job {job} was not signalled");
+            }
+            mutate_job(
+                &paths,
+                Op::Yield {
+                    job,
+                    reason,
+                    hold,
+                    interactive,
+                },
+                key,
+                json,
+            )
         }
         Command::Hold { job, json } => mutate_job(&paths, Op::Hold { job }, key, json),
         Command::Release { job, json } => mutate_job(&paths, Op::Release { job }, key, json),
@@ -463,6 +534,34 @@ fn send(paths: &Paths, op: Op, key: Option<String>) -> Result<Reply> {
     }
 }
 
+/// Ask the person at the terminal to confirm a yield. A terminal on stdin is
+/// all the daemon is told, and agent harnesses that run commands in a
+/// pseudo-terminal have one too; the prompt makes passing the gate an answer
+/// to a question rather than a side effect of how the command was run.
+fn confirm_yield(paths: &Paths, job: JobId, hold: bool) -> Result<bool> {
+    use std::io::Write as _;
+
+    let Reply::Job { job } = send(paths, Op::Show { job }, None)? else {
+        bail!(client::unexpected("job"))
+    };
+    let afterwards = if hold {
+        "held until `mlq release`"
+    } else {
+        "requeued behind the work waiting at its priority"
+    };
+    eprint!(
+        "Yield job {} [{}] ({}, attempt {})? It is asked to checkpoint and exit, then {afterwards}. [y/N] ",
+        job.id, job.name, job.state, job.attempt_count
+    );
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
 fn mutate_job(paths: &Paths, op: Op, key: String, json: bool) -> Result<()> {
     let reply = send(paths, op.clone(), Some(key))?;
     let Reply::Job { job } = reply else {
@@ -506,6 +605,26 @@ fn format_mutation_message(op: &Op, job: &JobView) -> String {
     {
         let force = if *force { " (force)" } else { "" };
         return format!("job {} [{}] cancel requested{force}", job.id, job.name);
+    }
+
+    if matches!(op, Op::Yield { .. })
+        && let (Some(request), Some(policy)) = (&job.yield_request, job.yield_policy)
+    {
+        // Report the standing request: a repeat changes nothing, and the
+        // signal it asked for may already have been sent and declined.
+        let requeue = if request.hold { "held" } else { "queued" };
+        let status = if request.delivered {
+            format!(
+                "{} was already sent and is not sent again; the command owes the yield at its next checkpoint",
+                policy.signal
+            )
+        } else {
+            "yield requested".to_string()
+        };
+        return format!(
+            "job {} [{}] {status}; it returns {requeue} if the command exits with code {}",
+            job.id, job.name, policy.exit_code
+        );
     }
 
     if matches!(op, Op::SetMaxParallelRuns { .. }) {
@@ -622,6 +741,10 @@ fn submit(paths: &Paths, args: SubmitArgs, key: String) -> Result<()> {
         max_attempts: args.max_attempts,
         retry_delay_ms,
         time_limit_ms,
+        yield_policy: args.yield_signal.map(|signal| YieldPolicy {
+            signal,
+            exit_code: args.yield_exit_code.unwrap_or(DEFAULT_YIELD_EXIT_CODE),
+        }),
         dependencies: args
             .after_terminal
             .into_iter()
@@ -882,6 +1005,10 @@ fn follow_tts_announcement(events: &[EventView]) -> Option<String> {
                     }
                     None => format!("An attempt for {} failed and a retry is queued", name()),
                 });
+                started.remove(&event.job);
+            }
+            "job_yielded" => {
+                outcomes.push(format!("{} checkpointed and yielded its turn", name()));
                 started.remove(&event.job);
             }
             "attempt_orphaned" | "attempt_quarantined" => {
@@ -1176,11 +1303,20 @@ fn write_status_job(output: &mut String, job: &JobView) {
         .as_deref()
         .or(job.state_reason.as_deref())
         .filter(|reason| !reason.is_empty() && *reason != "-");
-    let reason = match (job.cancel_requested == Some(true), prior) {
-        (true, Some(prior)) => format!("cancel_requested; {prior}"),
-        (true, None) => "cancel_requested".to_string(),
-        (false, Some(prior)) => prior.to_string(),
-        (false, None) => "-".to_string(),
+    let pending = [
+        (job.cancel_requested == Some(true)).then_some("cancel_requested"),
+        job.yield_request.is_some().then_some("yield_requested"),
+    ];
+    let reason = pending
+        .into_iter()
+        .flatten()
+        .chain(prior)
+        .collect::<Vec<_>>()
+        .join("; ");
+    let reason = if reason.is_empty() {
+        "-".to_string()
+    } else {
+        reason
     };
     writeln!(
         output,
@@ -1190,7 +1326,7 @@ fn write_status_job(output: &mut String, job: &JobView) {
         job.state,
         job.priority,
         job.max_parallel_runs,
-        format!("{}/{}", job.attempt_count, job.max_attempts),
+        format!("{}/{}", counted_attempts(job), job.max_attempts),
         reason,
         width = STATUS_NAME_WIDTH,
     )
@@ -1219,6 +1355,15 @@ fn print_job_detail(job: &JobView) {
     if job.cancel_requested == Some(true) {
         println!("  cancel requested: yes");
     }
+    if let Some(request) = &job.yield_request {
+        let delivered = if request.delivered {
+            "signal sent"
+        } else {
+            "not yet signalled"
+        };
+        let hold = if request.hold { ", then hold" } else { "" };
+        println!("  yield requested:  {delivered}{hold}");
+    }
     println!("  priority:         {}", job.priority);
     println!("  maxParallelRuns:  {}", job.max_parallel_runs);
     if let Some(context) = &job.context {
@@ -1228,9 +1373,20 @@ fn print_job_detail(job: &JobView) {
     println!("  cwd:              {}", job.cwd);
     println!("  command:          {}", shell_join(&job.args));
     println!(
-        "  attempts:         {}/{}",
-        job.attempt_count, job.max_attempts
+        "  attempts:         {}/{}{}",
+        counted_attempts(job),
+        job.max_attempts,
+        match job.yield_count {
+            0 => String::new(),
+            yields => format!(" (+{yields} yielded)"),
+        }
     );
+    if let Some(policy) = job.yield_policy {
+        println!(
+            "  yield:            {} -> exit {}",
+            policy.signal, policy.exit_code
+        );
+    }
     for dependency in &job.dependencies {
         let outcome = match (&dependency.resolution, &dependency.parent_outcome) {
             (Some(resolution), Some(parent_outcome)) => {
@@ -1272,8 +1428,16 @@ fn print_job_detail(job: &JobView) {
                 None => String::new(),
             }
         );
+        if let Some(reason) = &attempt.yield_reason {
+            println!("    yield requested: {reason}");
+        }
         println!("    logs: {}", attempt.log_dir);
     }
+}
+
+/// Attempts that count toward `maxAttempts`; yielded attempts do not.
+fn counted_attempts(job: &JobView) -> i64 {
+    job.attempt_count - job.yield_count
 }
 
 fn see(paths: &Paths, job: Option<JobId>, json: bool) -> Result<()> {
@@ -1547,6 +1711,7 @@ fn shell_join(args: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::YieldRequestView;
 
     #[test]
     fn submit_rejects_a_retry_delay_that_overflows_milliseconds() {
@@ -1667,6 +1832,9 @@ mod tests {
             dependencies: vec![],
             attempts: vec![],
             cancel_requested: None,
+            yield_policy: None,
+            yield_count: 0,
+            yield_request: None,
         }
     }
 
@@ -1712,6 +1880,103 @@ mod tests {
             panic!("expected submit command")
         };
         assert_eq!(args.time_limit, Some(Duration::from_secs(90 * 60)));
+    }
+
+    #[test]
+    fn submit_parses_a_yield_policy_and_bounds_its_exit_code() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["mlq", "submit"];
+            argv.extend_from_slice(extra);
+            argv.extend_from_slice(&["--", "true"]);
+            Cli::try_parse_from(argv)
+        };
+        let Command::Submit(args) = parse(&["--yield-signal", "usr1"]).unwrap().command else {
+            panic!("expected submit command")
+        };
+        assert_eq!(args.yield_signal, Some(YieldSignal::Usr1));
+        assert_eq!(args.yield_exit_code, None);
+        let Command::Submit(args) = parse(&["--yield-signal", "SIGUSR2", "--yield-exit-code", "3"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected submit command")
+        };
+        assert_eq!(args.yield_signal, Some(YieldSignal::Usr2));
+        assert_eq!(args.yield_exit_code.map(NonZeroU8::get), Some(3));
+
+        for rejected in [
+            &["--yield-signal", "TERM"][..],
+            &["--yield-signal", "USR1", "--yield-exit-code", "1"],
+            &["--yield-signal", "USR1", "--yield-exit-code", "126"],
+            // An exit code alone would declare nothing.
+            &["--yield-exit-code", "75"],
+        ] {
+            assert!(parse(rejected).is_err(), "{rejected:?}");
+        }
+    }
+
+    #[test]
+    fn yield_requires_a_reason() {
+        assert!(Cli::try_parse_from(["mlq", "yield", "4"]).is_err());
+        let cli =
+            Cli::try_parse_from(["mlq", "yield", "4", "--reason", "drain", "--hold"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Yield {
+                job: 4,
+                hold: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn yield_mutation_message_reports_the_standing_request() {
+        let mut job = status_job(9, "running", None);
+        job.yield_policy = Some(YieldPolicy {
+            signal: YieldSignal::Usr1,
+            exit_code: DEFAULT_YIELD_EXIT_CODE,
+        });
+        job.yield_request = Some(YieldRequestView {
+            reason: "drain".into(),
+            requested_at: 1,
+            hold: true,
+            delivered: false,
+        });
+        // A repeat without --hold reports the first request's choice.
+        let op = Op::Yield {
+            job: 9,
+            reason: "again".into(),
+            hold: false,
+            interactive: true,
+        };
+        assert_eq!(
+            format_mutation_message(&op, &job),
+            "job 9 [running-9] yield requested; it returns held if the command exits with code 75"
+        );
+        job.yield_request.as_mut().unwrap().delivered = true;
+        assert_eq!(
+            format_mutation_message(&op, &job),
+            "job 9 [running-9] SIGUSR1 was already sent and is not sent again; the command owes \
+             the yield at its next checkpoint; it returns held if the command exits with code 75"
+        );
+    }
+
+    #[test]
+    fn status_counts_only_non_yielded_attempts_and_flags_a_pending_yield() {
+        let mut job = status_job(5, "running", None);
+        job.attempt_count = 3;
+        job.yield_count = 2;
+        job.yield_request = Some(YieldRequestView {
+            reason: "drain".into(),
+            requested_at: 1,
+            hold: false,
+            delivered: false,
+        });
+        let mut output = String::new();
+        write_status_job(&mut output, &job);
+        assert!(output.contains(" 1/1 "), "{output}");
+        assert!(output.contains("yield_requested"), "{output}");
     }
 
     #[test]

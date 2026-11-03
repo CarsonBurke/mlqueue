@@ -12,7 +12,7 @@ use crate::domain::{JobState, now_ms};
 use crate::paths::Paths;
 use crate::protocol::{
     AttemptView, DependencyView, EventView, FollowTtsJobView, FollowTtsSnapshotView, JobView,
-    ReservationView, StatusView,
+    ReservationView, StatusView, YieldRequestView,
 };
 
 const TTS_NAME_LIMIT: usize = 80;
@@ -69,6 +69,8 @@ pub fn attempt_view(paths: &Paths, attempt: &AttemptRow) -> AttemptView {
         message: attempt.message.clone(),
         created_at: attempt.created_at,
         finished_at: attempt.finished_at,
+        yield_requested_at: attempt.yield_requested_at,
+        yield_reason: attempt.yield_reason.clone(),
         log_dir: paths.attempt_dir(attempt.id).display().to_string(),
     }
 }
@@ -159,9 +161,19 @@ pub fn job_view(
     } else {
         Vec::new()
     };
-    let cancel_requested = db::live_attempt_for_job(conn, job.id)?
+    let live_attempt = db::live_attempt_for_job(conn, job.id)?;
+    let cancel_requested = live_attempt
+        .as_ref()
         .map(|attempt| attempt.cancel_requested)
         .filter(|&requested| requested);
+    let yield_request = live_attempt.as_ref().and_then(|attempt| {
+        Some(YieldRequestView {
+            reason: attempt.yield_reason.clone().unwrap_or_default(),
+            requested_at: attempt.yield_requested_at?,
+            hold: attempt.yield_hold,
+            delivered: attempt.yield_delivered_at.is_some(),
+        })
+    });
     let dependencies = if include_attempts {
         db::dependencies_of(conn, job.id)?
             .into_iter()
@@ -202,6 +214,9 @@ pub fn job_view(
         dependencies,
         attempts,
         cancel_requested,
+        yield_policy: job.yield_policy,
+        yield_count: job.yield_count,
+        yield_request,
     })
 }
 

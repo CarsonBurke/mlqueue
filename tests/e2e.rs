@@ -2783,3 +2783,225 @@ timeout = "30s"
         }
     }
 }
+
+/// A checkpointing workload: attempt 1 runs until it is asked to yield,
+/// then exits with the yield code; later attempts run `then`.
+const YIELDING_WORKLOAD: &str = r#"echo "job=$MLQ_JOB_ID attempt=$MLQ_ATTEMPT signal=$MLQ_YIELD_SIGNAL code=$MLQ_YIELD_EXIT_CODE"
+if [ "$MLQ_ATTEMPT" != 1 ]; then exec sh -c "$1"; fi
+trap 'echo checkpointed; exit 75' USR1
+while :; do sleep 0.05; done"#;
+
+fn yield_queue() -> TestQueue {
+    TestQueue::with_config(20, "allow_noninteractive_yield = true\n")
+}
+
+fn attempt_states(q: &TestQueue, job: i64) -> Vec<String> {
+    q.job(job)["attempts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|attempt| attempt["state"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn a_yielded_job_keeps_its_id_and_dependents_and_runs_after_waiting_work() {
+    let q = yield_queue();
+    let job = q.submit(
+        &["--name", "trainer", "--yield-signal", "USR1"],
+        &["sh", "-c", YIELDING_WORKLOAD, "workload", "exit 0"],
+    );
+    q.wait_state(job, "running", Duration::from_secs(10));
+    let waiting = q.submit(&["--name", "waiting"], &["sh", "-c", "sleep 0.3"]);
+    let probe = q.submit(
+        &["--name", "probe", "--after-success", &job.to_string()],
+        &["true"],
+    );
+
+    let out = q.cli(&["yield", &job.to_string(), "--reason", "let the queue drain"]);
+    assert!(out.contains("yield requested"), "{out}");
+    // Asking again is not an error, and the first reason stands.
+    q.cli(&["yield", &job.to_string(), "--reason", "second ask"]);
+
+    q.wait_state(probe, "succeeded", Duration::from_secs(20));
+    assert_eq!(q.job_state(job), "succeeded");
+    assert_eq!(q.job_state(waiting), "succeeded");
+    assert_eq!(attempt_states(&q, job), ["yielded", "succeeded"]);
+
+    let detail = q.job(job);
+    assert_eq!(detail["yieldCount"], 1);
+    assert_eq!(detail["yieldPolicy"]["signal"], "SIGUSR1");
+    assert_eq!(detail["attempts"][0]["exitCode"], 75);
+    assert_eq!(detail["attempts"][0]["yieldReason"], "let the queue drain");
+    // The waiting job ran in the gap, before the second attempt was admitted.
+    let waiting_finished = q.job(waiting)["finishedAt"].as_i64().unwrap();
+    assert!(detail["attempts"][1]["createdAt"].as_i64().unwrap() >= waiting_finished);
+
+    let first = q.cli(&["logs", &job.to_string(), "--attempt", "1"]);
+    assert!(
+        first.contains(&format!("job={job} attempt=1 signal=SIGUSR1 code=75"))
+            && first.contains("checkpointed"),
+        "{first}"
+    );
+    let second = q.cli(&["logs", &job.to_string(), "--attempt", "2"]);
+    assert!(second.contains(&format!("job={job} attempt=2")), "{second}");
+}
+
+#[test]
+fn yielded_attempts_do_not_consume_the_retry_budget() {
+    let q = yield_queue();
+    // Attempt 2 fails once; attempt 3 succeeds. With max-attempts 2, that
+    // retry only happens if the yielded attempt was not counted.
+    let job = q.submit(
+        &[
+            "--name",
+            "budget",
+            "--yield-signal",
+            "usr2",
+            "--max-attempts",
+            "2",
+        ],
+        &[
+            "sh",
+            "-c",
+            &YIELDING_WORKLOAD.replace("USR1", "USR2"),
+            "workload",
+            r#"[ "$MLQ_ATTEMPT" = 3 ]"#,
+        ],
+    );
+    q.wait_state(job, "running", Duration::from_secs(10));
+    q.cli(&["yield", &job.to_string(), "--reason", "test", "--hold"]);
+    q.wait_state(job, "held", Duration::from_secs(10));
+    assert!(
+        q.job(job)["stateReason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("yielded: test")),
+        "{}",
+        q.job(job)
+    );
+    q.cli(&["release", &job.to_string()]);
+    q.wait_state(job, "succeeded", Duration::from_secs(20));
+    assert_eq!(attempt_states(&q, job), ["yielded", "failed", "succeeded"]);
+}
+
+#[test]
+fn yield_is_refused_unless_the_job_opted_in_and_someone_is_waiting() {
+    let q = yield_queue();
+    let plain = q.submit(&["--name", "plain"], &["sleep", "30"]);
+    q.wait_state(plain, "running", Duration::from_secs(10));
+    let refused = q.try_cli(&["yield", &plain.to_string(), "--reason", "mine now"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("did not opt into"));
+    q.cli(&["cancel", &plain.to_string(), "--force"]);
+    q.wait_state(plain, "cancelled", Duration::from_secs(10));
+
+    let job = q.submit(
+        &["--name", "alone", "--yield-signal", "USR1"],
+        &["sh", "-c", YIELDING_WORKLOAD, "workload", "exit 0"],
+    );
+    q.wait_state(job, "running", Duration::from_secs(10));
+    // Nothing would run ahead of it, so yielding would only cost work.
+    let pointless = q.try_cli(&["yield", &job.to_string(), "--reason", "idle"]);
+    assert!(!pointless.status.success());
+    assert!(String::from_utf8_lossy(&pointless.stderr).contains("--hold"));
+    // A higher-priority job also keeps its place over lower-priority waiters.
+    q.submit(&["--name", "lower", "--priority", "-1"], &["true"]);
+    assert!(
+        !q.try_cli(&["yield", &job.to_string(), "--reason", "idle"])
+            .status
+            .success()
+    );
+    assert_eq!(attempt_states(&q, job), ["running"]);
+    assert_eq!(q.job(job)["yieldRequest"], serde_json::Value::Null);
+}
+
+#[test]
+fn yield_requires_a_terminal_unless_the_daemon_allows_otherwise() {
+    let q = TestQueue::new();
+    let job = q.submit(
+        &["--name", "trainer", "--yield-signal", "USR1"],
+        &["sh", "-c", YIELDING_WORKLOAD, "workload", "exit 0"],
+    );
+    q.wait_state(job, "running", Duration::from_secs(10));
+    q.submit(&["--name", "waiting"], &["true"]);
+    let refused = q.try_cli(&["yield", &job.to_string(), "--reason", "agent"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("interactive terminal"));
+    assert_eq!(attempt_states(&q, job), ["running"]);
+    q.cli(&["cancel", &job.to_string()]);
+}
+
+#[test]
+fn a_declined_yield_leaves_the_outcome_to_the_command_and_cancel_still_wins() {
+    let q = yield_queue();
+    // Handles the signal (no checkpoint yet) and keeps running.
+    let job = q.submit(
+        &["--name", "no-checkpoint", "--yield-signal", "USR1"],
+        &[
+            "sh",
+            "-c",
+            "trap 'echo not yet' USR1; while :; do sleep 0.05; done",
+        ],
+    );
+    q.wait_state(job, "running", Duration::from_secs(10));
+    q.submit(&["--name", "waiting"], &["true"]);
+    q.cli(&["yield", &job.to_string(), "--reason", "try"]);
+    wait_for("the yield to be delivered", Duration::from_secs(10), || {
+        q.cli(&["logs", &job.to_string()]).contains("not yet")
+    });
+    assert_eq!(q.job_state(job), "running");
+    wait_for(
+        "the delivery to be recorded",
+        Duration::from_secs(10),
+        || q.job(job)["yieldRequest"]["delivered"] == true,
+    );
+    assert_eq!(q.job(job)["yieldRequest"]["hold"], false);
+    // A repeat neither re-signals nor changes the standing request.
+    let repeat = q.cli(&["yield", &job.to_string(), "--reason", "again", "--hold"]);
+    assert!(repeat.contains("not sent again"), "{repeat}");
+    assert!(repeat.contains("returns queued"), "{repeat}");
+    assert_eq!(q.job(job)["yieldRequest"]["reason"], "try");
+
+    q.cli(&["cancel", &job.to_string()]);
+    q.wait_state(job, "cancelled", Duration::from_secs(10));
+    assert_eq!(attempt_states(&q, job), ["cancelled"]);
+}
+
+#[test]
+fn a_runner_that_dies_after_delivering_a_yield_holds_the_job_for_the_operator() {
+    let q = yield_queue();
+    let job = q.submit(
+        &["--name", "trainer", "--yield-signal", "USR1"],
+        &[
+            "sh",
+            "-c",
+            "trap 'sleep 0.5; exit 75' USR1; while :; do sleep 0.05; done",
+        ],
+    );
+    q.wait_state(job, "running", Duration::from_secs(10));
+    let probe = q.submit(
+        &["--name", "probe", "--after-success", &job.to_string()],
+        &["true"],
+    );
+    q.cli(&["yield", &job.to_string(), "--reason", "drain", "--hold"]);
+
+    let attempt_dir = PathBuf::from(q.job(job)["attempts"][0]["logDir"].as_str().unwrap());
+    wait_for("the yield delivery record", Duration::from_secs(10), || {
+        attempt_dir.join("yield_sent.json").exists()
+    });
+    let identity: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(attempt_dir.join("identity.json")).unwrap()).unwrap();
+    let runner_pid = identity["runner_pid"].as_i64().unwrap() as i32;
+    assert_eq!(unsafe { libc::kill(runner_pid, libc::SIGKILL) }, 0);
+
+    // Without the runner the exit code is unknown, but the job is not lost:
+    // its dependent keeps waiting instead of being skipped.
+    q.wait_state(job, "held", Duration::from_secs(10));
+    assert_eq!(attempt_states(&q, job), ["lost"]);
+    assert!(
+        q.job(job)["stateReason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("outcome is unknown"))
+    );
+    assert_eq!(q.job_state(probe), "queued");
+}

@@ -23,7 +23,10 @@ The daemon does **not**:
 - Discover GPUs or parse NVIDIA/ROCm telemetry
 - Meter or reserve VRAM, RAM, CPU, or wall time
 - Infer workload type from commands or repositories
-- Preempt, suspend, or checkpoint healthy work
+- Preempt, suspend, or checkpoint healthy work on its own initiative. An
+  operator may ask an opted-in job to yield (see
+  [Cooperative yield](#cooperative-yield)); the job decides whether and when
+  to stop.
 - Detect unmanaged processes or foreign GPU use
 - Accept remote submission or multi-user isolation
 
@@ -156,6 +159,7 @@ drained for the window so they cannot hold it open forever.
 | `set-max-parallel-runs` | queued, held, starting, running, needs_attention | Live path updates job + attempt + lease atomically; lowering may leave the set temporarily oversubscribed until excess leases drain |
 | `set-priority` | queued, held only | No preemption; invalidates reservation if the protected job’s priority changes |
 | `set-time-limit` | queued, held, starting, running, needs_attention | Replaces the per-attempt wall-clock limit (`--clear` removes it). A live runner adopts the new deadline, still measured from command spawn, on its next poll. A limit already in the past begins termination; the runner records that commitment, and a later extension does not revive the attempt even if the runner then dies. An earlier cancellation stays a cancellation. On an orphan, a limit just moved into the past still gets the full SIGTERM grace; a limit that was already in force is enforced from its original deadline. Later attempts use the updated limit |
+| `yield` | running, opted in | Asks the command to checkpoint and exit; see [Cooperative yield](#cooperative-yield) |
 | `hold` | queued | Invalidates reservation if protected |
 | `cancel` | most states | Before start → terminal; after start → signal process group |
 | `pause` / `unpause` | always | Durable operator gate. Submissions still enqueue; running leases continue; the scheduler issues no new leases until unpause. Pause survives daemon restart. |
@@ -276,6 +280,8 @@ $XDG_STATE_HOME/mlqueue/attempts/<id>/
   start                 # launch authorization marker
   exec.json             # command identity / running
   cancel.json
+  yield.json            # yield request for the runner to deliver
+  yield_sent.json       # written once, before the yield signal is sent
   limit.json            # live time-limit override; absent means command.json still applies
   timeout.json          # written once, when timeout termination starts
   result.json
@@ -308,6 +314,10 @@ readiness sequence; historical cancelled and skipped records remain truthful.
 | `operations` | Idempotency keys, request hash, stored response / tombstone |
 | `events` | Append-only audit log |
 
+Migration v9 adds the job's yield policy and each attempt's yield request
+(time, reason, hold) and delivery time. The yield count is derived from
+attempts in state `yielded`, so it cannot drift from the history.
+
 
 Job IDs are `AUTOINCREMENT` rowids. Scheduling uses a separate durable
 readiness sequence, so pre-enqueued dependency waiters do not reserve old FIFO
@@ -323,7 +333,7 @@ Job:
   starting | running → needs_attention → lost | cancelled
 
 Attempt (persisted):
-  prepared → authorized → running → finalized (success/fail/cancel/lost)
+  prepared → authorized → running → finalized (success/fail/cancel/lost/yielded)
   authorized | running → orphaned | quarantined → resolved when group empty
 ```
 
@@ -359,6 +369,84 @@ valid, quarantine corrupt identity, retain leases for orphans.
   (SIGTERM, optional SIGKILL after grace).
 - Lease released only when the group is empty.
 - Natural exit before signal delivery can win (`cancellation_too_late`).
+
+### Cooperative yield
+
+A job opts in at submission with `--yield-signal SIGUSR1|SIGUSR2` and
+optionally `--yield-exit-code N` (3–125, default 75, `EX_TEMPFAIL`). That
+declares: on this signal the command saves a checkpoint when it can, then exits
+with this code. Only the user signals qualify. Cancellation and time limits
+send SIGTERM, and the other catchable signals already mean something to shells
+and runtimes, so the workload could not tell a yield from an abort. Exit codes
+1, 2 and 126+ are excluded because crashes and signal deaths produce them.
+
+`mlq yield JOB --reason TEXT [--hold]`:
+
+- Refused unless the job opted in and its attempt is `running`. During
+  `starting` there is nothing to checkpoint. The daemon does not probe the
+  runner first: if it has died, the request is never delivered, the event log
+  records `yield_unfulfilled`, and the attempt resolves as any orphan does.
+- Refused, unless `--hold`, when no eligible queued job has equal or higher
+  priority. The requeued job would be the head again and restart at once,
+  costing work and freeing nothing.
+- Refused when the client's stdin is not a terminal, unless the daemon config
+  sets `allow_noninteractive_yield = true`. On a terminal, `mlq yield` names
+  the job and asks for confirmation before sending anything. Every client runs
+  as the same UID and the daemon trusts the client's `interactive` flag, so
+  this is a speed bump, not access control: an agent driving a pseudo-terminal
+  can answer the prompt. It keeps an agent from yielding by running a command,
+  and the recorded reason makes any yield attributable. The reason, hold flag
+  and `interactive` are recorded in the `yield_requested` event and on the
+  attempt.
+- A repeat request returns success without changing anything: the first
+  reason and hold choice stand, and the signal is not sent again. The job
+  view's `yieldRequest` shows the standing request and whether it was
+  delivered.
+
+The request is committed, then published as `yield.json` (reconcile
+republishes it). The runner delivers the signal **once, to the command's
+leader only**, and never escalates. The leader owns the checkpoint: sending
+the signal to the group would kill launchers and forked workers through the
+signal's default action, or run the trainer's inherited handler inside them.
+A launcher (`sh -c`, `uv run`, `torchrun`) must `exec` or forward it. The
+unreaped leader keeps its PID pinned while the runner checks that it has not
+exited, so the PID cannot name another process. A request that arrives after
+cancellation or timeout termination has started is not delivered.
+
+Before signalling, the runner writes `yield_sent.json` exclusively, and it
+does not signal until that write succeeds (it retries each poll). It then
+checks once more that the leader has not exited. The attempt is `yielded`
+only if the signal was sent, the exit code is the declared one, and neither
+cancellation nor timeout classified the run. A leader that exits on its own
+in the instant between that last check and `kill()`, with the declared code,
+is still counted as yielded; that code means "try again later" either way.
+Any other exit is the ordinary outcome, and the event log records
+`yield_unfulfilled` with `delivered`: whether `yield_sent.json` was written
+(a leader that exited during the final check leaves it written but unsignalled). Because the signal comes
+only once, a command with no checkpoint yet must remember the request, keep
+running, and exit with the yield code after its next save (or never).
+
+On a `yielded` attempt the job returns to `queued` (or `held`) with the same
+ID, command and dependency edges. Its readiness sequence is cleared, so it
+rejoins at the back of its priority class and behind any frozen backfill
+frontier. The job never becomes terminal, so dependents keep waiting. Yielded
+attempts do not count toward `maxAttempts`. A cancel committed before
+finalization still cancels the job, even if the command had already yielded.
+
+If the runner dies after `yield_sent.json` exists, the drained orphan's exit
+code is unknown. The attempt is `lost`, but the job goes to `held` rather
+than `lost`, because a terminal `lost` would permanently skip its
+`--after-success` dependents. The operator releases or cancels it.
+
+Every attempt's environment carries `MLQ_JOB_ID` and `MLQ_ATTEMPT`, and an
+opted-in job's also carries `MLQ_YIELD_SIGNAL` and `MLQ_YIELD_EXIT_CODE`.
+These override submitted values of the same name. An unchanged command can
+then resume idempotently from its own run directory. mlq never stores,
+validates or discovers checkpoints.
+
+`mlq follow --events yielded` reports a yield; it is not a terminal outcome.
+The `yield` op and the `yieldPolicy` submit field are additive, so the protocol
+version stays 8; an older daemon rejects them.
 
 ### Per-attempt wall-clock limits
 
@@ -416,7 +504,9 @@ evidence), and leave priority at `0` unless ordering is intentional.
    frozen frontier; lower priority cannot backfill a higher protected job.
 8. Commands are argv + cwd + explicit env—no shell strings.
 9. Every mutation is idempotent under its key.
-10. The daemon does not kill foreign work or preempt healthy managed work.
+10. The daemon does not kill foreign work or preempt healthy managed work. A
+    yield signal is sent only on an operator request, only to jobs that
+    declared they handle it, and is never escalated.
 11. Events, results, and logs remain inspectable without a live daemon.
 
 ## Known limitations

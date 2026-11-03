@@ -11,7 +11,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::domain::{
     AttemptId, AttemptState, DependencyCondition, DependencyResolution, JobId, JobState,
-    SCHEDULER_SEMANTICS_VERSION, now_ms,
+    SCHEDULER_SEMANTICS_VERSION, YieldPolicy, now_ms,
 };
 use crate::protocol::SubmitParams;
 use crate::scheduler::{ActiveLease, Candidate};
@@ -239,6 +239,15 @@ const MIGRATIONS: &[&str] = &[
     "#,
     // v8: immutable repository/checkout context, discovered outside transactions.
     "ALTER TABLE jobs ADD COLUMN context TEXT;",
+    // v9: opt-in cooperative yield. A yielded attempt returns its job to the
+    // queue and does not consume the automatic retry budget.
+    r#"
+    ALTER TABLE jobs ADD COLUMN yield_policy TEXT;
+    ALTER TABLE attempts ADD COLUMN yield_requested_at INTEGER;
+    ALTER TABLE attempts ADD COLUMN yield_hold INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE attempts ADD COLUMN yield_reason TEXT;
+    ALTER TABLE attempts ADD COLUMN yield_delivered_at INTEGER;
+    "#,
 ];
 
 pub fn open(path: &Path) -> Result<Connection> {
@@ -306,6 +315,10 @@ pub struct JobRow {
     pub retry_not_before: Option<i64>,
     pub ready_seq: Option<i64>,
     pub attempt_count: i64,
+    pub yield_policy: Option<YieldPolicy>,
+    /// Attempts that ended by yielding (derived). They do not count toward
+    /// `max_attempts`.
+    pub yield_count: i64,
     pub state_reason: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -349,6 +362,12 @@ pub struct AttemptRow {
     pub running_at: Option<i64>,
     pub finished_at: Option<i64>,
     pub timed_out_at: Option<i64>,
+    pub yield_requested_at: Option<i64>,
+    /// Requeue the job held, rather than queued, if the command yields.
+    pub yield_hold: bool,
+    pub yield_reason: Option<String>,
+    /// When the runner committed to delivering the yield signal.
+    pub yield_delivered_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -375,7 +394,8 @@ pub struct EventRow {
 
 const JOB_COLUMNS: &str = "id, name, state, cwd, args, env, max_parallel_runs, priority, \
      max_attempts, retry_delay_ms, time_limit_ms, time_limit_set_at, retry_not_before, ready_seq, \
-     attempt_count, state_reason, created_at, updated_at, finished_at, context";
+     attempt_count, state_reason, created_at, updated_at, finished_at, context, yield_policy, \
+     (SELECT COUNT(*) FROM attempts a WHERE a.job_id = jobs.id AND a.state = 'yielded')";
 
 fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRow> {
     let state: String = row.get(2)?;
@@ -404,13 +424,18 @@ fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRow> {
         context: row.get::<_, Option<String>>(19)?.and_then(|encoded| {
             serde_json::from_str(&encoded).expect("valid context JSON in database")
         }),
+        yield_policy: row.get::<_, Option<String>>(20)?.map(|encoded| {
+            serde_json::from_str(&encoded).expect("valid yield policy JSON in database")
+        }),
+        yield_count: row.get(21)?,
     })
 }
 
 const ATTEMPT_COLUMNS: &str = "id, job_id, number, state, launch_token, max_parallel_runs, \
      runner_pid, runner_start_time, runner_boot_id, cmd_pid, cmd_pgid, cmd_start_time, \
      command_started_at, exit_code, term_signal, cancel_requested, cancel_force, \
-     cancel_requested_at, message, created_at, authorized_at, running_at, finished_at, timed_out_at";
+     cancel_requested_at, message, created_at, authorized_at, running_at, finished_at, timed_out_at, \
+     yield_requested_at, yield_hold, yield_reason, yield_delivered_at";
 
 fn attempt_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttemptRow> {
     let state: String = row.get(3)?;
@@ -439,6 +464,10 @@ fn attempt_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttemptRow> {
         running_at: row.get(21)?,
         finished_at: row.get(22)?,
         timed_out_at: row.get(23)?,
+        yield_requested_at: row.get(24)?,
+        yield_hold: row.get::<_, i64>(25)? != 0,
+        yield_reason: row.get(26)?,
+        yield_delivered_at: row.get(27)?,
     })
 }
 
@@ -479,8 +508,9 @@ pub fn backfill_job_context(conn: &Connection) -> Result<()> {
 pub fn insert_job(conn: &Connection, params: &SubmitParams, now: i64) -> Result<JobId> {
     conn.execute(
         "INSERT INTO jobs (name, state, cwd, args, env, max_parallel_runs, priority, \
-         max_attempts, retry_delay_ms, time_limit_ms, attempt_count, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, ?11)",
+         max_attempts, retry_delay_ms, time_limit_ms, yield_policy, attempt_count, created_at, \
+         updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12, ?12)",
         params![
             params.name,
             JobState::Queued.as_str(),
@@ -492,6 +522,11 @@ pub fn insert_job(conn: &Connection, params: &SubmitParams, now: i64) -> Result<
             params.max_attempts,
             i64::try_from(params.retry_delay_ms)?,
             params.time_limit_ms.map(i64::try_from).transpose()?,
+            params
+                .yield_policy
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
             now,
         ],
     )?;
@@ -1116,6 +1151,31 @@ pub fn finalize_attempt(
     Ok(())
 }
 
+/// Record a yield request. Callers reject a repeated request, so the first
+/// reason and hold choice are the ones that stand.
+pub fn set_attempt_yield_requested(
+    conn: &Connection,
+    attempt: AttemptId,
+    reason: &str,
+    hold: bool,
+    now: i64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE attempts SET yield_requested_at = ?2, yield_reason = ?3, yield_hold = ?4 \
+         WHERE id = ?1 AND yield_requested_at IS NULL",
+        params![attempt, now, reason, hold as i64],
+    )?;
+    Ok(())
+}
+
+pub fn set_attempt_yield_delivered(conn: &Connection, attempt: AttemptId, at: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE attempts SET yield_delivered_at = COALESCE(yield_delivered_at, ?2) WHERE id = ?1",
+        params![attempt, at],
+    )?;
+    Ok(())
+}
+
 pub fn set_attempt_cancel_requested(
     conn: &Connection,
     attempt: AttemptId,
@@ -1481,6 +1541,7 @@ mod tests {
             retry_delay_ms: 0,
             time_limit_ms: None,
             dependencies: vec![],
+            yield_policy: None,
         }
     }
 
