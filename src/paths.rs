@@ -74,6 +74,11 @@ impl Paths {
         self.state_dir.join("daemon.lock")
     }
 
+    /// Staged daemon updates; see `crate::update`.
+    pub fn updates_dir(&self) -> PathBuf {
+        self.state_dir.join("updates")
+    }
+
     pub fn follow_tts_lock(&self) -> PathBuf {
         self.state_dir.join("follow-tts.lock")
     }

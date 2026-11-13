@@ -58,6 +58,8 @@ src/domain.rs           IDs, states, scheduler semantics version
 src/protocol.rs         wire ops, public camelCase views, framing
 src/db.rs               migrations, repositories, operations, events
 src/scheduler.rs        pure admission + backfill policy (no I/O)
+src/systemd.rs          systemctl --user helpers
+src/update.rs           staged daemon updates (`mlq daemon update`)
 src/daemon/
   mod.rs                listen loop, singleton lock, runner adopt
   coordinator.rs        serialized mutations and schedule passes
@@ -283,6 +285,7 @@ XDG conventions (overridable in tests):
 $XDG_RUNTIME_DIR/mlqueue/mlqd.sock
 $XDG_STATE_HOME/mlqueue/mlqueue.db
 $XDG_STATE_HOME/mlqueue/daemon.lock          # stable singleton (not under runtime)
+$XDG_STATE_HOME/mlqueue/updates/             # staged daemon updates
 $XDG_STATE_HOME/mlqueue/attempts/<id>/
   stdout.log  stderr.log
   identity.json
@@ -500,6 +503,80 @@ restart. Scheduling semantics are **code-versioned**, not config-toggled.
 [`skills/queue-ml-jobs/`](skills/queue-ml-jobs/) is versioned with the repo.
 It covers submission, monitoring, concurrency limits, dependencies, and job
 controls for agents using the shared queue.
+
+## Staged daemon updates
+
+`mlq daemon update` copies a built `mlq`/`mlqd` pair into the updates
+directory and records it in `pending.json`. It never replaces the running
+installation itself. A systemd path unit starts `mlqd-update.service` while an
+update is pending. That watcher runs a pinned copy of the `mlq` that staged
+it, because activation must stop the daemon and so cannot run inside it.
+
+The installed daemon may speak an older protocol, so the watcher never sends
+it requests. Staging also pins a copy of the *installed* `mlq` as the
+observer. The watcher runs `observer subscribe` and reads only `activeLeases`,
+`admissionBlocked`, and each job's `finishedAt`. It blocks on that single
+subscription until no lease is active, admission is not blocked, and every
+listed job has finished. A job in a state this binary does not know counts as
+unfinished. A daemon restart ends the subscription; the watcher resubscribes
+for up to two minutes before it counts as a failure.
+
+Activation, under `update.lock`:
+
+1. Re-verify the candidate checksums. Check that the unit is persistent, uses
+   `KillMode=process`, runs the recorded `mlqd`, and that its `MainPID` is the
+   daemon the observer reaches.
+2. While the daemon still runs, back up each installed binary this staging
+   has not yet replaced into `staged-<id>/original/`, and copy its candidate
+   to a synced temporary file beside it. Nothing is copied while the daemon
+   is stopped.
+3. Write `restart.json`, then stop the unit. Workers keep running.
+4. Take `daemon.lock` without blocking. If another daemon holds it, nothing
+   can be replaced safely.
+5. Read the database directly. Any job with `finished_at IS NULL` or lease
+   with `released_at IS NULL` defers the update. That catches work admitted
+   after the idle snapshot.
+6. If the installed binaries are unchanged since step 2, record the schema
+   version (`user_version`) in `restart.json`, then rename the candidates
+   over the installed binaries, `mlq` first. A rename never truncates a
+   running executable. A half-replaced pair is a new `mlq` with the old
+   `mlqd`, which the observer can still watch, so a later activation
+   finishes it.
+7. Release `daemon.lock`, start the unit, and wait until its main process
+   runs the installed `mlqd` and the socket accepts connections. A unit that
+   exits or restarts while starting fails at once; a slow start has two
+   minutes. On success, remove `restart.json`, then make `original/` the new
+   `previous/` and remove `pending.json`. A pending update whose pair is
+   already installed is finished this way without waiting on the observer,
+   which may not speak the new daemon's protocol. If renaming failed, put
+   back any `mlq` already replaced.
+
+If the new daemon does not come up, `failed.json` records the update and
+`pending.json` is removed before anything else, so the build is never
+retried. The watcher then restores `original/`, unless the schema version
+changed since step 6: an older `mlqd` refuses a newer schema, so the new pair
+stays installed under systemd's restarts, `original/` becomes `previous/`, and
+the record says an operator is needed. Until the record shows the outcome,
+`restart.json` stays, and a new watcher completes the rollback.
+
+If the watcher dies between steps 3 and 7, systemd restarts it after the
+current retry delay (the path unit, seeing `restart.json`, covers a reboot).
+The new watcher puts back an `mlq` replaced without its `mlqd` and restarts
+the daemon, rolling back if the new `mlqd` was installed and does not come
+up. It finishes the update if the pair was already replaced, and waits again
+otherwise. Other failures leave `pending.json` in place. The watcher retries
+with a backoff from 30 seconds to 30 minutes, and `status` shows its last
+error. The daemon stays stopped only while a watcher killed mid-activation
+waits for that retry.
+
+Whatever removes a staging directory (finishing, cancelling, restaging, or
+concluding a rollback) first puts back a half-replaced pair, and moves
+`original/` to `previous/` if those binaries are no longer installed, so the
+only copy of a replaced pair is never deleted.
+`mlq daemon update cancel --force` abandons an interrupted activation that
+cannot finish. Staging checks up front what activation would otherwise
+retry forever: that the installed `mlq` can subscribe, and that the install
+directory is writable.
 
 ## Invariants
 
