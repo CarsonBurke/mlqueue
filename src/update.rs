@@ -44,6 +44,8 @@ use crate::systemd;
 const PENDING: &str = "pending.json";
 const RESTART: &str = "restart.json";
 const FAILED: &str = "failed.json";
+/// The watcher's last error, while it retries.
+const WATCHER_ERROR: &str = "watcher-error.txt";
 const LOCK: &str = "update.lock";
 const UPDATER: &str = "mlq";
 const OBSERVER: &str = "observer";
@@ -112,6 +114,7 @@ impl Checksums {
 /// the daemon is stopped for it). Fields added later need `#[serde(default)]`
 /// so a newer `mlq` can still read, finish, or cancel an older staging.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Manifest {
     /// The daemon's systemd user unit.
     pub service: String,
@@ -214,6 +217,8 @@ pub trait Host {
     fn systemctl(&self, args: &[&str]) -> Result<()>;
     fn show(&self, unit: &str, property: &str) -> Result<String>;
     fn daemon_status(&self, manifest: &Manifest) -> Result<DaemonProbe>;
+    /// Check that the observer can subscribe, by reading one snapshot.
+    fn check_subscription(&self, manifest: &Manifest) -> Result<()>;
     /// Block until the queue is idle, without polling.
     fn wait_idle(&self, manifest: &Manifest) -> Result<()>;
     /// Wait until the unit's main process runs the installed `mlqd` and
@@ -250,18 +255,31 @@ impl Host for Systemd {
         serde_json::from_slice(&output.stdout).context("parsing `mlq daemon status --json`")
     }
 
+    fn check_subscription(&self, manifest: &Manifest) -> Result<()> {
+        let supported = observer(manifest)
+            .args(["subscribe", "--help"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .context("running the staged observer")?
+            .success();
+        ensure!(
+            supported,
+            "the installed mlq cannot subscribe to queue snapshots (added in v0.3.0); \
+             upgrade by hand as the README describes"
+        );
+        ensure!(
+            read_snapshots(manifest, |_| true)?,
+            "the installed mlq could not subscribe to the installed daemon"
+        );
+        Ok(())
+    }
+
     fn wait_idle(&self, manifest: &Manifest) -> Result<()> {
-        let mut subscriber = observer(manifest)
-            .arg("subscribe")
-            .stdout(Stdio::piped())
-            .spawn()
-            .context("starting the queue subscription")?;
-        let stdout = subscriber.stdout.take().expect("stdout is piped");
-        let idle = first_idle_snapshot(BufReader::new(stdout));
-        // The subscriber has nothing left to say once we stop reading.
-        let _ = subscriber.kill();
-        let _ = subscriber.wait();
-        ensure!(idle?, "queue subscription ended; pending update retained");
+        ensure!(
+            read_snapshots(manifest, IdleProbe::is_idle)?,
+            "queue subscription ended; pending update retained"
+        );
         Ok(())
     }
 
@@ -270,8 +288,10 @@ impl Host for Systemd {
         let restarts = self.show(service, "NRestarts")?;
         let deadline = Instant::now() + READY_TIMEOUT;
         while !self.is_ready(manifest) {
-            let exited = self.show(service, "ActiveState")? == "failed"
-                || self.show(service, "SubState")? == "auto-restart"
+            let exited = matches!(
+                self.show(service, "ActiveState")?.as_str(),
+                "failed" | "inactive"
+            ) || self.show(service, "SubState")? == "auto-restart"
                 || self.show(service, "NRestarts")? != restarts;
             ensure!(!exited, "{service} exited while starting");
             ensure!(
@@ -304,12 +324,27 @@ impl Systemd {
     }
 }
 
-/// Read snapshots until one is idle (`true`) or the stream ends (`false`).
-fn first_idle_snapshot(snapshots: impl BufRead) -> Result<bool> {
+/// Follow the observer's subscription until a snapshot satisfies `done`
+/// (`true`) or the stream ends (`false`).
+fn read_snapshots(manifest: &Manifest, done: impl Fn(&IdleProbe) -> bool) -> Result<bool> {
+    let mut subscriber = observer(manifest)
+        .arg("subscribe")
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("starting the queue subscription")?;
+    let stdout = subscriber.stdout.take().expect("stdout is piped");
+    let found = first_snapshot(BufReader::new(stdout), done);
+    // The subscriber has nothing left to say once we stop reading.
+    let _ = subscriber.kill();
+    let _ = subscriber.wait();
+    found
+}
+
+fn first_snapshot(snapshots: impl BufRead, done: impl Fn(&IdleProbe) -> bool) -> Result<bool> {
     for line in snapshots.lines() {
         let line = line.context("reading the queue subscription")?;
         let probe: IdleProbe = serde_json::from_str(&line).context("parsing a queue snapshot")?;
-        if probe.is_idle() {
+        if done(&probe) {
             return Ok(true);
         }
     }
@@ -329,6 +364,17 @@ fn main_pid(host: &impl Host, service: &str) -> Result<u32> {
         .context("parsing MainPID")?;
     ensure!(pid != 0, "{service} is not running");
     Ok(pid)
+}
+
+/// A plain (non-template) systemd service name, safe to derive unit file
+/// names and unit file lines from.
+fn is_service_name(service: &str) -> bool {
+    service.strip_suffix(".service").is_some_and(|stem| {
+        !stem.is_empty()
+            && stem
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || ":_.-".contains(c))
+    })
 }
 
 /// Names of the watcher units for a daemon unit: `mlqd.service` is watched by
@@ -367,6 +413,10 @@ pub fn stage(host: &impl Host, request: StageRequest<'_>) -> Result<Manifest> {
         env,
     } = request;
     ensure!(root.is_absolute(), "update directory must be absolute");
+    ensure!(
+        is_service_name(service),
+        "{service:?} is not a systemd service name"
+    );
     ensure_private_dir(root)?;
     let _lock = lock(root)?;
     ensure!(
@@ -422,14 +472,22 @@ pub fn stage(host: &impl Host, request: StageRequest<'_>) -> Result<Manifest> {
         status.pid
     );
     manifest.socket = status.socket_path;
+    host.check_subscription(&manifest)?;
+    // Activation renames into this directory; find out now, not in the
+    // watcher's retries.
+    NamedTempFile::with_prefix_in(TEMP_PREFIX, &manifest.install_dir).with_context(|| {
+        format!(
+            "the installed binaries in {} cannot be replaced",
+            manifest.install_dir.display()
+        )
+    })?;
 
     replace_file(updater, &root.join(UPDATER))?;
     // From here the directory may be referenced, so only sweeping removes it.
     let staged_dir = staged.keep();
     write_json(&root.join(PENDING), &manifest)?;
-    if root.join(FAILED).exists() {
-        remove_file(&root.join(FAILED))?;
-    }
+    remove_if_exists(&root.join(FAILED))?;
+    remove_if_exists(&root.join(WATCHER_ERROR))?;
     remove_unreferenced_staging(root, &staged_dir)?;
     install_watcher(host, root, service)?;
     Ok(manifest)
@@ -555,6 +613,7 @@ fn install_watcher(host: &impl Host, root: &Path, service: &str) -> Result<()> {
              ExecStart=\"{}\" daemon update watch --root \"{root}\"\n\
              Restart=on-failure\n\
              RestartSec=30\n\
+             # systemd < 254 ignores these and retries every 30s.\n\
              RestartSteps=6\n\
              RestartMaxDelaySec=30min\n\
              TimeoutStopSec=60\n",
@@ -615,12 +674,40 @@ pub fn uninstall_watcher(host: &impl Host, root: &Path, service: &str) -> Result
 // Status and cancellation
 // ---------------------------------------------------------------------------
 
-/// An update whose daemon did not start and was rolled back, persisted as
-/// `failed.json` so it is reported and never retried.
+/// `restart.json`: written before the daemon is stopped for an activation and
+/// removed once it is running again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Restart {
+    pub manifest: Manifest,
+    /// The stopped daemon's database.
+    pub db_path: PathBuf,
+    /// Schema version before the first candidate was renamed into place. Set
+    /// once renaming may have begun, so recovery knows a rollback applies.
+    #[serde(default)]
+    pub schema: Option<i64>,
+}
+
+/// An update whose daemon did not start, persisted as `failed.json` so it is
+/// reported and never retried.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FailedUpdate {
     pub manifest: Manifest,
     pub reason: String,
+    pub rollback: Rollback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum Rollback {
+    /// Decided; the watcher finishes it, even after being interrupted.
+    InProgress,
+    /// The original pair is installed and running again.
+    Restored,
+    /// The new daemon migrated the schema, which the original daemon cannot
+    /// open, so the new pair stays installed and systemd keeps restarting it.
+    Refused { from: i64, to: i64 },
 }
 
 #[derive(Debug, Serialize)]
@@ -629,15 +716,23 @@ pub struct UpdateStatus {
     pub pending: Option<Manifest>,
     /// Set while the daemon may be stopped for an activation that has not
     /// finished; the watcher restarts it.
-    pub interrupted: Option<Manifest>,
+    pub interrupted: Option<Restart>,
     pub failed: Option<FailedUpdate>,
+    /// Why the watcher's last attempt failed; it retries with a backoff.
+    pub watcher_error: Option<String>,
 }
 
 pub fn status(root: &Path) -> Result<UpdateStatus> {
+    let watcher_error = match fs::read_to_string(root.join(WATCHER_ERROR)) {
+        Ok(error) => Some(error),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err).context("reading the watcher's last error"),
+    };
     Ok(UpdateStatus {
         pending: read_json(&root.join(PENDING))?,
         interrupted: read_json(&root.join(RESTART))?,
         failed: read_json(&root.join(FAILED))?,
+        watcher_error,
     })
 }
 
@@ -645,7 +740,8 @@ pub fn status(root: &Path) -> Result<UpdateStatus> {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Cancelled {
     pub pending: Option<Manifest>,
-    pub interrupted: Option<Manifest>,
+    pub interrupted: Option<Restart>,
+    pub failed: Option<FailedUpdate>,
 }
 
 /// Discard the pending update and any failure report, and stop the watcher.
@@ -656,7 +752,7 @@ pub fn cancel(host: &impl Host, root: &Path, force: bool) -> Result<Cancelled> {
         return Ok(Cancelled::default());
     }
     let _lock = lock(root)?;
-    let interrupted = read_json::<Manifest>(&root.join(RESTART))?;
+    let interrupted = read_json::<Restart>(&root.join(RESTART))?;
     if interrupted.is_some() {
         ensure!(
             force,
@@ -665,9 +761,9 @@ pub fn cancel(host: &impl Host, root: &Path, force: bool) -> Result<Cancelled> {
         );
         remove_file(&root.join(RESTART))?;
     }
-    if root.join(FAILED).exists() {
-        remove_file(&root.join(FAILED))?;
-    }
+    let failed = read_json::<FailedUpdate>(&root.join(FAILED))?;
+    remove_if_exists(&root.join(FAILED))?;
+    remove_if_exists(&root.join(WATCHER_ERROR))?;
     let pending = read_json::<Manifest>(&root.join(PENDING))?;
     if let Some(manifest) = &pending {
         discard(root, manifest)?;
@@ -675,12 +771,17 @@ pub fn cancel(host: &impl Host, root: &Path, force: bool) -> Result<Cancelled> {
     sync_dir(root)?;
     // The triggers are gone, so the path unit will not start it again. Under
     // update.lock the watcher is waiting, never activating: safe to stop.
-    if let Some(manifest) = pending.as_ref().or(interrupted.as_ref()) {
-        host.systemctl(&["stop", "--quiet", &watcher_units(&manifest.service).1])?;
+    let service = pending
+        .as_ref()
+        .or(interrupted.as_ref().map(|restart| &restart.manifest))
+        .map(|manifest| &manifest.service);
+    if let Some(service) = service {
+        host.systemctl(&["stop", "--quiet", &watcher_units(service).1])?;
     }
     Ok(Cancelled {
         pending,
         interrupted,
+        failed,
     })
 }
 
@@ -694,14 +795,27 @@ pub enum Activation {
     /// Work appeared between the idle snapshot and the stop.
     Deferred,
     Activated(Manifest),
-    /// The new daemon did not start; the original pair is back and the
-    /// update is recorded in `failed.json`.
-    RolledBack(FailedUpdate),
+    /// The new daemon did not start. `failed.json` holds the same record.
+    Failed(FailedUpdate),
 }
 
 /// The watcher: finish any interrupted activation, then wait for an idle
-/// queue and activate until nothing is pending.
+/// queue and activate until nothing is pending. Its last error is kept for
+/// `status`, since systemd retries it out of sight.
 pub fn watch(host: &impl Host, root: &Path) -> Result<()> {
+    let result = watch_until_done(host, root);
+    let recorded = match &result {
+        Ok(()) => remove_if_exists(&root.join(WATCHER_ERROR)),
+        Err(err) => write_atomically(
+            &root.join(WATCHER_ERROR),
+            format!("{err:#}").as_bytes(),
+            0o600,
+        ),
+    };
+    result.and(recorded)
+}
+
+fn watch_until_done(host: &impl Host, root: &Path) -> Result<()> {
     recover(host, root)?;
     while let Some(manifest) = read_json::<Manifest>(&root.join(PENDING))? {
         println!(
@@ -717,31 +831,68 @@ pub fn watch(host: &impl Host, root: &Path) -> Result<()> {
                 manifest.version,
                 manifest.short_sha()
             ),
-            Activation::RolledBack(failed) => eprintln!(
-                "mlqd {} did not start ({}); restored the original pair",
-                failed.manifest.version, failed.reason
-            ),
+            Activation::Failed(failed) => eprintln!("{}", failed.describe()),
         }
     }
     Ok(())
 }
 
-/// Restart a daemon left stopped by an interrupted activation.
+impl FailedUpdate {
+    pub fn describe(&self) -> String {
+        let version = &self.manifest.version;
+        let reason = &self.reason;
+        match self.rollback {
+            Rollback::InProgress => {
+                format!("mlqd {version} did not start ({reason}); rolling back")
+            }
+            Rollback::Restored => {
+                format!("mlqd {version} did not start ({reason}); restored the original pair")
+            }
+            Rollback::Refused { from, to } => format!(
+                "mlqd {version} did not start ({reason}), but it migrated the database from \
+                 schema {from} to {to}, which the original mlqd cannot open; the new pair stays \
+                 installed and needs an operator"
+            ),
+        }
+    }
+}
+
+/// Finish an activation the previous watcher did not: restart the daemon,
+/// or complete a rollback that was decided or is now needed.
 fn recover(host: &impl Host, root: &Path) -> Result<()> {
     if !root.join(RESTART).exists() {
         return Ok(());
     }
     let _lock = lock(root)?;
-    let Some(manifest) = read_json::<Manifest>(&root.join(RESTART))? else {
+    let Some(restart) = read_json::<Restart>(&root.join(RESTART))? else {
         return Ok(());
     };
+    let manifest = &restart.manifest;
+    let failed = read_json::<FailedUpdate>(&root.join(FAILED))?
+        .filter(|failed| failed.manifest == *manifest);
+    if let Some(failed) = &failed
+        && failed.rollback == Rollback::InProgress
+    {
+        let failed = roll_back(host, root, &restart, failed.reason.clone())?;
+        eprintln!("{}", failed.describe());
+        return Ok(());
+    }
     host.systemctl(&["start", &manifest.service])?;
-    host.wait_ready(&manifest)?;
+    match host.wait_ready(manifest) {
+        Ok(()) => {}
+        // Candidates may be installed and the update was never judged.
+        Err(not_ready) if restart.schema.is_some() && failed.is_none() => {
+            let failed = roll_back(host, root, &restart, format!("{not_ready:#}"))?;
+            eprintln!("{}", failed.describe());
+            return Ok(());
+        }
+        Err(not_ready) => return Err(not_ready),
+    }
     remove_file(&root.join(RESTART))?;
     sync_dir(root)?;
     let pending = read_json::<Manifest>(&root.join(PENDING))?;
-    if pending.as_ref() == Some(&manifest) && manifest.outdated()?.is_empty() {
-        finish(root, &manifest)?;
+    if pending.as_ref() == Some(manifest) && manifest.outdated()?.is_empty() {
+        finish(root, manifest)?;
         println!(
             "recovered the activation of mlqd {} ({})",
             manifest.version,
@@ -781,75 +932,106 @@ pub fn activate(host: &impl Host, root: &Path) -> Result<Activation> {
 
     // Recovery intent outlives this process: if it dies with the daemon
     // stopped, the path unit starts a watcher that restarts it.
-    write_json(&root.join(RESTART), &manifest)?;
+    let mut restart = Restart {
+        manifest,
+        db_path: status.db_path,
+        schema: None,
+    };
+    write_json(&root.join(RESTART), &restart)?;
     let committed = host
-        .systemctl(&["stop", &manifest.service])
-        .and_then(|()| swap.commit_if_idle(&status.db_path));
+        .systemctl(&["stop", &restart.manifest.service])
+        .and_then(|()| swap.commit_if_idle(root, &mut restart));
     let started = host
-        .systemctl(&["start", &manifest.service])
-        .and_then(|()| host.wait_ready(&manifest));
+        .systemctl(&["start", &restart.manifest.service])
+        .and_then(|()| host.wait_ready(&restart.manifest));
     match (committed, started) {
-        (Ok(Commit::Replaced { schema }), Err(not_ready)) => {
-            let failed = FailedUpdate {
-                manifest,
-                reason: format!("{not_ready:#}"),
-            };
-            // Recorded first, so nothing retries this build even if the
-            // rollback itself fails.
-            write_json(&root.join(FAILED), &failed)?;
-            remove_file(&root.join(PENDING))?;
-            sync_dir(root)?;
-            rollback(host, &failed.manifest, &status.db_path, schema)
-                .with_context(|| format!("rolling back after: {}", failed.reason))?;
-            remove_file(&root.join(RESTART))?;
-            sync_dir(root)?;
-            remove_staged(root, &failed.manifest.staged_dir)?;
-            Ok(Activation::RolledBack(failed))
+        (Ok(Commit::Replaced), Err(not_ready)) => {
+            roll_back(host, root, &restart, format!("{not_ready:#}")).map(Activation::Failed)
         }
-        (_, Err(not_ready)) => Err(not_ready),
+        (Ok(_), Err(not_ready)) => Err(not_ready),
+        (Err(not_applied), Err(not_ready)) => Err(not_ready.context(format!(
+            "after failing to apply the update: {not_applied:#}"
+        ))),
         (committed, Ok(())) => {
             remove_file(&root.join(RESTART))?;
             sync_dir(root)?;
             match committed? {
                 Commit::Deferred => Ok(Activation::Deferred),
-                Commit::Replaced { .. } => {
-                    finish(root, &manifest)?;
-                    Ok(Activation::Activated(manifest))
+                Commit::Replaced => {
+                    finish(root, &restart.manifest)?;
+                    Ok(Activation::Activated(restart.manifest))
                 }
             }
         }
     }
 }
 
-/// Restore the pair the update replaced, unless the new daemon already
-/// migrated the database past what the original daemon can open.
-fn rollback(host: &impl Host, manifest: &Manifest, db: &Path, schema: i64) -> Result<()> {
+/// Record that the update failed, then restore the original pair. The
+/// record comes first, so nothing activates this build again even if the
+/// rollback is interrupted; recovery finishes it from the record.
+fn roll_back(
+    host: &impl Host,
+    root: &Path,
+    restart: &Restart,
+    reason: String,
+) -> Result<FailedUpdate> {
+    let manifest = &restart.manifest;
+    let schema = restart
+        .schema
+        .context("no schema version was recorded before the swap")?;
+    let mut failed = FailedUpdate {
+        manifest: manifest.clone(),
+        reason,
+        rollback: Rollback::InProgress,
+    };
+    write_json(&root.join(FAILED), &failed)?;
+    if read_json::<Manifest>(&root.join(PENDING))?.as_ref() == Some(manifest) {
+        remove_file(&root.join(PENDING))?;
+    }
+    sync_dir(root)?;
+
+    failed.rollback = restore_original(host, manifest, &restart.db_path, schema)
+        .with_context(|| format!("rolling back after: {}", failed.reason))?;
+    write_json(&root.join(FAILED), &failed)?;
+    remove_file(&root.join(RESTART))?;
+    sync_dir(root)?;
+    remove_staged(root, &manifest.staged_dir)?;
+    Ok(failed)
+}
+
+/// Put back `original/`, unless the new daemon already migrated the
+/// database past what the original daemon can open.
+fn restore_original(
+    host: &impl Host,
+    manifest: &Manifest,
+    db: &Path,
+    schema: i64,
+) -> Result<Rollback> {
     host.systemctl(&["stop", &manifest.service])?;
     let current = schema_version(db)?;
     if current != schema {
         host.systemctl(&["start", &manifest.service])?;
-        bail!(
-            "the new mlqd migrated the database from schema {schema} to {current}, which the \
-             original mlqd cannot open, so the new pair stays installed"
-        );
+        return Ok(Rollback::Refused {
+            from: schema,
+            to: current,
+        });
     }
-    for binary in Binary::ALL.into_iter().rev() {
+    for binary in Binary::ALL {
         let original = manifest.original(binary);
         if original.exists() && digest(&original)? != digest(&manifest.installed(binary))? {
             replace_file(&original, &manifest.installed(binary))?;
         }
     }
     host.systemctl(&["start", &manifest.service])?;
-    host.wait_ready(manifest)
+    host.wait_ready(manifest)?;
+    Ok(Rollback::Restored)
 }
 
 /// Outcome of `Swap::commit_if_idle`.
 enum Commit {
     /// Work appeared; nothing was replaced.
     Deferred,
-    /// The pair is installed; `schema` is the database version before the
-    /// new daemon first ran.
-    Replaced { schema: i64 },
+    Replaced,
 }
 
 /// Synced copies of the outdated candidates beside the installed binaries,
@@ -895,9 +1077,11 @@ impl Swap {
 
     /// With the daemon stopped, take its singleton lock so no other daemon
     /// can admit work, check the database, and rename the prepared copies
-    /// into place in `Binary::ALL` order. The lock is released on return,
-    /// before the daemon is started again.
-    fn commit_if_idle(self, db: &Path) -> Result<Commit> {
+    /// into place in `Binary::ALL` order, recording the schema version in
+    /// `restart.json` first. The lock is released on return, before the
+    /// daemon is started again.
+    fn commit_if_idle(self, root: &Path, restart: &mut Restart) -> Result<Commit> {
+        let db = &restart.db_path;
         let state_dir = db.parent().context("database path has no parent")?;
         let lock_path = state_dir.join("daemon.lock");
         let daemon_lock = fs::OpenOptions::new()
@@ -917,7 +1101,6 @@ impl Swap {
         if !database_is_idle(db)? {
             return Ok(Commit::Deferred);
         }
-        let schema = schema_version(db)?;
         for step in &self.steps {
             ensure!(
                 digest(&step.target)? == step.installed_sha,
@@ -925,10 +1108,12 @@ impl Swap {
                 step.target.display()
             );
         }
+        restart.schema = Some(schema_version(db)?);
+        write_json(&root.join(RESTART), restart)?;
         for step in self.steps {
             persist(step.candidate, &step.target)?;
         }
-        Ok(Commit::Replaced { schema })
+        Ok(Commit::Replaced)
     }
 }
 
@@ -957,13 +1142,15 @@ fn schema_version(db: &Path) -> Result<i64> {
         .context("reading the database schema version")
 }
 
-/// Complete an activation: keep the original pair in `previous/` and discard
+/// Complete an activation: keep what it replaced in `previous/` and discard
 /// the staging.
 fn finish(root: &Path, manifest: &Manifest) -> Result<()> {
     let previous = root.join(PREVIOUS);
     ensure_private_dir(&previous)?;
     for binary in Binary::ALL {
         let original = manifest.original(binary);
+        // A binary the update did not replace keeps no stale copy here.
+        remove_if_exists(&previous.join(binary.name()))?;
         if original.exists() {
             fs::rename(&original, previous.join(binary.name()))
                 .with_context(|| format!("keeping {}", original.display()))?;
@@ -1111,6 +1298,15 @@ fn persist(file: NamedTempFile, target: &Path) -> Result<()> {
     sync_dir(target.parent().context("target has no parent directory")?)
 }
 
+fn remove_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+            Err(err).with_context(|| format!("removing {}", path.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
 fn remove_file(path: &Path) -> Result<()> {
     fs::remove_file(path).with_context(|| format!("removing {}", path.display()))
 }
@@ -1157,6 +1353,8 @@ mod tests {
         reinstall_on_stop: std::cell::Cell<bool>,
         /// `start` of mlqd 2.0.0 migrates the database schema.
         migrate_on_start: std::cell::Cell<bool>,
+        /// The observer predates `mlq subscribe`.
+        no_subscribe: std::cell::Cell<bool>,
     }
 
     impl FakeHost {
@@ -1219,6 +1417,14 @@ mod tests {
             })
         }
 
+        fn check_subscription(&self, _: &Manifest) -> Result<()> {
+            ensure!(
+                !self.no_subscribe.get(),
+                "the installed mlq cannot subscribe"
+            );
+            Ok(())
+        }
+
         fn wait_idle(&self, _: &Manifest) -> Result<()> {
             Ok(())
         }
@@ -1253,6 +1459,7 @@ mod tests {
             broken: Default::default(),
             reinstall_on_stop: Default::default(),
             migrate_on_start: Default::default(),
+            no_subscribe: Default::default(),
         };
         let root = temp.path().join("state/updates");
         fs::create_dir_all(&root).unwrap();
@@ -1311,6 +1518,16 @@ mod tests {
                 .unwrap()
                 .execute_batch(statement)
                 .unwrap();
+        }
+
+        fn write_restart(&self, manifest: &Manifest, schema: Option<i64>) -> Restart {
+            let restart = Restart {
+                manifest: manifest.clone(),
+                db_path: self.host.state_dir().join("mlqueue.db"),
+                schema,
+            };
+            write_json(&self.root.join(RESTART), &restart).unwrap();
+            restart
         }
 
         fn assert_untouched(&self) {
@@ -1522,7 +1739,7 @@ mod tests {
     fn watcher_recovers_an_activation_interrupted_after_replacement() {
         let fixture = fixture();
         let manifest = fixture.staged();
-        write_json(&fixture.root.join(RESTART), &manifest).unwrap();
+        fixture.write_restart(&manifest, Some(0));
         for binary in Binary::ALL {
             replace_file(&manifest.candidate(binary), &manifest.installed(binary)).unwrap();
         }
@@ -1537,7 +1754,7 @@ mod tests {
     fn watcher_resumes_an_activation_interrupted_before_replacement() {
         let fixture = fixture();
         let manifest = fixture.staged();
-        write_json(&fixture.root.join(RESTART), &manifest).unwrap();
+        fixture.write_restart(&manifest, None);
         watch(&fixture.host, &fixture.root).unwrap();
         assert_eq!(
             fixture.host.calls(),
@@ -1559,7 +1776,8 @@ mod tests {
             cancel(&fixture.host, &fixture.root, false).unwrap(),
             Cancelled {
                 pending: Some(manifest.clone()),
-                interrupted: None
+                interrupted: None,
+                failed: None,
             }
         );
         assert!(!fixture.root.join(PENDING).exists());
@@ -1576,9 +1794,10 @@ mod tests {
         let fixture = fixture();
         let manifest = fixture.staged();
         fixture.host.broken.set(Some("mlqd 2.0.0"));
-        let Activation::RolledBack(failed) = activate(&fixture.host, &fixture.root).unwrap() else {
-            panic!("expected a rollback");
+        let Activation::Failed(failed) = activate(&fixture.host, &fixture.root).unwrap() else {
+            panic!("expected a failed activation");
         };
+        assert_eq!(failed.rollback, Rollback::Restored);
         assert!(failed.reason.contains("crashed"), "{}", failed.reason);
         assert!(fixture.installed("mlqd").contains("mlqd 1.0.0"));
         assert!(fixture.installed("mlq").contains("mlq 1.0.0"));
@@ -1610,34 +1829,113 @@ mod tests {
         fixture.staged();
         fixture.host.broken.set(Some("mlqd 2.0.0"));
         fixture.host.migrate_on_start.set(true);
-        let err = activate(&fixture.host, &fixture.root).unwrap_err();
-        assert!(
-            format!("{err:#}").contains("migrated the database"),
-            "{err:#}"
-        );
+        let Activation::Failed(failed) = activate(&fixture.host, &fixture.root).unwrap() else {
+            panic!("expected a failed activation");
+        };
+        assert_eq!(failed.rollback, Rollback::Refused { from: 0, to: 99 });
+        assert!(failed.describe().contains("needs an operator"));
         assert!(fixture.installed("mlqd").contains("mlqd 2.0.0"));
         assert!(fixture.installed("mlq").contains("mlq 2.0.0"));
-        // Left for recovery, but never activated again.
-        assert!(fixture.root.join(RESTART).exists());
-        assert!(fixture.root.join(FAILED).exists());
+        // Terminal: nothing is retried or left for recovery.
+        assert!(!fixture.root.join(RESTART).exists());
         assert!(!fixture.root.join(PENDING).exists());
+        assert_eq!(status(&fixture.root).unwrap().failed, Some(failed));
     }
 
     #[test]
-    fn failed_rollback_is_left_to_recovery_or_a_forced_cancel() {
+    fn interrupted_rollback_is_finished_by_the_next_watcher() {
         let fixture = fixture();
         fixture.staged();
+        // Even the original daemon fails, so the rollback cannot finish.
         fixture.host.broken.set(Some("mlqd"));
         assert!(activate(&fixture.host, &fixture.root).is_err());
         assert!(fixture.installed("mlqd").contains("mlqd 1.0.0"));
         assert!(fixture.root.join(RESTART).exists());
         assert!(!fixture.root.join(PENDING).exists());
+        let failed = status(&fixture.root).unwrap().failed.unwrap();
+        assert_eq!(failed.rollback, Rollback::InProgress);
+
+        assert!(watch(&fixture.host, &fixture.root).is_err());
+        let report = status(&fixture.root).unwrap();
+        assert!(report.watcher_error.unwrap().contains("crashed"));
         assert!(cancel(&fixture.host, &fixture.root, false).is_err());
         assert!(uninstall_watcher(&fixture.host, &fixture.root, SERVICE).is_err());
-        let cancelled = cancel(&fixture.host, &fixture.root, true).unwrap();
-        assert!(cancelled.interrupted.is_some());
-        let status = status(&fixture.root).unwrap();
-        assert!(status.interrupted.is_none() && status.failed.is_none());
+
+        fixture.host.broken.set(None);
+        watch(&fixture.host, &fixture.root).unwrap();
+        let report = status(&fixture.root).unwrap();
+        assert_eq!(report.failed.unwrap().rollback, Rollback::Restored);
+        assert!(report.interrupted.is_none() && report.watcher_error.is_none());
+    }
+
+    #[test]
+    fn watcher_killed_after_the_swap_rolls_back_a_broken_daemon() {
+        let fixture = fixture();
+        let manifest = fixture.staged();
+        let mut restart = fixture.write_restart(&manifest, None);
+        Swap::prepare(&manifest)
+            .unwrap()
+            .commit_if_idle(&fixture.root, &mut restart)
+            .unwrap();
+        assert!(fixture.installed("mlqd").contains("mlqd 2.0.0"));
+        // The watcher died here; its replacement finds a broken daemon.
+        fixture.host.broken.set(Some("mlqd 2.0.0"));
+        watch(&fixture.host, &fixture.root).unwrap();
+        assert!(fixture.installed("mlqd").contains("mlqd 1.0.0"));
+        assert!(fixture.installed("mlq").contains("mlq 1.0.0"));
+        let report = status(&fixture.root).unwrap();
+        assert_eq!(report.failed.unwrap().rollback, Rollback::Restored);
+        assert!(report.pending.is_none() && report.interrupted.is_none());
+    }
+
+    #[test]
+    fn forced_cancel_abandons_an_interrupted_activation() {
+        let fixture = fixture();
+        let manifest = fixture.staged();
+        let restart = fixture.write_restart(&manifest, None);
+        assert!(cancel(&fixture.host, &fixture.root, false).is_err());
+        assert_eq!(
+            cancel(&fixture.host, &fixture.root, true).unwrap(),
+            Cancelled {
+                pending: Some(manifest),
+                interrupted: Some(restart),
+                failed: None,
+            }
+        );
+        let report = status(&fixture.root).unwrap();
+        assert!(report.pending.is_none() && report.interrupted.is_none());
+    }
+
+    #[test]
+    fn staging_refuses_what_activation_could_never_do() {
+        let fixture = fixture();
+        fixture.host.no_subscribe.set(true);
+        let err = fixture.stage().unwrap_err();
+        assert!(err.to_string().contains("cannot subscribe"), "{err:#}");
+        fixture.host.no_subscribe.set(false);
+
+        let install_dir = fixture.host.install_dir();
+        fs::set_permissions(&install_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let err = fixture.stage().unwrap_err();
+        fs::set_permissions(&install_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(err.to_string().contains("cannot be replaced"), "{err:#}");
+
+        let err = stage(
+            &fixture.host,
+            StageRequest {
+                root: &fixture.root,
+                source_dir: &fixture.source(),
+                service: "x.service\nExecStart=/bin/false",
+                updater: &fixture.host.dir.join("updater"),
+                env: BTreeMap::new(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("not a systemd service name"),
+            "{err:#}"
+        );
+        assert!(!fixture.root.join(PENDING).exists());
     }
 
     #[test]

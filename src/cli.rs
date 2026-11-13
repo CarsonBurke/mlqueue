@@ -1751,46 +1751,49 @@ fn daemon_update(paths: &Paths, args: UpdateArgs) -> Result<()> {
                 return Ok(());
             }
             if let Some(failed) = &status.failed {
-                println!(
-                    "mlqd {} did not start and was rolled back: {}",
-                    failed.manifest.version, failed.reason
-                );
+                println!("{}", failed.describe());
             }
-            if let Some(manifest) = &status.interrupted {
+            if let Some(restart) = &status.interrupted {
                 println!(
-                    "interrupted activation of {} {}: the watcher restarts the daemon \
+                    "the activation of mlqd {} was interrupted; the watcher restarts {} \
                      (systemctl --user status {})",
-                    manifest.service,
-                    manifest.version,
-                    update::watcher_units(&manifest.service).1
+                    restart.manifest.version,
+                    restart.manifest.service,
+                    update::watcher_units(&restart.manifest.service).1
                 );
             }
-            match &status.pending {
-                Some(manifest) => println!(
+            if let Some(manifest) = &status.pending {
+                println!(
                     "mlqd {} staged for {}; waiting until no job is unfinished and no run lease \
                      is held",
                     manifest.version,
                     manifest.install_dir.display()
-                ),
-                None if status.interrupted.is_none() && status.failed.is_none() => {
-                    println!("no update staged")
-                }
-                None => {}
+                );
+            }
+            if let Some(error) = &status.watcher_error {
+                println!("the watcher's last attempt failed and will be retried: {error}");
+            }
+            if status.pending.is_none() && status.interrupted.is_none() && status.failed.is_none() {
+                println!("no update staged");
             }
             Ok(())
         }
         Some(UpdateCommand::Cancel { force }) => {
             let cancelled = update::cancel(&update::Systemd, &root, force)?;
-            if let Some(manifest) = &cancelled.interrupted {
+            if let Some(restart) = &cancelled.interrupted {
                 println!(
                     "abandoned the interrupted activation of mlqd {}; check {}",
-                    manifest.version, manifest.service
+                    restart.manifest.version, restart.manifest.service
                 );
             }
-            match &cancelled.pending {
-                Some(manifest) => println!("discarded the staged mlqd {}", manifest.version),
-                None if cancelled.interrupted.is_none() => println!("no update staged"),
-                None => {}
+            if let Some(failed) = &cancelled.failed {
+                println!("cleared the report of mlqd {}", failed.manifest.version);
+            }
+            if let Some(manifest) = &cancelled.pending {
+                println!("discarded the staged mlqd {}", manifest.version);
+            }
+            if cancelled == update::Cancelled::default() {
+                println!("no update staged");
             }
             Ok(())
         }

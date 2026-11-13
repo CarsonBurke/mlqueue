@@ -84,11 +84,13 @@ then restarts `mlqd.service` on the new `mlq` and `mlqd`. Keep submitting as
 usual; the update waits for that work too. `mlq daemon update status` shows
 the staged release, and `mlq daemon update cancel` discards it. If the new
 daemon does not start, the watcher restores the previous pair, unless the new
-daemon already migrated the database, and `status` reports the failure. The
-last replaced pair stays in `~/.local/state/mlqueue/updates/previous/`.
+daemon already migrated the database, and `status` reports the outcome. The
+binaries the last update replaced stay in
+`~/.local/state/mlqueue/updates/previous/`.
 
 Staging needs a release that has `mlq daemon update` (after v0.3.0), the
-service from `mlq daemon install`, and a running daemon from v0.2.0 or later.
+service from `mlq daemon install`, and an installed v0.3.0 or later, whose
+`mlq subscribe` the watcher uses.
 Otherwise, wait for the queue to empty and run:
 
 ```bash

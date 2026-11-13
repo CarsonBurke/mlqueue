@@ -534,30 +534,37 @@ Activation, under `update.lock`:
    can be replaced safely.
 5. Read the database directly. Any job with `finished_at IS NULL` or lease
    with `released_at IS NULL` defers the update. That catches work admitted
-   after the idle snapshot. Record the schema version (`user_version`).
-6. If the installed binaries are unchanged since step 2, rename the
-   candidates over them, `mlq` first. A rename never truncates a running
-   executable. A half-replaced pair is a new `mlq` with the old `mlqd`, which
-   the observer can still watch, so a later activation finishes it.
+   after the idle snapshot.
+6. If the installed binaries are unchanged since step 2, record the schema
+   version (`user_version`) in `restart.json`, then rename the candidates
+   over the installed binaries, `mlq` first. A rename never truncates a
+   running executable. A half-replaced pair is a new `mlq` with the old
+   `mlqd`, which the observer can still watch, so a later activation
+   finishes it.
 7. Release `daemon.lock`, start the unit, and wait until its main process
    runs the installed `mlqd` and the socket accepts connections. A unit that
    exits or restarts while starting fails at once; a slow start has two
-   minutes. On success, move `original/` to `previous/` and remove
+   minutes. On success, move what was replaced to `previous/` and remove
    `restart.json` and `pending.json`.
 
-If the new daemon does not come up, the update is recorded in `failed.json`
-and removed from `pending.json` before anything else, so it is never retried.
-The watcher then restores the original pair, unless the database schema
-version changed since step 5. An older `mlqd` refuses a newer schema, so in
-that case the new pair stays, and the daemon is left to systemd and the
-operator. `mlq daemon update status` reports the failure.
+If the new daemon does not come up, `failed.json` records the update and
+`pending.json` is removed before anything else, so the build is never
+retried. The watcher then restores `original/`, unless the schema version
+changed since step 6: an older `mlqd` refuses a newer schema, so the new pair
+stays installed under systemd's restarts, and the record says an operator is
+needed. Until the record shows the rollback finished, `restart.json` stays,
+and a new watcher completes the rollback.
 
 If the watcher dies between steps 3 and 7, the path unit sees `restart.json`
-and starts a new watcher, which first restarts the daemon. It finishes the
-update if the binaries were already replaced, and waits again otherwise.
-Other failures leave `pending.json` in place, and the watcher retries with a
-backoff from 30 seconds to 30 minutes. `mlq daemon update cancel --force`
-abandons an interrupted activation that cannot finish.
+and starts a new watcher. That watcher restarts the daemon, rolling back if
+renaming had begun and the daemon does not come up. It finishes the update
+if the binaries were already replaced, and waits again otherwise. Other
+failures leave `pending.json` in place. The watcher retries with a backoff
+from 30 seconds to 30 minutes, and `status` shows its last error.
+`mlq daemon update cancel --force` abandons an interrupted activation that
+cannot finish. Staging checks up front what activation would otherwise
+retry forever: that the installed `mlq` can subscribe, and that the install
+directory is writable.
 
 ## Invariants
 
