@@ -1,8 +1,8 @@
 [package]
 name = "mlqueue"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
-description = "Machine-wide queue coordinating local ML jobs through per-job maxParallelRuns admission"
+description = "A shared queue for local ML jobs with durable scheduling and per-job concurrency limits"
 license = "MIT"
 
 [[bin]]
