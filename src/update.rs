@@ -277,11 +277,20 @@ impl Host for Systemd {
     }
 
     fn wait_idle(&self, manifest: &Manifest) -> Result<()> {
-        ensure!(
-            read_snapshots(manifest, IdleProbe::is_idle)?,
-            "the queue subscription ended before the queue was idle"
-        );
-        Ok(())
+        // A daemon restart ends the subscription. Resubscribe while it comes
+        // back, so systemd's retry backoff only counts real failures.
+        let mut retry_until = Instant::now() + READY_TIMEOUT;
+        loop {
+            match read_snapshots(manifest, IdleProbe::is_idle) {
+                Ok(true) => return Ok(()),
+                Ok(false) => retry_until = Instant::now() + READY_TIMEOUT,
+                Err(err) if Instant::now() >= retry_until => {
+                    return Err(err.context("the installed daemon stayed unreachable"));
+                }
+                Err(_) => {}
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
     }
 
     fn wait_ready(&self, manifest: &Manifest) -> Result<()> {
@@ -509,6 +518,9 @@ pub fn stage(host: &impl Host, request: StageRequest<'_>) -> Result<Manifest> {
     })?;
 
     replace_file(updater, &root.join(UPDATER))?;
+    if let Some(replaced) = &replaced {
+        release_staging(root, replaced)?;
+    }
     // From here the directory may be referenced, so only sweeping removes it.
     let staged_dir = staged.keep();
     write_json(&root.join(PENDING), &manifest)?;
@@ -673,6 +685,7 @@ pub fn uninstall_watcher(host: &impl Host, root: &Path, service: &str) -> Result
             && manifest.service == service
         {
             discard(root, &manifest)?;
+            remove_if_exists(&root.join(WATCHER_ERROR))?;
         }
         Some(lock)
     } else {
@@ -773,8 +786,13 @@ pub fn status(root: &Path) -> Result<UpdateStatus> {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Cancelled {
     pub pending: Option<Manifest>,
+    /// The pending pair was already installed, so only its staging was left.
+    pub pending_installed: bool,
     pub interrupted: Option<Restart>,
     pub failed: Option<FailedUpdate>,
+    /// Where the binaries the abandoned update replaced were kept, if it
+    /// replaced any.
+    pub kept_originals: Option<PathBuf>,
 }
 
 /// Discard the pending update and any failure report, and stop the watcher.
@@ -785,21 +803,25 @@ pub fn cancel(host: &impl Host, root: &Path, force: bool) -> Result<Cancelled> {
         return Ok(Cancelled::default());
     }
     let _lock = lock(root)?;
+    let mut kept = false;
     let interrupted = read_json::<Restart>(&root.join(RESTART))?;
-    if interrupted.is_some() {
+    if let Some(restart) = &interrupted {
         ensure!(
             force,
             "an activation was interrupted and the watcher is restarting the daemon; \
              pass --force to abandon it and leave the daemon as it is"
         );
+        kept |= release_staging(root, &restart.manifest)?;
         remove_file(&root.join(RESTART))?;
     }
     let failed = read_json::<FailedUpdate>(&root.join(FAILED))?;
     remove_if_exists(&root.join(FAILED))?;
     remove_if_exists(&root.join(WATCHER_ERROR))?;
     let pending = read_json::<Manifest>(&root.join(PENDING))?;
+    let mut pending_installed = false;
     if let Some(manifest) = &pending {
-        discard(root, manifest)?;
+        pending_installed = manifest.outdated()?.is_empty();
+        kept |= discard(root, manifest)?;
     }
     sync_dir(root)?;
     // The triggers are gone, so the path unit will not start it again. Under
@@ -813,8 +835,10 @@ pub fn cancel(host: &impl Host, root: &Path, force: bool) -> Result<Cancelled> {
     }
     Ok(Cancelled {
         pending,
+        pending_installed,
         interrupted,
         failed,
+        kept_originals: kept.then(|| root.join(PREVIOUS)),
     })
 }
 
@@ -920,11 +944,17 @@ fn recover(host: &impl Host, root: &Path) -> Result<()> {
         eprintln!("{}", failed.describe());
         return Ok(());
     }
+    // Renaming stopped before mlqd: the original daemon starts again, and
+    // with the original mlq so the two can talk while the update waits.
+    let candidate_installed = !manifest.outdated()?.contains(&Binary::Mlqd);
+    if !candidate_installed {
+        undo_partial_swap(manifest)?;
+    }
     host.systemctl(&["start", &manifest.service])?;
     match host.wait_ready(manifest) {
         Ok(()) => {}
-        // Candidates may be installed and the update was never judged.
-        Err(not_ready) if restart.schema.is_some() => {
+        // The new mlqd may have been installed and was never judged.
+        Err(not_ready) if restart.schema.is_some() && candidate_installed => {
             let failed = roll_back(host, root, &restart, format!("{not_ready:#}"))?;
             eprintln!("{}", failed.describe());
             return Ok(());
@@ -935,7 +965,7 @@ fn recover(host: &impl Host, root: &Path) -> Result<()> {
     sync_dir(root)?;
     let pending = read_json::<Manifest>(&root.join(PENDING))?;
     if pending.as_ref() == Some(manifest) && manifest.outdated()?.is_empty() {
-        finish(root, manifest)?;
+        discard(root, manifest)?;
         println!(
             "recovered the activation of mlqd {} ({})",
             manifest.version,
@@ -960,7 +990,7 @@ pub fn activate(host: &impl Host, root: &Path) -> Result<Activation> {
     if manifest.outdated()?.is_empty() {
         // An earlier activation confirmed the daemon was up, then stopped
         // before finishing.
-        finish(root, &manifest)?;
+        discard(root, &manifest)?;
         return Ok(Activation::Activated(manifest));
     }
     manifest.verify_candidates()?;
@@ -1001,13 +1031,20 @@ pub fn activate(host: &impl Host, root: &Path) -> Result<Activation> {
         (Err(not_applied), Err(not_ready)) => Err(not_ready.context(format!(
             "after failing to apply the update: {not_applied:#}"
         ))),
-        (committed, Ok(())) => {
+        (Err(not_applied), Ok(())) => {
+            // Renaming may have stopped after mlq; the original daemon runs.
+            undo_partial_swap(&restart.manifest)?;
             remove_file(&root.join(RESTART))?;
             sync_dir(root)?;
-            match committed? {
+            Err(not_applied)
+        }
+        (Ok(committed), Ok(())) => {
+            remove_file(&root.join(RESTART))?;
+            sync_dir(root)?;
+            match committed {
                 Commit::Deferred => Ok(Activation::Deferred),
                 Commit::Replaced => {
-                    finish(root, &restart.manifest)?;
+                    discard(root, &restart.manifest)?;
                     Ok(Activation::Activated(restart.manifest))
                 }
             }
@@ -1050,12 +1087,9 @@ fn roll_back(
 /// A refused rollback keeps the original pair in `previous/` for the
 /// operator.
 fn conclude_rollback(root: &Path, failed: &FailedUpdate) -> Result<()> {
-    if let Rollback::Refused { .. } = failed.rollback {
-        keep_originals(root, &failed.manifest)?;
-    }
+    release_staging(root, &failed.manifest)?;
     remove_if_exists(&root.join(RESTART))?;
-    sync_dir(root)?;
-    remove_staged(root, &failed.manifest.staged_dir)
+    sync_dir(root)
 }
 
 /// Put back `original/`, unless the new daemon already migrated the
@@ -1067,9 +1101,19 @@ fn restore_original(
     schema: i64,
 ) -> Result<Rollback> {
     host.systemctl(&["stop", &manifest.service])?;
+    let outcome = put_back_originals(manifest, db, schema);
+    // Whatever happened, the daemon should run again.
+    host.systemctl(&["start", &manifest.service])?;
+    let outcome = outcome?;
+    if outcome == Rollback::Restored {
+        host.wait_ready(manifest)?;
+    }
+    Ok(outcome)
+}
+
+fn put_back_originals(manifest: &Manifest, db: &Path, schema: i64) -> Result<Rollback> {
     let current = schema_version(db)?;
     if current != schema {
-        host.systemctl(&["start", &manifest.service])?;
         return Ok(Rollback::Refused {
             from: schema,
             to: current,
@@ -1081,8 +1125,6 @@ fn restore_original(
             replace_file(&original, &manifest.installed(binary))?;
         }
     }
-    host.systemctl(&["start", &manifest.service])?;
-    host.wait_ready(manifest)?;
     Ok(Rollback::Restored)
 }
 
@@ -1203,9 +1245,22 @@ fn schema_version(db: &Path) -> Result<i64> {
 
 /// Complete an activation: keep what it replaced in `previous/` and discard
 /// the staging.
-fn finish(root: &Path, manifest: &Manifest) -> Result<()> {
-    keep_originals(root, manifest)?;
-    discard(root, manifest)
+/// Remove a staging directory without losing the only copy of what it
+/// replaced: a half-replaced pair is put back first, and originals that are
+/// no longer installed become `previous/`. Returns whether they did.
+fn release_staging(root: &Path, manifest: &Manifest) -> Result<bool> {
+    undo_partial_swap(manifest)?;
+    let mut superseded = false;
+    for binary in Binary::ALL {
+        let original = manifest.original(binary);
+        superseded |=
+            original.exists() && digest(&original)? != digest(&manifest.installed(binary))?;
+    }
+    if superseded {
+        keep_originals(root, manifest)?;
+    }
+    remove_staged(root, &manifest.staged_dir)?;
+    Ok(superseded)
 }
 
 /// Make the staging's `original/` the new `previous/`. Replacing the whole
@@ -1213,9 +1268,6 @@ fn finish(root: &Path, manifest: &Manifest) -> Result<()> {
 /// interruption.
 fn keep_originals(root: &Path, manifest: &Manifest) -> Result<()> {
     let original = manifest.staged_dir.join(ORIGINAL);
-    if !original.exists() {
-        return Ok(());
-    }
     let previous = root.join(PREVIOUS);
     match fs::remove_dir_all(&previous) {
         Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
@@ -1245,12 +1297,14 @@ fn undo_partial_swap(manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
-/// Remove `pending.json` and the staging directory it refers to.
-fn discard(root: &Path, manifest: &Manifest) -> Result<()> {
-    undo_partial_swap(manifest)?;
+/// Release the staging directory of the pending update, then remove
+/// `pending.json`. This finishes an installed update and abandons one that
+/// is not. Returns whether replaced binaries were kept in `previous/`.
+fn discard(root: &Path, manifest: &Manifest) -> Result<bool> {
+    let kept = release_staging(root, manifest)?;
     remove_file(&root.join(PENDING))?;
     sync_dir(root)?;
-    remove_staged(root, &manifest.staged_dir)
+    Ok(kept)
 }
 
 // ---------------------------------------------------------------------------
@@ -1890,8 +1944,7 @@ mod tests {
             cancel(&fixture.host, &fixture.root, false).unwrap(),
             Cancelled {
                 pending: Some(manifest.clone()),
-                interrupted: None,
-                failed: None,
+                ..Cancelled::default()
             }
         );
         assert!(!fixture.root.join(PENDING).exists());
@@ -2034,11 +2087,68 @@ mod tests {
             Cancelled {
                 pending: Some(manifest),
                 interrupted: Some(restart),
-                failed: None,
+                ..Cancelled::default()
             }
         );
         let report = status(&fixture.root).unwrap();
         assert!(report.pending.is_none() && report.interrupted.is_none());
+    }
+
+    #[test]
+    fn forced_cancel_after_the_swap_keeps_the_replaced_pair() {
+        let fixture = fixture();
+        let manifest = fixture.staged();
+        let mut restart = fixture.write_restart(&manifest, None);
+        Swap::prepare(&manifest)
+            .unwrap()
+            .commit_if_idle(&fixture.root, &mut restart)
+            .unwrap();
+        let cancelled = cancel(&fixture.host, &fixture.root, true).unwrap();
+        assert!(cancelled.pending_installed);
+        assert_eq!(cancelled.kept_originals, Some(fixture.root.join(PREVIOUS)));
+        assert!(fixture.installed("mlqd").contains("mlqd 2.0.0"));
+        assert!(fixture.previous("mlqd").contains("mlqd 1.0.0"));
+        assert!(fixture.previous("mlq").contains("mlq 1.0.0"));
+    }
+
+    #[test]
+    fn forced_cancel_mid_rollback_keeps_a_consistent_pair() {
+        let fixture = fixture();
+        fixture.staged();
+        // Even the original daemon fails, so the rollback cannot finish.
+        fixture.host.broken.set(Some("mlqd"));
+        assert!(activate(&fixture.host, &fixture.root).is_err());
+        let cancelled = cancel(&fixture.host, &fixture.root, true).unwrap();
+        assert!(cancelled.pending.is_none() && cancelled.failed.is_some());
+        assert!(fixture.installed("mlqd").contains("mlqd 1.0.0"));
+        assert!(fixture.installed("mlq").contains("mlq 1.0.0"));
+        let leftovers: Vec<_> = fs::read_dir(&fixture.root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().starts_with(STAGED_PREFIX))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn recovery_from_a_crash_between_the_renames_does_not_blame_the_candidate() {
+        let fixture = fixture();
+        let manifest = fixture.staged();
+        fixture.half_replace(&manifest);
+        fixture.write_restart(&manifest, Some(0));
+        // The original daemon fails to come back for its own reasons.
+        fixture.host.broken.set(Some("mlqd 1.0.0"));
+        assert!(watch(&fixture.host, &fixture.root).is_err());
+        let report = status(&fixture.root).unwrap();
+        assert!(report.failed.is_none());
+        assert_eq!(report.pending, Some(manifest));
+        // The original mlq is back, matching the running mlqd.
+        assert!(fixture.installed("mlq").contains("mlq 1.0.0"));
+
+        fixture.host.broken.set(None);
+        watch(&fixture.host, &fixture.root).unwrap();
+        assert!(fixture.installed("mlqd").contains("mlqd 2.0.0"));
+        assert!(fixture.previous("mlq").contains("mlq 1.0.0"));
     }
 
     #[test]
@@ -2195,8 +2305,10 @@ mod tests {
     fn uninstall_discards_the_update_and_removes_the_units() {
         let fixture = fixture();
         let manifest = fixture.staged();
+        fs::write(fixture.root.join(WATCHER_ERROR), "subscription failed").unwrap();
         assert!(uninstall_watcher(&fixture.host, &fixture.root, SERVICE).unwrap());
         assert!(!fixture.root.join(PENDING).exists());
+        assert!(status(&fixture.root).unwrap().watcher_error.is_none());
         assert!(!manifest.staged_dir.exists());
         assert!(!fixture.host.dir.join("units/test-update.path").exists());
         assert!(!fixture.host.dir.join("units/test-update.service").exists());

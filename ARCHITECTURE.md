@@ -518,7 +518,8 @@ observer. The watcher runs `observer subscribe` and reads only `activeLeases`,
 `admissionBlocked`, and each job's `finishedAt`. It blocks on that single
 subscription until no lease is active, admission is not blocked, and every
 listed job has finished. A job in a state this binary does not know counts as
-unfinished.
+unfinished. A daemon restart ends the subscription; the watcher resubscribes
+for up to two minutes before it counts as a failure.
 
 Activation, under `update.lock`:
 
@@ -547,7 +548,8 @@ Activation, under `update.lock`:
    minutes. On success, remove `restart.json`, then make `original/` the new
    `previous/` and remove `pending.json`. A pending update whose pair is
    already installed is finished this way without waiting on the observer,
-   which may not speak the new daemon's protocol.
+   which may not speak the new daemon's protocol. If renaming failed, put
+   back any `mlq` already replaced.
 
 If the new daemon does not come up, `failed.json` records the update and
 `pending.json` is removed before anything else, so the build is never
@@ -557,15 +559,22 @@ stays installed under systemd's restarts, `original/` becomes `previous/`, and
 the record says an operator is needed. Until the record shows the outcome,
 `restart.json` stays, and a new watcher completes the rollback.
 
-If the watcher dies between steps 3 and 7, the path unit sees `restart.json`
-and starts a new watcher. That watcher restarts the daemon, rolling back if
-renaming had begun and the daemon does not come up. It finishes the update
-if the binaries were already replaced, and waits again otherwise. Other
-failures leave `pending.json` in place. The watcher retries with a backoff
-from 30 seconds to 30 minutes, and `status` shows its last error.
+If the watcher dies between steps 3 and 7, systemd restarts it after the
+current retry delay (the path unit, seeing `restart.json`, covers a reboot).
+The new watcher puts back an `mlq` replaced without its `mlqd` and restarts
+the daemon, rolling back if the new `mlqd` was installed and does not come
+up. It finishes the update if the pair was already replaced, and waits again
+otherwise. Other failures leave `pending.json` in place. The watcher retries
+with a backoff from 30 seconds to 30 minutes, and `status` shows its last
+error. The daemon stays stopped only while a watcher killed mid-activation
+waits for that retry.
+
+Whatever removes a staging directory (finishing, cancelling, restaging, or
+concluding a rollback) first puts back a half-replaced pair, and moves
+`original/` to `previous/` if those binaries are no longer installed, so the
+only copy of a replaced pair is never deleted.
 `mlq daemon update cancel --force` abandons an interrupted activation that
-cannot finish. Cancelling or restaging over a half-replaced pair restores the
-original `mlq` first. Staging checks up front what activation would otherwise
+cannot finish. Staging checks up front what activation would otherwise
 retry forever: that the installed `mlq` can subscribe, and that the install
 directory is writable.
 

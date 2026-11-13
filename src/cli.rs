@@ -1789,8 +1789,15 @@ fn daemon_update(paths: &Paths, args: UpdateArgs) -> Result<()> {
             if let Some(failed) = &cancelled.failed {
                 println!("cleared the report of mlqd {}", failed.manifest.version);
             }
-            if let Some(manifest) = &cancelled.pending {
-                println!("discarded the staged mlqd {}", manifest.version);
+            match &cancelled.pending {
+                Some(manifest) if cancelled.pending_installed => {
+                    println!("mlqd {} was already installed", manifest.version);
+                }
+                Some(manifest) => println!("discarded the staged mlqd {}", manifest.version),
+                None => {}
+            }
+            if let Some(previous) = &cancelled.kept_originals {
+                println!("the binaries it replaced are in {}", previous.display());
             }
             if cancelled == update::Cancelled::default() {
                 println!("no update staged");
