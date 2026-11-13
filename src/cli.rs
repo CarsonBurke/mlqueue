@@ -20,6 +20,8 @@ use crate::protocol::{
     DependencySpec, EventView, JobView, LogPathsView, Op, Reply, ResolveAs, StatusView,
     SubmitParams,
 };
+use crate::systemd::{self, DAEMON_SERVICE};
+use crate::update;
 
 /// Environment variables captured by default at submission. Everything else
 /// must be passed explicitly via `--env` or `--inherit-env`.
@@ -222,6 +224,49 @@ enum DaemonCommand {
     },
     /// Stop, disable, and remove the systemd user service.
     Uninstall,
+    /// Stage a new mlq and mlqd; the service switches to them once the
+    /// queue is idle.
+    Update(UpdateArgs),
+}
+
+/// With no subcommand, stage the binaries in --from. A separate systemd
+/// watcher waits until no job is unfinished and no run lease is held, then
+/// restarts the service on the new pair. Running jobs are never stopped.
+#[derive(Args)]
+#[command(args_conflicts_with_subcommands = true)]
+struct UpdateArgs {
+    #[command(subcommand)]
+    command: Option<UpdateCommand>,
+    /// Directory containing the new mlq and mlqd [default: this mlq's
+    /// directory, e.g. target/release]
+    #[arg(long, value_name = "DIR")]
+    from: Option<PathBuf>,
+    /// The daemon's systemd user unit.
+    #[arg(long, default_value = systemd::DAEMON_SERVICE)]
+    service: String,
+}
+
+#[derive(Subcommand)]
+enum UpdateCommand {
+    /// Show the staged update, if any.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Discard the staged update and any report of a failed one.
+    Cancel {
+        /// Also abandon an interrupted activation, leaving the daemon as it
+        /// is. Check `systemctl --user status mlqd` afterwards.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Wait for an idle queue and activate the staged update; run by the
+    /// watcher service.
+    #[command(hide = true)]
+    Watch {
+        #[arg(long)]
+        root: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -476,7 +521,10 @@ pub fn main() -> Result<()> {
         } => daemon_install(no_enable),
         Command::Daemon {
             command: DaemonCommand::Uninstall,
-        } => daemon_uninstall(),
+        } => daemon_uninstall(&paths),
+        Command::Daemon {
+            command: DaemonCommand::Update(args),
+        } => daemon_update(&paths, args),
         Command::Recover { command } => match command {
             RecoverCommand::List { json } => {
                 let reply = send(&paths, Op::RecoverList, None)?;
@@ -1570,8 +1618,6 @@ pub(crate) fn outcome_exit_code(
 // Daemon lifecycle: foreground run and systemd user-service management
 // ---------------------------------------------------------------------------
 
-const SERVICE_NAME: &str = "mlqd.service";
-
 /// Locate the `mlqd` binary: preferring the one installed alongside this
 /// `mlq` binary (they are built and versioned together), then PATH.
 fn mlqd_path() -> Result<PathBuf> {
@@ -1604,34 +1650,9 @@ fn daemon_run() -> Result<()> {
     Err(err).with_context(|| format!("executing {}", path.display()))
 }
 
-fn systemd_user_unit_path() -> Result<PathBuf> {
-    let config_home = match std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-        Some(xdg) => PathBuf::from(xdg),
-        None => {
-            let home = std::env::var_os("HOME")
-                .filter(|v| !v.is_empty())
-                .context("HOME is not set; cannot locate the systemd user unit directory")?;
-            PathBuf::from(home).join(".config")
-        }
-    };
-    Ok(config_home.join("systemd/user").join(SERVICE_NAME))
-}
-
-fn systemctl_user(args: &[&str]) -> Result<()> {
-    let status = std::process::Command::new("systemctl")
-        .arg("--user")
-        .args(args)
-        .status()
-        .context("running systemctl (is this a systemd system?)")?;
-    if !status.success() {
-        bail!("`systemctl --user {}` failed", args.join(" "));
-    }
-    Ok(())
-}
-
 fn daemon_install(no_enable: bool) -> Result<()> {
     let mlqd = mlqd_path()?;
-    let unit_path = systemd_user_unit_path()?;
+    let unit_path = systemd::user_unit_dir()?.join(DAEMON_SERVICE);
     // Mirrors contrib/systemd/mlqd.service, with the resolved binary.
     let unit = format!(
         "[Unit]\n\
@@ -1654,34 +1675,150 @@ fn daemon_install(no_enable: bool) -> Result<()> {
     std::fs::write(&unit_path, unit).with_context(|| format!("writing {}", unit_path.display()))?;
     println!("wrote {}", unit_path.display());
     if no_enable {
-        println!("not enabled; start with: systemctl --user enable --now {SERVICE_NAME}");
+        println!("not enabled; start with: systemctl --user enable --now {DAEMON_SERVICE}");
         return Ok(());
     }
-    systemctl_user(&["daemon-reload"])?;
-    systemctl_user(&["enable", "--now", SERVICE_NAME])?;
-    println!("mlqd enabled and started (systemctl --user status {SERVICE_NAME})");
+    systemd::systemctl(&["daemon-reload"])?;
+    systemd::systemctl(&["enable", "--now", DAEMON_SERVICE])?;
+    println!("mlqd enabled and started (systemctl --user status {DAEMON_SERVICE})");
     Ok(())
 }
 
-fn daemon_uninstall() -> Result<()> {
-    let unit_path = systemd_user_unit_path()?;
+fn daemon_uninstall(paths: &Paths) -> Result<()> {
+    let unit_path = systemd::user_unit_dir()?.join(DAEMON_SERVICE);
     if !unit_path.exists() {
         bail!(
             "{} is not installed (expected {})",
-            SERVICE_NAME,
+            DAEMON_SERVICE,
             unit_path.display()
         );
+    }
+    let (path_unit, watch_unit) = update::watcher_units(DAEMON_SERVICE);
+    let root = std::path::absolute(paths.updates_dir())?;
+    if update::uninstall_watcher(&update::Systemd, &root, DAEMON_SERVICE)? {
+        println!("removed {path_unit} and {watch_unit}");
     }
     // Stopping the daemon never kills workers (KillMode=process); a later
     // daemon start adopts anything still running. A unit that was installed
     // with --no-enable was never loaded, so disable failing is not fatal.
-    if let Err(err) = systemctl_user(&["disable", "--now", SERVICE_NAME]) {
+    if let Err(err) = systemd::systemctl(&["disable", "--now", DAEMON_SERVICE]) {
         eprintln!("warning: {err:#} (removing the unit file anyway)");
     }
     std::fs::remove_file(&unit_path)
         .with_context(|| format!("removing {}", unit_path.display()))?;
-    systemctl_user(&["daemon-reload"])?;
+    systemd::systemctl(&["daemon-reload"])?;
     println!("removed {}", unit_path.display());
+    Ok(())
+}
+
+fn daemon_update(paths: &Paths, args: UpdateArgs) -> Result<()> {
+    // systemd units refer to it, so it must not depend on the working directory.
+    let root = std::path::absolute(paths.updates_dir())?;
+    match args.command {
+        None => {
+            refuse_legacy_python_update()?;
+            let updater = std::env::current_exe().context("locating this mlq")?;
+            let source_dir = match args.from {
+                Some(dir) => dir,
+                None => updater
+                    .parent()
+                    .context("this mlq has no parent directory")?
+                    .to_owned(),
+            };
+            let manifest = update::stage(
+                &update::Systemd,
+                update::StageRequest {
+                    root: &root,
+                    source_dir: &source_dir,
+                    service: &args.service,
+                    updater: &updater,
+                    env: update::observer_env(),
+                },
+            )?;
+            println!(
+                "staged mlq and mlqd {} for {}; they replace the installed pair once no job is \
+                 unfinished and no run lease is held",
+                manifest.version,
+                manifest.install_dir.display()
+            );
+            println!("check progress with: mlq daemon update status");
+            Ok(())
+        }
+        Some(UpdateCommand::Status { json }) => {
+            let status = update::status(&root)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+                return Ok(());
+            }
+            if let Some(failed) = &status.failed {
+                println!(
+                    "mlqd {} did not start and was rolled back: {}",
+                    failed.manifest.version, failed.reason
+                );
+            }
+            if let Some(manifest) = &status.interrupted {
+                println!(
+                    "interrupted activation of {} {}: the watcher restarts the daemon \
+                     (systemctl --user status {})",
+                    manifest.service,
+                    manifest.version,
+                    update::watcher_units(&manifest.service).1
+                );
+            }
+            match &status.pending {
+                Some(manifest) => println!(
+                    "mlqd {} staged for {}; waiting until no job is unfinished and no run lease \
+                     is held",
+                    manifest.version,
+                    manifest.install_dir.display()
+                ),
+                None if status.interrupted.is_none() && status.failed.is_none() => {
+                    println!("no update staged")
+                }
+                None => {}
+            }
+            Ok(())
+        }
+        Some(UpdateCommand::Cancel { force }) => {
+            let cancelled = update::cancel(&update::Systemd, &root, force)?;
+            if let Some(manifest) = &cancelled.interrupted {
+                println!(
+                    "abandoned the interrupted activation of mlqd {}; check {}",
+                    manifest.version, manifest.service
+                );
+            }
+            match &cancelled.pending {
+                Some(manifest) => println!("discarded the staged mlqd {}", manifest.version),
+                None if cancelled.interrupted.is_none() => println!("no update staged"),
+                None => {}
+            }
+            Ok(())
+        }
+        Some(UpdateCommand::Watch { root }) => update::watch(&update::Systemd, &root),
+    }
+}
+
+/// The Python updater kept its state outside the mlqueue state directory.
+/// Staging rewrites its systemd units, so an update it still owns would be
+/// orphaned.
+fn refuse_legacy_python_update() -> Result<()> {
+    let state_home = match std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => match std::env::var_os("HOME") {
+            Some(home) => PathBuf::from(home).join(".local/state"),
+            None => return Ok(()),
+        },
+    };
+    let legacy = state_home.join("mlqueue-updates");
+    for name in ["pending.json", "restart.json"] {
+        let path = legacy.join(name);
+        if path.exists() {
+            bail!(
+                "{} belongs to the retired Python updater; let it finish or remove it first",
+                path.display()
+            );
+        }
+    }
     Ok(())
 }
 

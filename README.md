@@ -69,8 +69,27 @@ them under the same ID without consuming a retry attempt. See the
 
 ## Upgrade
 
-From v0.2.0, wait until all queued, held, running, and recovery-blocked jobs
-have finished. From the new release checkout:
+Build the new release in your checkout and stage it with the `mlq` you just
+built:
+
+```bash
+git fetch --tags && git checkout vX.Y.Z
+cargo build --release --locked
+target/release/mlq daemon update
+```
+
+The installed binaries stay in place until the queue is idle. A systemd
+watcher waits until no job is queued, held, running, or awaiting recovery,
+then restarts `mlqd.service` on the new `mlq` and `mlqd`. Keep submitting as
+usual; the update waits for that work too. `mlq daemon update status` shows
+the staged release, and `mlq daemon update cancel` discards it. If the new
+daemon does not start, the watcher restores the previous pair, unless the new
+daemon already migrated the database, and `status` reports the failure. The
+last replaced pair stays in `~/.local/state/mlqueue/updates/previous/`.
+
+Staging needs a release that has `mlq daemon update` (after v0.3.0), the
+service from `mlq daemon install`, and a running daemon from v0.2.0 or later.
+Otherwise, wait for the queue to empty and run:
 
 ```bash
 systemctl --user stop mlqd
@@ -79,10 +98,10 @@ systemctl --user start mlqd
 ```
 
 Without systemd, stop and restart the foreground daemon around installation.
-Update both binaries. v0.3.0 uses protocol 8 and schema 10; back up the state
-directory before upgrading if you need to roll back. For installations that
-already support subscriptions, [the staged updater](contrib/mlq-update) can
-wait for the queue to empty before activating a new daemon.
+v0.3.0 uses protocol 8 and schema 10; back up the state directory before
+upgrading if you need to roll back. `mlq daemon update` replaces the Python
+`contrib/mlq-update` script and takes over its systemd units; delete
+`~/.local/bin/mlq-update` if you installed it.
 
 Configuration: `~/.config/mlqueue/config.toml`. State and logs:
 `~/.local/state/mlqueue/`. Both follow XDG overrides.
