@@ -1753,16 +1753,23 @@ fn daemon_update(paths: &Paths, args: UpdateArgs) -> Result<()> {
             if let Some(failed) = &status.failed {
                 println!("{}", failed.describe());
             }
-            if let Some(restart) = &status.interrupted {
-                println!(
+            match &status.interrupted {
+                Some(restart) if status.locked => println!(
+                    "activating mlqd {}: {} is restarting",
+                    restart.manifest.version, restart.manifest.service
+                ),
+                Some(restart) => println!(
                     "the activation of mlqd {} was interrupted; the watcher restarts {} \
                      (systemctl --user status {})",
                     restart.manifest.version,
                     restart.manifest.service,
                     update::watcher_units(&restart.manifest.service).1
-                );
+                ),
+                None => {}
             }
-            if let Some(manifest) = &status.pending {
+            if let Some(manifest) = &status.pending
+                && !(status.locked && status.interrupted.is_some())
+            {
                 println!(
                     "mlqd {} staged for {}; waiting until no job is unfinished and no run lease \
                      is held",

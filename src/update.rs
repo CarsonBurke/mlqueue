@@ -169,7 +169,9 @@ impl Manifest {
     fn outdated(&self) -> Result<Vec<Binary>> {
         let mut outdated = Vec::new();
         for binary in Binary::ALL {
-            if digest(&self.installed(binary))? != self.sha256.get(binary) {
+            if digest_if_exists(&self.installed(binary))?.as_deref()
+                != Some(self.sha256.get(binary))
+            {
                 outdated.push(binary);
             }
         }
@@ -518,16 +520,17 @@ pub fn stage(host: &impl Host, request: StageRequest<'_>) -> Result<Manifest> {
     })?;
 
     replace_file(updater, &root.join(UPDATER))?;
-    if let Some(replaced) = &replaced {
-        release_staging(root, replaced)?;
-    }
     // From here the directory may be referenced, so only sweeping removes it.
     let staged_dir = staged.keep();
     write_json(&root.join(PENDING), &manifest)?;
+    // Only now is the replaced staging unreferenced.
+    if let Some(replaced) = &replaced {
+        release_staging(root, replaced)?;
+    }
     remove_if_exists(&root.join(FAILED))?;
     remove_if_exists(&root.join(WATCHER_ERROR))?;
     remove_unreferenced_staging(root, &staged_dir)?;
-    if let Some(replaced) = replaced
+    if let Some(replaced) = &replaced
         && replaced.service != service
     {
         remove_watcher_units(host, &replaced.service)?;
@@ -535,7 +538,13 @@ pub fn stage(host: &impl Host, request: StageRequest<'_>) -> Result<Manifest> {
     if let Err(err) = install_watcher(host, root, service) {
         // Nothing would activate it.
         discard(root, &manifest)?;
-        return Err(err);
+        let replaced = replaced.map_or(String::new(), |replaced| {
+            format!(
+                " (mlqd {} it replaced is no longer staged)",
+                replaced.version
+            )
+        });
+        return Err(err.context(format!("discarded the staged update{replaced}")));
     }
     Ok(manifest)
 }
@@ -705,12 +714,7 @@ fn remove_watcher_units(host: &impl Host, service: &str) -> Result<bool> {
     host.systemctl(&["disable", "--now", "--quiet", &path_unit])?;
     host.systemctl(&["stop", "--quiet", &watch_unit])?;
     for unit in [&path_unit, &watch_unit] {
-        let path = units.join(unit);
-        if let Err(err) = fs::remove_file(&path)
-            && err.kind() != std::io::ErrorKind::NotFound
-        {
-            return Err(err).with_context(|| format!("removing {}", path.display()));
-        }
+        remove_if_exists(&units.join(unit))?;
     }
     host.systemctl(&["daemon-reload"])?;
     Ok(true)
@@ -763,6 +767,9 @@ pub struct UpdateStatus {
     /// Set while the daemon may be stopped for an activation that has not
     /// finished; the watcher restarts it.
     pub interrupted: Option<Restart>,
+    /// Another process holds `update.lock`: with `interrupted` set, the
+    /// watcher is activating right now rather than recovering later.
+    pub locked: bool,
     pub failed: Option<FailedUpdate>,
     /// Why the watcher's last attempt failed; it retries with a backoff.
     pub watcher_error: Option<String>,
@@ -774,9 +781,21 @@ pub fn status(root: &Path) -> Result<UpdateStatus> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
         Err(err) => return Err(err).context("reading the watcher's last error"),
     };
+    let locked = match File::open(root.join(LOCK)) {
+        Ok(file) => match file.try_lock() {
+            Ok(()) => false,
+            Err(TryLockError::WouldBlock) => true,
+            Err(TryLockError::Error(err)) => {
+                return Err(err).context("checking whether an update is in progress");
+            }
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(err) => return Err(err).context("opening the update lock"),
+    };
     Ok(UpdateStatus {
         pending: read_json(&root.join(PENDING))?,
         interrupted: read_json(&root.join(RESTART))?,
+        locked,
         failed: read_json(&root.join(FAILED))?,
         watcher_error,
     })
@@ -861,19 +880,22 @@ pub enum Activation {
 /// `status`, since systemd retries it out of sight.
 pub fn watch(host: &impl Host, root: &Path) -> Result<()> {
     let result = watch_until_done(host, root);
-    let recorded = match &result {
-        Ok(()) => remove_if_exists(&root.join(WATCHER_ERROR)),
-        Err(err) => write_atomically(
-            &root.join(WATCHER_ERROR),
-            format!("{err:#}").as_bytes(),
-            0o600,
-        ),
-    };
+    let recorded = lock(root).and_then(|_lock| {
+        let path = root.join(WATCHER_ERROR);
+        // Cancelled meanwhile: nothing is left to retry.
+        let retried = root.join(PENDING).exists() || root.join(RESTART).exists();
+        match &result {
+            Err(err) if retried => write_atomically(&path, format!("{err:#}").as_bytes(), 0o600),
+            _ => remove_if_exists(&path),
+        }
+    });
     result.and(recorded)
 }
 
 fn watch_until_done(host: &impl Host, root: &Path) -> Result<()> {
     recover(host, root)?;
+    // Whatever failed last time is behind us now.
+    remove_if_exists(&root.join(WATCHER_ERROR))?;
     while let Some(manifest) = read_json::<Manifest>(&root.join(PENDING))? {
         // An installed update only needs finishing, and its daemon may not
         // speak the observer's protocol.
@@ -946,14 +968,14 @@ fn recover(host: &impl Host, root: &Path) -> Result<()> {
     }
     // Renaming stopped before mlqd: the original daemon starts again, and
     // with the original mlq so the two can talk while the update waits.
-    let candidate_installed = !manifest.outdated()?.contains(&Binary::Mlqd);
+    let candidate_installed = manifest.outdated()?.is_empty();
     if !candidate_installed {
         undo_partial_swap(manifest)?;
     }
     host.systemctl(&["start", &manifest.service])?;
     match host.wait_ready(manifest) {
         Ok(()) => {}
-        // The new mlqd may have been installed and was never judged.
+        // The new pair was installed and never judged.
         Err(not_ready) if restart.schema.is_some() && candidate_installed => {
             let failed = roll_back(host, root, &restart, format!("{not_ready:#}"))?;
             eprintln!("{}", failed.describe());
@@ -1121,7 +1143,12 @@ fn put_back_originals(manifest: &Manifest, db: &Path, schema: i64) -> Result<Rol
     }
     for binary in Binary::ALL {
         let original = manifest.original(binary);
-        if original.exists() && digest(&original)? != digest(&manifest.installed(binary))? {
+        ensure!(
+            original.exists(),
+            "no backup of the original {} to restore",
+            binary.name()
+        );
+        if Some(digest(&original)?) != digest_if_exists(&manifest.installed(binary))? {
             replace_file(&original, &manifest.installed(binary))?;
         }
     }
@@ -1156,15 +1183,22 @@ impl Swap {
     fn prepare(manifest: &Manifest) -> Result<Self> {
         remove_install_temps(&manifest.install_dir)?;
         ensure_private_dir(&manifest.staged_dir.join(ORIGINAL))?;
+        sync_dir(&manifest.staged_dir)?;
         let mut steps = Vec::new();
         for binary in Binary::ALL {
             let target = manifest.installed(binary);
             let installed_sha = digest(&target)?;
+            let original = manifest.original(binary);
             if installed_sha == manifest.sha256.get(binary) {
+                // Already the candidate: either identical from the start, or
+                // replaced by an earlier attempt that backed it up. A rollback
+                // restores the pair, so the backup is complete either way.
+                if !original.exists() {
+                    replace_file(&target, &original)?;
+                }
                 continue;
             }
-            let original = manifest.original(binary);
-            if digest(&original).ok().as_ref() != Some(&installed_sha) {
+            if digest_if_exists(&original)?.as_ref() != Some(&installed_sha) {
                 replace_file(&target, &original)?;
             }
             steps.push(SwapStep {
@@ -1243,8 +1277,6 @@ fn schema_version(db: &Path) -> Result<i64> {
         .context("reading the database schema version")
 }
 
-/// Complete an activation: keep what it replaced in `previous/` and discard
-/// the staging.
 /// Remove a staging directory without losing the only copy of what it
 /// replaced: a half-replaced pair is put back first, and originals that are
 /// no longer installed become `previous/`. Returns whether they did.
@@ -1253,8 +1285,8 @@ fn release_staging(root: &Path, manifest: &Manifest) -> Result<bool> {
     let mut superseded = false;
     for binary in Binary::ALL {
         let original = manifest.original(binary);
-        superseded |=
-            original.exists() && digest(&original)? != digest(&manifest.installed(binary))?;
+        superseded |= original.exists()
+            && Some(digest(&original)?) != digest_if_exists(&manifest.installed(binary))?;
     }
     if superseded {
         keep_originals(root, manifest)?;
@@ -1302,6 +1334,7 @@ fn undo_partial_swap(manifest: &Manifest) -> Result<()> {
 /// is not. Returns whether replaced binaries were kept in `previous/`.
 fn discard(root: &Path, manifest: &Manifest) -> Result<bool> {
     let kept = release_staging(root, manifest)?;
+    remove_install_temps(&manifest.install_dir)?;
     remove_file(&root.join(PENDING))?;
     sync_dir(root)?;
     Ok(kept)
@@ -1359,9 +1392,12 @@ fn remove_unreferenced_staging(root: &Path, current: &Path) -> Result<()> {
 /// Remove copies an interrupted activation left beside the installed
 /// binaries. Callers hold `update.lock`.
 fn remove_install_temps(install_dir: &Path) -> Result<()> {
-    for entry in
-        fs::read_dir(install_dir).with_context(|| format!("listing {}", install_dir.display()))?
-    {
+    let entries = match fs::read_dir(install_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("listing {}", install_dir.display())),
+    };
+    for entry in entries {
         let entry = entry?;
         if entry
             .file_name()
@@ -1457,6 +1493,21 @@ fn sync_dir(dir: &Path) -> Result<()> {
         .with_context(|| format!("syncing {}", dir.display()))
 }
 
+/// The digest of `path`, or `None` if it does not exist.
+fn digest_if_exists(path: &Path) -> Result<Option<String>> {
+    match digest(path) {
+        Ok(digest) => Ok(Some(digest)),
+        Err(err)
+            if err
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|err| err.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 fn digest(path: &Path) -> Result<String> {
     let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut hasher = Sha256::new();
@@ -1525,9 +1576,21 @@ mod tests {
                 ensure!(args[0] != command, "systemctl {command} failed");
             }
             if args == ["start", SERVICE] && self.competitor.borrow().is_none() {
-                File::create(self.state_dir().join("daemon.lock"))?
-                    .try_lock()
-                    .expect("the updater released daemon.lock before starting the daemon");
+                // A child another test thread forks inherits the descriptor
+                // until it execs, briefly extending the hold; the watcher
+                // itself is single-threaded.
+                let lock = File::create(self.state_dir().join("daemon.lock"))?;
+                let released = (0..100).any(|_| {
+                    let free = lock.try_lock().is_ok();
+                    if !free {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    free
+                });
+                assert!(
+                    released,
+                    "the updater released daemon.lock before starting the daemon"
+                );
             }
             if args == ["start", SERVICE]
                 && self.migrate_on_start.get()
@@ -2198,7 +2261,7 @@ mod tests {
         // Without a watcher nothing would activate it.
         fixture.host.failing_systemctl.set(Some("daemon-reload"));
         let err = fixture.stage().unwrap_err();
-        assert!(err.to_string().contains("daemon-reload"), "{err:#}");
+        assert!(format!("{err:#}").contains("daemon-reload"), "{err:#}");
         assert!(!fixture.root.join(PENDING).exists());
     }
 
@@ -2316,6 +2379,42 @@ mod tests {
 
         write_json(&fixture.root.join(RESTART), &manifest).unwrap();
         assert!(uninstall_watcher(&fixture.host, &fixture.root, SERVICE).is_err());
+    }
+
+    #[test]
+    fn cancel_survives_a_removed_installation() {
+        let fixture = fixture();
+        let manifest = fixture.staged();
+        fs::remove_dir_all(fixture.host.install_dir()).unwrap();
+        let cancelled = cancel(&fixture.host, &fixture.root, false).unwrap();
+        assert_eq!(cancelled.pending, Some(manifest.clone()));
+        assert!(!manifest.staged_dir.exists());
+    }
+
+    #[test]
+    fn rollback_of_an_update_sharing_mlq_restores_the_pair() {
+        let fixture = fixture();
+        // Same release, so mlq is byte-identical and never renamed.
+        script(&fixture.host.install_dir().join("mlq"), "mlq 2.0.0");
+        fixture.staged();
+        fixture.host.broken.set(Some("mlqd 2.0.0"));
+        let Activation::Failed(failed) = activate(&fixture.host, &fixture.root).unwrap() else {
+            panic!("expected a failed activation");
+        };
+        assert_eq!(failed.rollback, Rollback::Restored);
+        assert!(fixture.installed("mlqd").contains("mlqd 1.0.0"));
+        assert!(fixture.installed("mlq").contains("mlq 2.0.0"));
+    }
+
+    #[test]
+    fn status_distinguishes_activating_from_interrupted() {
+        let fixture = fixture();
+        let manifest = fixture.staged();
+        fixture.write_restart(&manifest, None);
+        assert!(!status(&fixture.root).unwrap().locked);
+        let _watcher = lock(&fixture.root).unwrap();
+        let report = status(&fixture.root).unwrap();
+        assert!(report.locked && report.interrupted.is_some());
     }
 
     #[test]
