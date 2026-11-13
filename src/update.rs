@@ -1658,6 +1658,21 @@ mod tests {
     fn script(path: &Path, version_line: &str) {
         fs::write(path, format!("#!/bin/sh\necho '{version_line}'\n")).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        // A child another test thread forked during the write holds it open
+        // until it execs, and Linux refuses to run a file open for writing
+        // (ETXTBSY). Our handle is closed, so once it runs, it always will.
+        for _ in 0..100 {
+            match Command::new(path).output() {
+                Err(err) if err.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                result => {
+                    result.unwrap();
+                    return;
+                }
+            }
+        }
+        panic!("{} stayed busy", path.display());
     }
 
     fn fixture() -> Fixture {
