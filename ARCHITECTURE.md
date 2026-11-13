@@ -544,16 +544,18 @@ Activation, under `update.lock`:
 7. Release `daemon.lock`, start the unit, and wait until its main process
    runs the installed `mlqd` and the socket accepts connections. A unit that
    exits or restarts while starting fails at once; a slow start has two
-   minutes. On success, move what was replaced to `previous/` and remove
-   `restart.json` and `pending.json`.
+   minutes. On success, remove `restart.json`, then make `original/` the new
+   `previous/` and remove `pending.json`. A pending update whose pair is
+   already installed is finished this way without waiting on the observer,
+   which may not speak the new daemon's protocol.
 
 If the new daemon does not come up, `failed.json` records the update and
 `pending.json` is removed before anything else, so the build is never
 retried. The watcher then restores `original/`, unless the schema version
 changed since step 6: an older `mlqd` refuses a newer schema, so the new pair
-stays installed under systemd's restarts, and the record says an operator is
-needed. Until the record shows the rollback finished, `restart.json` stays,
-and a new watcher completes the rollback.
+stays installed under systemd's restarts, `original/` becomes `previous/`, and
+the record says an operator is needed. Until the record shows the outcome,
+`restart.json` stays, and a new watcher completes the rollback.
 
 If the watcher dies between steps 3 and 7, the path unit sees `restart.json`
 and starts a new watcher. That watcher restarts the daemon, rolling back if
@@ -562,7 +564,8 @@ if the binaries were already replaced, and waits again otherwise. Other
 failures leave `pending.json` in place. The watcher retries with a backoff
 from 30 seconds to 30 minutes, and `status` shows its last error.
 `mlq daemon update cancel --force` abandons an interrupted activation that
-cannot finish. Staging checks up front what activation would otherwise
+cannot finish. Cancelling or restaging over a half-replaced pair restores the
+original `mlq` first. Staging checks up front what activation would otherwise
 retry forever: that the installed `mlq` can subscribe, and that the install
 directory is writable.
 

@@ -1,6 +1,7 @@
 //! `systemctl --user` helpers shared by service installation and the staged
 //! daemon updater.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -55,6 +56,43 @@ pub fn show(unit: &str, property: &str) -> Result<String> {
     Ok(value.trim_end_matches('\n').to_owned())
 }
 
+/// Several unit properties from one `systemctl --user show` call, in the
+/// order requested.
+pub fn show_all<const N: usize>(unit: &str, properties: [&str; N]) -> Result<[String; N]> {
+    let mut command = Command::new("systemctl");
+    command.args(["--user", "show", unit]);
+    for property in properties {
+        command.args(["-p", property]);
+    }
+    let output = command
+        .output()
+        .context("running systemctl (is this a systemd system?)")?;
+    if !output.status.success() {
+        bail!(
+            "`systemctl --user show {unit}` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let text = String::from_utf8(output.stdout)
+        .with_context(|| format!("{unit} properties are not UTF-8"))?;
+    parse_properties(&text, properties).with_context(|| format!("reading {unit} properties"))
+}
+
+fn parse_properties<const N: usize>(text: &str, properties: [&str; N]) -> Result<[String; N]> {
+    let values: HashMap<&str, &str> = text
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect();
+    let mut out = properties.map(|_| String::new());
+    for (slot, property) in out.iter_mut().zip(properties) {
+        *slot = values
+            .get(property)
+            .with_context(|| format!("systemctl did not report {property}"))?
+            .to_string();
+    }
+    Ok(out)
+}
+
 /// The executable of a unit's only `ExecStart=` line, from its `show` value,
 /// e.g. `{ path=/usr/bin/mlqd ; argv[]=/usr/bin/mlqd ; ... }`.
 pub fn exec_start_path(value: &str) -> Result<PathBuf> {
@@ -85,6 +123,16 @@ mod tests {
             exec_start_path(value).unwrap(),
             PathBuf::from("/home/u/.cargo/bin/mlqd")
         );
+    }
+
+    #[test]
+    fn show_all_parses_properties_in_request_order() {
+        let text = "MainPID=42\nActiveState=active\nSubState=running\nNRestarts=0\n";
+        assert_eq!(
+            parse_properties(text, ["NRestarts", "MainPID", "SubState"]).unwrap(),
+            ["0", "42", "running"]
+        );
+        assert!(parse_properties(text, ["Missing"]).is_err());
     }
 
     #[test]
