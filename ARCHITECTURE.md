@@ -498,9 +498,8 @@ restart. Scheduling semantics are **code-versioned**, not config-toggled.
 ## Agent skill
 
 [`skills/queue-ml-jobs/`](skills/queue-ml-jobs/) is versioned with the repo.
-It requires agents to use `mlq`, keep work foregrounded, choose
-`maxParallelRuns` explicitly (`1` for exclusive/unknown, higher only from
-evidence), and leave priority at `0` unless ordering is intentional.
+It covers submission, monitoring, concurrency limits, dependencies, and job
+controls for agents using the shared queue.
 
 ## Invariants
 

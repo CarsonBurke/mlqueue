@@ -1,99 +1,44 @@
 ---
 name: queue-ml-jobs
-description: Queue and manage local machine-learning workloads with mlq. Use for local training, evaluation, preprocessing, or benchmarks that consume shared CPU or GPU resources, and for inspecting or controlling the mlq queue or daemon.
+description: Submit and manage local training, evaluation, preprocessing, and benchmarks through mlq, or inspect its queue and daemon.
 ---
 
 # Queue local ML work
 
-- Submit managed workloads with `mlq submit`; never run them directly or bypass
-  the queue.
-- Use `mlq follow JOB` instead of the removed `wait` command. It subscribes until
-  the final outcome or a 55-minute observation timeout, and exits with the
-  command's status (or `128 + signal`) on completion. Plain `follow` prints only
-  final output: no polling, heartbeats, log tails, hooks, checks, or LLM calls.
-  On timeout it prints `follow timed out after 55 minutes` and exits `124`;
-  the job is untouched. `--timeout DURATION` overrides the observation duration.
-- The 55-minute default leaves headroom for a 60-minute agent KV-cache TTL.
-  After timeout, reassess: reattach with `mlq follow JOB` only if waiting is still
-  useful; otherwise record the job ID and stop following. Never resubmit or retry
-  the workload solely because following timed out. Avoid an unattended shell
-  loop around `follow`: return control to the agent between observation windows.
-- Opt into intermediate events only when actionable: `--events started,retry`
-  or an explicit `--config follow.toml`. Checks require `warning` selection.
-  `--only-finish` overrides intermediate events/checks; `--no-hooks` also disables
-  explicitly configured finish notifications. `--json` emits compact NDJSON,
-  not full job history; use `show JOB --json` for detail. Never poll an LLM to
-  interpret metrics.
-- You may need to start `mlqd` if it fails.
-- When authorized to update this installation, build with `cargo build --release
-  --locked`, then `mlq-update stage --mlqd target/release/mlqd` before upgrading
-  the CLI with `cargo install --path . --locked --force --bin mlq`. The configured
-  updater activates only when no unfinished jobs or active leases remain.
-  Do not directly replace/restart a busy daemon or install both binaries.
-  `mlq-update status` shows the pending candidate; staging never fetches Git.
-- Keep each workload and its descendants foregrounded in the runner's process
-  group. Restructure commands that daemonize or call `setsid`.
-- Choose `--max-parallel-runs N` explicitly for every submission. It asserts
-  that the job is safe while at most `N` total managed jobs are running,
-  regardless of workload type; it is not a utilization target. Use `1` for
-  unknown, exclusive, multi-GPU, or benchmark-sensitive work. Raise it only
-  from evidence that mixed concurrent workloads remain safe.
-- Omit `--priority` for the default priority `0`. Use a signed value only when
-  queue precedence is intentional. Higher-priority eligible jobs rank first;
-  equal priorities retain the queue's FIFO/backfill rules, and running jobs
-  are never preempted. Never increase priority merely to advance your own work.
+Use `mlq` for expensive local workloads so they share the machine's queue.
 
 ```bash
-mlq submit --name NAME --max-parallel-runs N \
-  --cwd /absolute/repository/path -- COMMAND...
+mlq submit --name NAME --cwd /path/to/repo -- COMMAND...
+mlq follow JOB
 ```
 
-- Add `--time-limit DURATION` when a hard per-attempt wall-clock bound is
-  operationally reasonable. Choose a defensible, generous duration from
-  workload evidence; queue wait is excluded, but command startup, compilation,
-  and descendants count toward the limit. Prefer a limit when an overlong run
-  likely indicates a hang or would waste shared resources. Leave the job
-  unlimited when valid runtimes are too variable to bound safely.
-- For sequential or conditional work, use durable queue dependencies:
-  `--after-success JOB` runs only after a successful prerequisite, while
-  `--after-terminal JOB` runs after any terminal outcome. Repeat flags for an
-  AND gate. Use `mlq follow` in the submitter for output-derived commands, or
-  explicitly configure cheap local warning checks for metric conditions. Checks
-  notify; they never cancel/retry the job. Keep keys stable and advance metric
-  steps only for new observations so persistent findings do not waste tokens.
-- Pass required environment explicitly. Values supplied through `--env` are
-  stored as plaintext; make workloads read secrets from credential files.
-- Change a queued or running job with
-  `mlq set-max-parallel-runs JOB N` when evidence changes its safe limit.
-  Lowering below the current active-lease count is allowed: existing work
-  keeps running, and new admissions wait until the set drains.
-- Change a queued or held job's order with `mlq set-priority JOB P`. Running
-  jobs cannot change priority (no preemption). Do not raise priority merely to
-  jump the queue for your own work.
-- Change a queued or running job's wall-clock bound with
-  `mlq set-time-limit JOB DURATION`, or remove it with `--clear`. The clock
-  stays anchored at command spawn. Shortening below the time already elapsed
-  stops that attempt; once termination has started, extending it does not
-  revive the attempt. An earlier cancellation stays cancelled. Later retries
-  use the updated limit.
-- Add `--yield-signal SIGUSR1` only when the command itself handles it: on the
-  signal its leader process saves a checkpoint and exits with code 75 (or
-  `--yield-exit-code`), and a rerun of the same command resumes from that
-  checkpoint (`MLQ_ATTEMPT` says which attempt is running). The signal arrives
-  once, so a command with nothing to save yet must remember it and yield after
-  its next checkpoint. Wrapper scripts must `exec` the trainer or forward the
-  signal. Never opt in work that cannot checkpoint: a yield would lose it.
-- Never run `mlq yield` unless the user explicitly asked you to yield that
-  specific job. Do not yield jobs to get your own work scheduled sooner. The
-  daemon normally refuses non-interactive yields and asks for confirmation on
-  a terminal; do not work around either (for example by running it in a
-  pseudo-terminal or answering the prompt yourself), and do not change its
-  config.
-- Use `mlq status`, `show`, `see`, and `logs` to observe work, and `cancel` or
-  `retry` to control it. Report the submitted job ID, chosen parallel limit,
-  chosen time limit (or the decision to leave it unlimited), and any nonzero
-  priority.
-- If `mlq status` reports the queue is paused, new work will not start until
-  an operator runs `mlq unpause`. Do not pause or unpause the shared queue
-  unless the user asked.
+Submission returns a job ID. Report it so the work can be found later.
+`follow` waits for the outcome and exits with its status. Its default 55-minute
+timeout exits 124 without stopping the job; reattach rather than resubmit.
 
+Jobs run alone by default. Set `--max-parallel-runs N` when a job is safe with
+N total managed jobs active, including itself. Every active job's cap must fit;
+the queue does not measure resource usage or count work started outside it.
+Keep workloads in the foreground so their descendants stay supervised.
+
+Useful submission options:
+
+- `--env KEY=VALUE` or `--inherit-env VAR`: pass required environment explicitly.
+  Values are stored in plaintext; use credential files for secrets.
+- `--after-success JOB` or `--after-terminal JOB`: declare dependencies.
+- `--max-attempts N --retry-delay 30s`: retry failed attempts.
+- `--time-limit 2h`: bound each attempt from command spawn, excluding queue wait.
+- `--priority P`: change ordering; higher values run first, default 0.
+
+Use `status` for the queue, `see JOB` for details and recent output, and
+`logs JOB --follow` to stream stdout (`--stderr` for stderr). `show JOB --json`
+returns attempt history; `subscribe` streams queue snapshots.
+
+Use `cancel`, `retry`, `hold`, `release`, and the `set-*` commands as needed.
+`pause` stops new starts across the queue; running work continues.
+
+For checkpoint-capable commands, `--yield-signal SIGUSR1` opts into yielding.
+The command must handle the signal, checkpoint, and exit 75 so the same command
+can resume later. Read the [yield protocol](../../ARCHITECTURE.md#cooperative-yield)
+when implementing this. See the [README](../../README.md#upgrade) for upgrades
+and `mlq <command> --help` for other options.
