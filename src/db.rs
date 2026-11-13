@@ -248,7 +248,21 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE attempts ADD COLUMN yield_reason TEXT;
     ALTER TABLE attempts ADD COLUMN yield_delivered_at INTEGER;
     "#,
+    // v10: index completion time. `status` (and every subscription refresh)
+    // selects unfinished jobs plus the newest finished ones; without this it
+    // scanned the whole job history, env blobs included.
+    "CREATE INDEX jobs_finished ON jobs(finished_at, id);",
 ];
+
+/// `Connection::query_row` through the statement cache. The daemon polls the
+/// same handful of single-row lookups many times a second.
+fn query_row_cached<T, P, F>(conn: &Connection, sql: &str, params: P, f: F) -> rusqlite::Result<T>
+where
+    P: rusqlite::Params,
+    F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+{
+    conn.prepare_cached(sql)?.query_row(params, f)
+}
 
 pub fn open(path: &Path) -> Result<Connection> {
     let conn =
@@ -270,6 +284,9 @@ fn configure(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "synchronous", "FULL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.busy_timeout(std::time::Duration::from_secs(10))?;
+    // The coordinator reuses one connection for its whole life; keep every
+    // static statement of a pass compiled instead of reparsing it each tick.
+    conn.set_prepared_statement_cache_capacity(64);
     Ok(())
 }
 
@@ -558,23 +575,28 @@ pub fn insert_job(conn: &Connection, params: &SubmitParams, now: i64) -> Result<
 }
 
 pub fn job_row(conn: &Connection, id: JobId) -> Result<Option<JobRow>> {
-    Ok(conn
-        .query_row(
-            &format!("SELECT {JOB_COLUMNS} FROM jobs WHERE id = ?1"),
-            [id],
-            job_from_row,
-        )
-        .optional()?)
+    Ok(query_row_cached(
+        conn,
+        &format!("SELECT {JOB_COLUMNS} FROM jobs WHERE id = ?1"),
+        [id],
+        job_from_row,
+    )
+    .optional()?)
 }
 
 /// Most recently submitted job (`MAX(id)`), if the queue is not empty.
 pub fn latest_job_id(conn: &Connection) -> Result<Option<JobId>> {
-    Ok(conn.query_row("SELECT MAX(id) FROM jobs", [], |row| row.get(0))?)
+    Ok(query_row_cached(
+        conn,
+        "SELECT MAX(id) FROM jobs",
+        [],
+        |row| row.get(0),
+    )?)
 }
 
-/// Jobs shown by `status`: all non-terminal plus the most recent terminal.
-pub fn status_jobs(conn: &Connection, recent_terminal: u32) -> Result<Vec<JobRow>> {
-    let mut stmt = conn.prepare(&format!(
+/// Both halves seek the `jobs_finished` index; neither touches job history.
+fn status_jobs_sql() -> String {
+    format!(
         "SELECT {JOB_COLUMNS} FROM jobs WHERE id IN (
              SELECT id FROM jobs WHERE finished_at IS NULL
              UNION
@@ -583,7 +605,12 @@ pub fn status_jobs(conn: &Connection, recent_terminal: u32) -> Result<Vec<JobRow
                  ORDER BY finished_at DESC, id DESC LIMIT ?1
              )
          ) ORDER BY id"
-    ))?;
+    )
+}
+
+/// Jobs shown by `status`: all non-terminal plus the most recent terminal.
+pub fn status_jobs(conn: &Connection, recent_terminal: u32) -> Result<Vec<JobRow>> {
+    let mut stmt = conn.prepare_cached(&status_jobs_sql())?;
     let rows = stmt.query_map([recent_terminal], job_from_row)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
@@ -672,7 +699,8 @@ pub fn set_active_attempt_max_parallel_runs(
     value: u32,
 ) -> Result<()> {
     ensure!(value > 0, "maxParallelRuns must be positive");
-    let mutable: bool = conn.query_row(
+    let mutable: bool = query_row_cached(
+        conn,
         "SELECT EXISTS (
              SELECT 1 FROM attempts a
              JOIN run_leases l ON l.attempt_id = a.id
@@ -708,18 +736,19 @@ pub fn max_job_seq(conn: &Connection) -> Result<i64> {
     // sqlite_sequence records the highest id ever allocated, so a future
     // retention cleanup deleting the newest rows can never lower the frozen
     // backfill cutoff. The row is absent until the first job is inserted.
-    Ok(conn
-        .query_row(
-            "SELECT seq FROM sqlite_sequence WHERE name = 'jobs'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?
-        .unwrap_or(0))
+    Ok(query_row_cached(
+        conn,
+        "SELECT seq FROM sqlite_sequence WHERE name = 'jobs'",
+        [],
+        |row| row.get(0),
+    )
+    .optional()?
+    .unwrap_or(0))
 }
 
 pub fn max_ready_seq(conn: &Connection) -> Result<i64> {
-    Ok(conn.query_row(
+    Ok(query_row_cached(
+        conn,
         "SELECT value FROM scheduler_ready_sequence WHERE singleton = 1",
         [],
         |row| row.get(0),
@@ -740,7 +769,8 @@ fn assign_next_ready_seq(conn: &Connection, job: JobId, now: i64) -> Result<i64>
 }
 
 pub fn count_jobs_in_state(conn: &Connection, state: JobState) -> Result<u32> {
-    Ok(conn.query_row(
+    Ok(query_row_cached(
+        conn,
         "SELECT COUNT(*) FROM jobs WHERE state = ?1",
         [state.as_str()],
         |row| row.get(0),
@@ -753,7 +783,7 @@ pub fn bounded_job_names_in_state(
     name_chars: u32,
     limit: u32,
 ) -> Result<Vec<(JobId, String)>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT id, substr(name, 1, ?2) FROM jobs WHERE state = ?1 ORDER BY id LIMIT ?3",
     )?;
     let rows = stmt.query_map(params![state.as_str(), name_chars, limit], |row| {
@@ -767,7 +797,7 @@ pub fn bounded_job_names_in_state(
 // ---------------------------------------------------------------------------
 
 pub fn dependencies_of(conn: &Connection, child: JobId) -> Result<Vec<DependencyRow>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT d.parent_id, d.child_id, d.condition, p.state, d.resolution,
                 d.parent_outcome, d.resolved_at
            FROM dependencies d JOIN jobs p ON p.id = d.parent_id
@@ -801,7 +831,7 @@ pub fn dependencies_of(conn: &Connection, child: JobId) -> Result<Vec<Dependency
 }
 
 pub fn unresolved_dependency_parents(conn: &Connection, child: JobId) -> Result<Vec<JobId>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT parent_id FROM dependencies
           WHERE child_id = ?1 AND resolution IS NULL ORDER BY parent_id",
     )?;
@@ -809,20 +839,24 @@ pub fn unresolved_dependency_parents(conn: &Connection, child: JobId) -> Result<
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// CROSS JOIN pins the loop order: drive from the partial index of unresolved
+/// edges (normally empty) and look parents up by key. Left to choose, the
+/// planner walks every terminal job in history on every pass.
+const UNRESOLVED_EDGES_OF_TERMINAL_PARENTS: &str = "\
+    SELECT d.parent_id, d.child_id, d.condition, p.state
+      FROM dependencies d
+     CROSS JOIN jobs p ON p.id = d.parent_id
+     WHERE d.resolution IS NULL
+       AND p.state IN ('succeeded','failed','cancelled','lost','skipped')
+     ORDER BY d.parent_id, d.child_id";
+
 /// Latch terminal parent outcomes, cascade impossible success requirements,
 /// and assign FIFO positions to jobs that have become runnable. Resolved
 /// edges never reopen, including when a parent is manually retried later.
 pub fn advance_dependency_graph(conn: &Connection, now: i64) -> Result<()> {
     loop {
         let unresolved = {
-            let mut stmt = conn.prepare(
-                "SELECT d.parent_id, d.child_id, d.condition, p.state
-                   FROM dependencies d
-                   JOIN jobs p ON p.id = d.parent_id
-                  WHERE d.resolution IS NULL
-                    AND p.state IN ('succeeded','failed','cancelled','lost','skipped')
-                  ORDER BY d.parent_id, d.child_id",
-            )?;
+            let mut stmt = conn.prepare_cached(UNRESOLVED_EDGES_OF_TERMINAL_PARENTS)?;
             let rows = stmt.query_map([], |row| {
                 let condition: String = row.get(2)?;
                 let outcome: String = row.get(3)?;
@@ -855,7 +889,7 @@ pub fn advance_dependency_graph(conn: &Connection, now: i64) -> Result<()> {
         }
 
         let violated = {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT d.child_id, d.parent_id
                    FROM dependencies d
                    JOIN jobs child ON child.id = d.child_id
@@ -891,7 +925,7 @@ pub fn advance_dependency_graph(conn: &Connection, now: i64) -> Result<()> {
     }
 
     let ready = {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT j.id FROM jobs j
               WHERE j.state IN ('queued','held')
                 AND j.ready_seq IS NULL
@@ -922,7 +956,7 @@ pub fn advance_dependency_graph(conn: &Connection, now: i64) -> Result<()> {
 
 /// Priority/FIFO-ordered jobs eligible for admission right now.
 pub fn eligible_candidates(conn: &Connection, now: i64) -> Result<Vec<Candidate>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT j.id, j.ready_seq, j.max_parallel_runs, j.priority FROM jobs j
          WHERE j.state = 'queued'
            AND j.ready_seq IS NOT NULL
@@ -980,27 +1014,27 @@ pub fn create_attempt_with_lease(
 }
 
 pub fn attempt_row(conn: &Connection, id: AttemptId) -> Result<Option<AttemptRow>> {
-    Ok(conn
-        .query_row(
-            &format!("SELECT {ATTEMPT_COLUMNS} FROM attempts WHERE id = ?1"),
-            [id],
-            attempt_from_row,
-        )
-        .optional()?)
+    Ok(query_row_cached(
+        conn,
+        &format!("SELECT {ATTEMPT_COLUMNS} FROM attempts WHERE id = ?1"),
+        [id],
+        attempt_from_row,
+    )
+    .optional()?)
 }
 
 pub fn attempt_by_number(conn: &Connection, job: JobId, number: i64) -> Result<Option<AttemptRow>> {
-    Ok(conn
-        .query_row(
-            &format!("SELECT {ATTEMPT_COLUMNS} FROM attempts WHERE job_id = ?1 AND number = ?2"),
-            params![job, number],
-            attempt_from_row,
-        )
-        .optional()?)
+    Ok(query_row_cached(
+        conn,
+        &format!("SELECT {ATTEMPT_COLUMNS} FROM attempts WHERE job_id = ?1 AND number = ?2"),
+        params![job, number],
+        attempt_from_row,
+    )
+    .optional()?)
 }
 
 pub fn attempts_for_job(conn: &Connection, job: JobId) -> Result<Vec<AttemptRow>> {
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {ATTEMPT_COLUMNS} FROM attempts WHERE job_id = ?1 ORDER BY number"
     ))?;
     let rows = stmt.query_map([job], attempt_from_row)?;
@@ -1010,21 +1044,21 @@ pub fn attempts_for_job(conn: &Connection, job: JobId) -> Result<Vec<AttemptRow>
 /// The single non-terminal attempt of a job, if any. The serialized
 /// coordinator plus the unique lease per attempt guarantee at most one.
 pub fn live_attempt_for_job(conn: &Connection, job: JobId) -> Result<Option<AttemptRow>> {
-    Ok(conn
-        .query_row(
-            &format!(
-                "SELECT {ATTEMPT_COLUMNS} FROM attempts WHERE job_id = ?1 \
+    Ok(query_row_cached(
+        conn,
+        &format!(
+            "SELECT {ATTEMPT_COLUMNS} FROM attempts WHERE job_id = ?1 \
                  AND state IN ('prepared','authorized','running','orphaned','quarantined') \
                  ORDER BY number DESC LIMIT 1"
-            ),
-            [job],
-            attempt_from_row,
-        )
-        .optional()?)
+        ),
+        [job],
+        attempt_from_row,
+    )
+    .optional()?)
 }
 
 pub fn non_terminal_attempts(conn: &Connection) -> Result<Vec<AttemptRow>> {
-    let mut stmt = conn.prepare(&format!(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT {ATTEMPT_COLUMNS} FROM attempts \
          WHERE state IN ('prepared','authorized','running','orphaned','quarantined') ORDER BY id"
     ))?;
@@ -1032,8 +1066,45 @@ pub fn non_terminal_attempts(conn: &Connection) -> Result<Vec<AttemptRow>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// Whether any attempt still needs supervision: its runner, artifacts or
+/// process group can change without a request reaching the daemon.
+pub fn has_non_terminal_attempts(conn: &Connection) -> Result<bool> {
+    Ok(query_row_cached(
+        conn,
+        "SELECT EXISTS (SELECT 1 FROM attempts \
+         WHERE state IN ('prepared','authorized','running','orphaned','quarantined'))",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+/// The earliest retry delay that has not elapsed yet. Readiness and
+/// eligibility are otherwise functions of committed state alone, so this is
+/// the only moment a quiet queue changes on its own.
+pub fn next_retry_at(conn: &Connection, now: i64) -> Result<Option<i64>> {
+    Ok(query_row_cached(
+        conn,
+        "SELECT MIN(retry_not_before) FROM jobs \
+         WHERE state IN ('queued','held') AND retry_not_before > ?1",
+        [now],
+        |row| row.get(0),
+    )?)
+}
+
+/// A job's current time limit and when it was installed, without loading its
+/// argv and environment.
+pub fn job_time_limit(conn: &Connection, id: JobId) -> Result<Option<(Option<i64>, Option<i64>)>> {
+    Ok(query_row_cached(
+        conn,
+        "SELECT time_limit_ms, time_limit_set_at FROM jobs WHERE id = ?1",
+        [id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()?)
+}
+
 pub fn active_leases(conn: &Connection) -> Result<Vec<(AttemptId, ActiveLease)>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT attempt_id, job_id, max_parallel_runs FROM run_leases \
          WHERE released_at IS NULL ORDER BY attempt_id",
     )?;
@@ -1201,31 +1272,32 @@ pub fn set_attempt_cancel_requested(
 pub const RESERVATION_CUTOFF_UNFROZEN: i64 = 0;
 
 pub fn active_reservation(conn: &Connection) -> Result<Option<ReservationRow>> {
-    let row = conn
-        .query_row(
-            "SELECT id, job_id, cutoff_seq, semantics_version, created_at, initial_blockers \
+    let row = query_row_cached(
+        conn,
+        "SELECT id, job_id, cutoff_seq, semantics_version, created_at, initial_blockers \
              FROM scheduler_reservation WHERE status = 'active'",
-            [],
-            |row| {
-                let blockers: String = row.get(5)?;
-                Ok(ReservationRow {
-                    id: row.get(0)?,
-                    job_id: row.get(1)?,
-                    cutoff_seq: row.get(2)?,
-                    semantics_version: row.get(3)?,
-                    created_at: row.get(4)?,
-                    initial_blockers: serde_json::from_str(&blockers)
-                        .expect("valid blockers JSON in database"),
-                    consumed: BTreeSet::new(),
-                })
-            },
-        )
-        .optional()?;
+        [],
+        |row| {
+            let blockers: String = row.get(5)?;
+            Ok(ReservationRow {
+                id: row.get(0)?,
+                job_id: row.get(1)?,
+                cutoff_seq: row.get(2)?,
+                semantics_version: row.get(3)?,
+                created_at: row.get(4)?,
+                initial_blockers: serde_json::from_str(&blockers)
+                    .expect("valid blockers JSON in database"),
+                consumed: BTreeSet::new(),
+            })
+        },
+    )
+    .optional()?;
     let Some(mut reservation) = row else {
         return Ok(None);
     };
-    let mut stmt = conn
-        .prepare("SELECT job_id FROM scheduler_reservation_backfills WHERE reservation_id = ?1")?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT job_id FROM scheduler_reservation_backfills WHERE reservation_id = ?1",
+    )?;
     let consumed = stmt.query_map([reservation.id], |row| row.get::<_, JobId>(0))?;
     reservation.consumed = consumed.collect::<rusqlite::Result<BTreeSet<_>>>()?;
     Ok(Some(reservation))
@@ -1318,6 +1390,7 @@ pub fn any_blockers_advancing(conn: &Connection, attempts: &[AttemptId]) -> Resu
         return Ok(false);
     }
     let placeholders = vec!["?"; attempts.len()].join(",");
+    // The placeholder count varies with the blocker set; not worth caching.
     let mut stmt = conn.prepare(&format!(
         "SELECT EXISTS (
              SELECT 1 FROM run_leases l
@@ -1373,7 +1446,8 @@ pub fn record_backfill(
 // ---------------------------------------------------------------------------
 
 pub fn is_paused(conn: &Connection) -> Result<bool> {
-    Ok(conn.query_row(
+    Ok(query_row_cached(
+        conn,
         "SELECT paused FROM scheduler_pause WHERE singleton = 1",
         [],
         |row| Ok(row.get::<_, i64>(0)? != 0),
@@ -1396,13 +1470,13 @@ pub fn set_paused(conn: &Connection, paused: bool, now: i64) -> Result<bool> {
 // ---------------------------------------------------------------------------
 
 pub fn lookup_operation(conn: &Connection, key: &str) -> Result<Option<(String, String)>> {
-    Ok(conn
-        .query_row(
-            "SELECT request_hash, response FROM operations WHERE key = ?1",
-            [key],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?)
+    Ok(query_row_cached(
+        conn,
+        "SELECT request_hash, response FROM operations WHERE key = ?1",
+        [key],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()?)
 }
 
 pub fn insert_operation(
@@ -1426,15 +1500,16 @@ pub fn insert_operation(
 // ---------------------------------------------------------------------------
 
 pub fn latest_event_id(conn: &Connection) -> Result<i64> {
-    Ok(
-        conn.query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| {
-            row.get(0)
-        })?,
-    )
+    Ok(query_row_cached(
+        conn,
+        "SELECT COALESCE(MAX(id), 0) FROM events",
+        [],
+        |row| row.get(0),
+    )?)
 }
 
 pub fn events_after(conn: &Connection, after: i64, limit: u32) -> Result<Vec<EventRow>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT e.id, e.ts, e.job_id, substr(j.name, 1, 80), e.attempt_id, a.number, e.type \
          FROM events e \
          LEFT JOIN jobs j ON j.id = e.job_id \
@@ -1454,7 +1529,7 @@ pub fn job_events_after(
     after: i64,
     limit: u32,
 ) -> Result<Vec<EventRow>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT e.id, e.ts, e.job_id, substr(j.name, 1, 80), e.attempt_id, a.number, e.type \
          FROM events e \
          LEFT JOIN jobs j ON j.id = e.job_id \
@@ -1543,6 +1618,36 @@ mod tests {
             dependencies: vec![],
             yield_policy: None,
         }
+    }
+
+    fn query_plan(conn: &Connection, sql: &str) -> String {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let details = stmt
+            .query_map(
+                rusqlite::params_from_iter(std::iter::repeat_n(25, stmt.parameter_count())),
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap();
+        details
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n")
+    }
+
+    /// These run on every pass or status refresh. Without statistics SQLite's
+    /// plan does not depend on row counts, so an empty database shows the plan
+    /// a long job history gets.
+    #[test]
+    fn hot_queries_never_walk_job_history() {
+        let conn = open_in_memory().unwrap();
+        let edges = query_plan(&conn, UNRESOLVED_EDGES_OF_TERMINAL_PARENTS);
+        assert!(
+            edges.starts_with("SCAN d USING INDEX dependencies_unresolved_parent"),
+            "{edges}"
+        );
+        let status = query_plan(&conn, &status_jobs_sql());
+        assert!(!status.contains("SCAN jobs"), "{status}");
+        assert!(status.contains("jobs_finished"), "{status}");
     }
 
     #[test]

@@ -85,7 +85,7 @@ fn run(dir: &Path) -> anyhow::Result<()> {
         token: command.token.clone(),
         runner_pid: self_pid,
         runner_start_time: self_stat.start_time,
-        boot_id: identity::boot_id()?,
+        boot_id: identity::boot_id()?.to_string(),
     };
     // Non-exclusive: a recovery runner replacing a dead predecessor (the
     // flock serializes them) must be able to re-announce itself over the
@@ -210,7 +210,7 @@ fn run(dir: &Path) -> anyhow::Result<()> {
             pid: child_pid,
             pgid,
             start_time: child_start_time,
-            boot_id: identity::boot_id()?,
+            boot_id: identity::boot_id()?.to_string(),
             started_at: Some(command_started_at),
         },
         true,

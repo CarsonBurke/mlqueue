@@ -1,5 +1,5 @@
 //! Daemon assembly: singleton lock, Unix socket server with peer-credential
-//! checks, the coordinator thread, and the reconcile tick.
+//! checks, and the coordinator thread.
 
 mod coordinator;
 mod views;
@@ -89,21 +89,12 @@ async fn serve(paths: Paths, config: Config, conn: rusqlite::Connection) -> Resu
     // changes without polling; the sender lives on the coordinator thread and
     // its drop is what ends the streams at shutdown.
     let revisions = coordinator.revisions();
+    // The coordinator paces its own reconcile/schedule passes: on an interval
+    // while work is supervised, and only on demand while the queue is quiet.
+    let runtime = tokio::runtime::Handle::current();
     let coordinator_thread = std::thread::Builder::new()
         .name("coordinator".into())
-        .spawn(move || coordinator.run(rx))?;
-
-    let tick_tx = tx.clone();
-    let tick_interval = Duration::from_millis(config.tick_interval_ms.max(20));
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tick_interval);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            interval.tick().await;
-            // A full channel already has work queued; dropping a tick is fine.
-            let _ = tick_tx.try_send(Msg::Tick);
-        }
-    });
+        .spawn(move || coordinator.run(rx, runtime))?;
 
     let connections = Arc::new(Semaphore::new(config.max_connections));
     let serving = Serving {

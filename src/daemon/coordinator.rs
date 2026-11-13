@@ -8,7 +8,7 @@ use std::fs;
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::process::CommandExt;
 use std::process::Stdio;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, Transaction};
@@ -41,9 +41,14 @@ pub enum Msg {
         request: Box<Request>,
         reply: oneshot::Sender<Response>,
     },
-    Tick,
     Shutdown,
 }
+
+/// Longest sleep between passes while nothing is supervised. Idle passes are
+/// provably no-ops apart from retry delays, which are wall-clock deadlines
+/// that a monotonic sleep can overshoot across suspend or clock steps; this
+/// bounds that error.
+const IDLE_TICK_BACKSTOP: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub struct ApiError {
@@ -110,6 +115,12 @@ pub struct Coordinator {
     spawned: HashMap<AttemptId, Instant>,
     /// Orphaned attempts that already received a daemon-delivered SIGTERM.
     orphan_term_sent: HashSet<AttemptId>,
+    /// Per attempt, the (limit, installed-at) pair last verified as published.
+    /// Only this process writes `limit.json`, so a pair that matches the job's
+    /// committed limit needs no artifact reads on later passes.
+    time_limits_published: HashMap<AttemptId, (Option<u64>, Option<i64>)>,
+    /// When the next reconcile/schedule pass is due.
+    next_tick: Instant,
     /// Latest committed event id, republished after every handled message so
     /// streaming subscribers can refetch a snapshot instead of polling.
     revisions: watch::Sender<i64>,
@@ -138,6 +149,8 @@ impl Coordinator {
             admission_blocked: None,
             spawned: HashMap::new(),
             orphan_term_sent: HashSet::new(),
+            time_limits_published: HashMap::new(),
+            next_tick: Instant::now(),
             revisions,
             published_revision,
             published_admission_blocked: false,
@@ -150,25 +163,44 @@ impl Coordinator {
         self.revisions.subscribe()
     }
 
-    pub fn run(mut self, mut rx: mpsc::Receiver<Msg>) {
+    /// Serve requests until shutdown, running a pass whenever one is due.
+    /// `runtime` drives the timed wait; this thread is outside it.
+    pub fn run(mut self, mut rx: mpsc::Receiver<Msg>, runtime: tokio::runtime::Handle) {
         // Startup recovery is the same reconcile/schedule cycle as a tick:
         // adopt live runners, finalize durable results, respawn unlaunched
         // prepared attempts, orphan/quarantine the rest, restore the
         // reservation before ordinary admission.
         self.tick();
         self.publish_revision();
-        while let Some(msg) = rx.blocking_recv() {
+        loop {
+            // The deadline is checked before every message, so a steady
+            // stream of requests cannot postpone supervision.
+            let msg = if Instant::now() < self.next_tick {
+                let deadline = tokio::time::Instant::from_std(self.next_tick);
+                // The timer must be created inside the runtime's context.
+                let next =
+                    runtime.block_on(async { tokio::time::timeout_at(deadline, rx.recv()).await });
+                match next {
+                    Ok(Some(msg)) => Some(msg),
+                    Ok(None) => break,
+                    Err(_elapsed) => None,
+                }
+            } else {
+                None
+            };
             // Every committed change appends an event, so publishing the event
             // cursor once per handled message — after the transaction closed,
             // before the reply leaves for the socket — is the single choke
             // point that covers mutations, ticks and scheduling passes alike.
             let pending = match msg {
-                Msg::Request { request, reply } => Some((self.handle_request(*request), reply)),
-                Msg::Tick => {
+                Some(Msg::Request { request, reply }) => {
+                    Some((self.handle_request(*request), reply))
+                }
+                None => {
                     self.tick();
                     None
                 }
-                Msg::Shutdown => break,
+                Some(Msg::Shutdown) => break,
             };
             self.publish_revision();
             if let Some((response, reply)) = pending {
@@ -202,14 +234,61 @@ impl Coordinator {
     }
 
     fn tick(&mut self) {
+        let started_at = now_ms();
+        let revision_before = db::latest_event_id(&self.conn).ok();
+        let mut failed = false;
         if let Err(err) = self.reconcile_all() {
             tracing::error!("reconcile failed: {err:#}");
+            failed = true;
         }
         if let Err(err) = self.advance_dependency_graph() {
             tracing::error!("dependency reconciliation failed: {err:#}");
+            failed = true;
         }
         if let Err(err) = self.schedule() {
             tracing::error!("scheduling pass failed: {err:#}");
+            failed = true;
+        }
+        // Every committed change appends an event. A pass that committed one
+        // may have enabled more work (a failed launch requeues its job and
+        // releases dependents), so only a pass that changed nothing proves
+        // the queue quiet.
+        let changed = db::latest_event_id(&self.conn).ok() != revision_before;
+        self.next_tick = self.plan_next_tick(failed || changed, started_at);
+    }
+
+    /// Poll at the configured interval while anything is supervised, or when
+    /// `poll_again` says this pass failed or changed state. Otherwise a pass
+    /// can only find work after a request, which runs its own pass, or once a
+    /// retry delay elapses, so sleep until then, bounded by
+    /// [`IDLE_TICK_BACKSTOP`]. Deadlines are counted from `pass_started_at`,
+    /// so one that came due while the pass ran is still awaited.
+    fn plan_next_tick(&self, poll_again: bool, pass_started_at: i64) -> Instant {
+        let now = Instant::now();
+        let poll = now + Duration::from_millis(self.config.tick_interval_ms.max(20));
+        if poll_again {
+            return poll;
+        }
+        let idle_wait = db::has_non_terminal_attempts(&self.conn).and_then(|supervising| {
+            if supervising {
+                return Ok(None);
+            }
+            let wall_now = now_ms();
+            Ok(Some(
+                match db::next_retry_at(&self.conn, pass_started_at)? {
+                    Some(at) => Duration::from_millis(at.saturating_sub(wall_now).max(0) as u64)
+                        .min(IDLE_TICK_BACKSTOP),
+                    None => IDLE_TICK_BACKSTOP,
+                },
+            ))
+        });
+        match idle_wait {
+            Ok(Some(wait)) => (now + wait).max(poll),
+            Ok(None) => poll,
+            Err(err) => {
+                tracing::error!("planning the next pass: {err:#}");
+                poll
+            }
         }
     }
 
@@ -529,6 +608,7 @@ impl Coordinator {
             attempts.iter().map(|attempt| attempt.id).collect();
         self.spawned.retain(|id, _| live.contains(id));
         self.orphan_term_sent.retain(|id| live.contains(id));
+        self.time_limits_published.retain(|id, _| live.contains(id));
         for mut attempt in attempts {
             if let Err(err) = self.observe_yield_delivery(&mut attempt) {
                 tracing::warn!("reading yield delivery of attempt {}: {err:#}", attempt.id);
@@ -635,12 +715,9 @@ impl Coordinator {
         }
     }
 
-    fn republish_time_limit(&self, attempt: &AttemptRow, dir: &std::path::Path) {
-        let (desired, set_at) = match db::job_row(&self.conn, attempt.job_id) {
-            Ok(Some(job)) => (
-                job.time_limit_ms.map(|value| value as u64),
-                job.time_limit_set_at,
-            ),
+    fn republish_time_limit(&mut self, attempt: &AttemptRow, dir: &std::path::Path) {
+        let (desired, set_at) = match db::job_time_limit(&self.conn, attempt.job_id) {
+            Ok(Some((limit, set_at))) => (limit.map(|value| value as u64), set_at),
             Ok(None) => return,
             Err(err) => {
                 tracing::warn!(
@@ -650,7 +727,12 @@ impl Coordinator {
                 return;
             }
         };
+        if self.time_limits_published.get(&attempt.id) == Some(&(desired, set_at)) {
+            return;
+        }
         if published_time_limit_is_current(dir, &attempt.launch_token, desired, set_at) {
+            self.time_limits_published
+                .insert(attempt.id, (desired, set_at));
             return;
         }
         let Some(set_at) = set_at else {
@@ -1255,6 +1337,7 @@ impl Coordinator {
         }
         self.spawned.remove(&attempt.id);
         self.orphan_term_sent.remove(&attempt.id);
+        self.time_limits_published.remove(&attempt.id);
         Ok(())
     }
 
@@ -2562,7 +2645,7 @@ mod tests {
             attempt.id,
             pid,
             stat.start_time,
-            &identity::boot_id().unwrap(),
+            identity::boot_id().unwrap(),
         )
         .unwrap();
         db::set_attempt_running(&conn, attempt.id, pid, pid, stat.start_time + 1, now, now)
@@ -2765,5 +2848,103 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(missing.code, error_codes::NOT_FOUND);
+    }
+
+    #[test]
+    fn passes_are_paced_by_supervision_and_retry_deadlines() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            runtime_dir: dir.path().join("runtime"),
+            state_dir: dir.path().join("state"),
+            config_file: dir.path().join("config.toml"),
+        };
+        let conn = db::open_in_memory().unwrap();
+        let config = Config::default();
+        let poll = Duration::from_millis(config.tick_interval_ms);
+        let mut coordinator = Coordinator::new(conn, config, paths).unwrap();
+        let wait = |coordinator: &Coordinator, poll_again: bool| {
+            coordinator
+                .plan_next_tick(poll_again, now_ms())
+                .saturating_duration_since(Instant::now())
+        };
+        let near = |actual: Duration, expected: Duration| {
+            actual <= expected && actual + Duration::from_millis(100) >= expected
+        };
+
+        // Nothing queued or supervised: only the backstop wakes the pass.
+        assert!(near(wait(&coordinator, false), IDLE_TICK_BACKSTOP));
+        // A failed or state-changing pass is followed up promptly.
+        assert!(near(wait(&coordinator, true), poll));
+        // A pass that committed nothing leaves the queue asleep.
+        coordinator.tick();
+        assert!(near(
+            coordinator
+                .next_tick
+                .saturating_duration_since(Instant::now()),
+            IDLE_TICK_BACKSTOP
+        ));
+
+        // A pending retry delay wakes the pass when it elapses, never sooner
+        // than the poll interval and never later than the backstop.
+        let params = submission(dir.path());
+        let job = db::insert_job(&coordinator.conn, &params, now_ms()).unwrap();
+        let retry_in = |delay: i64| {
+            db::set_job_retry_not_before(&coordinator.conn, job, Some(now_ms() + delay), now_ms())
+                .unwrap();
+        };
+        retry_in(1_000);
+        assert!(near(wait(&coordinator, false), Duration::from_secs(1)));
+        retry_in(1);
+        assert!(near(wait(&coordinator, false), poll));
+        // A deadline that came due while the pass ran is not skipped as past.
+        let started_at = now_ms();
+        db::set_job_retry_not_before(&coordinator.conn, job, Some(started_at + 1), started_at)
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        let next = coordinator.plan_next_tick(false, started_at);
+        assert!(near(next.saturating_duration_since(Instant::now()), poll));
+        retry_in(i64::MAX / 2);
+        assert!(near(wait(&coordinator, false), IDLE_TICK_BACKSTOP));
+        db::set_job_retry_not_before(&coordinator.conn, job, Some(i64::MAX), now_ms()).unwrap();
+        assert!(near(wait(&coordinator, false), IDLE_TICK_BACKSTOP));
+
+        // A live attempt is supervised at the poll interval.
+        let row = db::job_row(&coordinator.conn, job).unwrap().unwrap();
+        db::create_attempt_with_lease(&coordinator.conn, &row, "token", now_ms()).unwrap();
+        assert!(near(wait(&coordinator, false), poll));
+    }
+
+    /// Per-pass cost of the coordinator's hot paths against a real database:
+    /// `MLQUEUE_BENCH_DB=/path/to/copy.db cargo test --release -- --ignored
+    /// --nocapture hot_path_costs`. Point it at a copy; ticks may write.
+    #[test]
+    #[ignore = "benchmark; needs MLQUEUE_BENCH_DB"]
+    fn hot_path_costs() {
+        let Some(db_path) = std::env::var_os("MLQUEUE_BENCH_DB") else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            runtime_dir: dir.path().join("runtime"),
+            state_dir: dir.path().join("state"),
+            config_file: dir.path().join("config.toml"),
+        };
+        let conn = db::open(std::path::Path::new(&db_path)).unwrap();
+        let mut coordinator = Coordinator::new(conn, Config::default(), paths.clone()).unwrap();
+        let time = |label: &str, iterations: u32, f: &mut dyn FnMut()| {
+            f();
+            let started = Instant::now();
+            for _ in 0..iterations {
+                f();
+            }
+            println!("{label}: {:?}/pass", started.elapsed() / iterations);
+        };
+        time("tick", 2_000, &mut || {
+            coordinator.tick();
+            coordinator.publish_revision();
+        });
+        time("status", 200, &mut || {
+            views::status_view(&coordinator.conn, &paths, false).unwrap();
+        });
     }
 }

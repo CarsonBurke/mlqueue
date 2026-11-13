@@ -206,6 +206,38 @@ impl Drop for TestQueue {
             let _ = child.kill();
             let _ = child.wait();
         }
+        self.kill_leftover_work();
+    }
+}
+
+impl TestQueue {
+    /// Runners are detached so they survive the daemon, and a command a test
+    /// left running would outlive the deleted state directory forever. Kill
+    /// whatever any attempt still has, checking start times so a recycled PID
+    /// is never signalled.
+    fn kill_leftover_work(&self) {
+        use mlqueue::process::artifacts::{
+            EXEC_FILE, ExecFile, IDENTITY_FILE, IdentityFile, read_artifact,
+        };
+        use mlqueue::process::identity::proc_stat;
+        let Ok(attempts) = std::fs::read_dir(self.state_dir().join("attempts")) else {
+            return;
+        };
+        let started_as = |pid: i32, start_time: i64| {
+            proc_stat(pid).is_some_and(|stat| stat.start_time == start_time)
+        };
+        for dir in attempts.flatten().map(|entry| entry.path()) {
+            if let Ok(Some(exec)) = read_artifact::<ExecFile>(&dir.join(EXEC_FILE))
+                && started_as(exec.pid, exec.start_time)
+            {
+                unsafe { libc::killpg(exec.pgid, libc::SIGKILL) };
+            }
+            if let Ok(Some(runner)) = read_artifact::<IdentityFile>(&dir.join(IDENTITY_FILE))
+                && started_as(runner.runner_pid, runner.runner_start_time)
+            {
+                unsafe { libc::kill(runner.runner_pid, libc::SIGKILL) };
+            }
+        }
     }
 }
 
@@ -2913,6 +2945,8 @@ fn yield_is_refused_unless_the_job_opted_in_and_someone_is_waiting() {
     );
     assert_eq!(attempt_states(&q, job), ["running"]);
     assert_eq!(q.job(job)["yieldRequest"], serde_json::Value::Null);
+    q.cli(&["cancel", &job.to_string()]);
+    q.wait_state(job, "cancelled", Duration::from_secs(10));
 }
 
 #[test]
@@ -2929,6 +2963,7 @@ fn yield_requires_a_terminal_unless_the_daemon_allows_otherwise() {
     assert!(String::from_utf8_lossy(&refused.stderr).contains("interactive terminal"));
     assert_eq!(attempt_states(&q, job), ["running"]);
     q.cli(&["cancel", &job.to_string()]);
+    q.wait_state(job, "cancelled", Duration::from_secs(10));
 }
 
 #[test]

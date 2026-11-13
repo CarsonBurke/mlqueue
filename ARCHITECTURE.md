@@ -184,6 +184,15 @@ On each pass the coordinator:
 Unknown reservation semantics versions block ordinary admission until an
 operator migrates or invalidates the reservation (`admission_blocked`).
 
+Every mutation runs a pass. Otherwise passes are paced by what can change
+without a request. While any attempt is non-terminal, the coordinator polls
+its runner, artifacts, and process group every `tick_interval_ms`; a pass
+that failed or committed an event is also followed up at that interval. Once
+a pass changes nothing with nothing supervised, a later pass can only find
+work after a retry delay elapses, so the coordinator sleeps until the earliest
+one. It still wakes at least every 5 s, in case a suspend or clock step makes
+the monotonic sleep overshoot that wall-clock deadline.
+
 
 ## Protocol
 
@@ -317,6 +326,10 @@ readiness sequence; historical cancelled and skipped records remain truthful.
 Migration v9 adds the job's yield policy and each attempt's yield request
 (time, reason, hold) and delivery time. The yield count is derived from
 attempts in state `yielded`, so it cannot drift from the history.
+
+Migration v10 indexes `jobs(finished_at, id)`: `status` and every subscription
+refresh read unfinished jobs plus the newest finished ones, which would
+otherwise scan the whole job history.
 
 
 Job IDs are `AUTOINCREMENT` rowids. Scheduling uses a separate durable

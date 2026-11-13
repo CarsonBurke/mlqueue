@@ -3,13 +3,20 @@
 
 use std::fs;
 use std::io;
+use std::sync::OnceLock;
 
 /// Stable identifier for the current boot; PIDs and start times are only
-/// meaningful within one boot.
-pub fn boot_id() -> io::Result<String> {
-    Ok(fs::read_to_string("/proc/sys/kernel/random/boot_id")?
+/// meaningful within one boot. A running process cannot outlive its boot, so
+/// the first successful read is cached: liveness checks run every poll.
+pub fn boot_id() -> io::Result<&'static str> {
+    static BOOT_ID: OnceLock<String> = OnceLock::new();
+    if let Some(id) = BOOT_ID.get() {
+        return Ok(id);
+    }
+    let id = fs::read_to_string("/proc/sys/kernel/random/boot_id")?
         .trim()
-        .to_string())
+        .to_string();
+    Ok(BOOT_ID.get_or_init(|| id))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -149,7 +156,7 @@ mod tests {
         assert!(!identity_alive(
             pid,
             proc_stat(pid).unwrap().start_time,
-            &boot
+            boot
         ));
         child.wait().unwrap();
     }
@@ -160,8 +167,8 @@ mod tests {
         let stat = proc_stat(pid).unwrap();
         assert_eq!(stat.pid, pid);
         let boot = boot_id().unwrap();
-        assert!(identity_alive(pid, stat.start_time, &boot));
-        assert!(!identity_alive(pid, stat.start_time + 1, &boot));
+        assert!(identity_alive(pid, stat.start_time, boot));
+        assert!(!identity_alive(pid, stat.start_time + 1, boot));
         assert!(!identity_alive(pid, stat.start_time, "not-a-boot-id"));
     }
 
